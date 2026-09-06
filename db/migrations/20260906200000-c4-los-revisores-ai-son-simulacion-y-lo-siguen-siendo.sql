@@ -395,6 +395,27 @@ begin
        and not reto_admite_conceptos(v_reto, v_fila.workspace_id) then
       raise exception 'la etapa 4 de ese reto está cerrada: o su G4 está aprobado sin la etapa reabierta, o el reto ya no admite trabajo de método';
     end if;
+    -- Y EL ESTADO DEL CONCEPTO, que es la otra mitad de la misma pregunta y faltaba.
+    --
+    -- Las políticas piden `candidato`, y eso cierra la escritura tardía SECUENCIAL. No la
+    -- concurrente, por lo que dice el párrafo de arriba: la instantánea con la que RLS decidió
+    -- se tomó antes de que este trigger empezara a esperar, así que el veredicto que se firma
+    -- MIENTRAS espera no lo ve nadie — ni la política, que ya decidió, ni este recheck, que
+    -- preguntaba solo por la ventana del reto.
+    --
+    -- El estado del concepto llegó a las políticas dos rondas después de que este recheck se
+    -- escribiera, y no lo traje hasta aquí: la regla acabó con una capa menos justo en el
+    -- instante para el que esta función existe.
+    --
+    -- Se lee en una sentencia propia y por eso ve el commit ajeno: en READ COMMITTED cada
+    -- sentencia de una función volátil toma instantánea nueva. Es lo mismo que hace que la
+    -- comprobación de la ventana de arriba sirva de algo.
+    if session_user = 'designio_app' and v_concepto is not null
+       and not exists (select 1 from concepto c
+                        where c.id = v_concepto and c.workspace_id = v_fila.workspace_id
+                          and c.estado = 'candidato') then
+      raise exception 'ese concepto ya no es candidato: su veredicto se firmó mientras esta escritura esperaba el candado del reto, así que llega después del pasa/muere que la revisión existía para informar';
+    end if;
   end if;
   return v_fila;
 end;
@@ -816,6 +837,86 @@ revoke execute on function revision_simulada_suelta_su_propuesta() from public;
 create trigger b_revision_simulada_suelta_su_propuesta
   before delete on revision_simulada
   for each row execute function revision_simulada_suelta_su_propuesta();
+
+-- ── Y UNA SESIÓN NO ES UNA SESIÓN SI ESTÁ VACÍA ──
+--
+-- El contrato pide al menos un hallazgo y al menos una pregunta de test, y las preguntas son
+-- lo único que una simulación puede legítimamente entregarle a la etapa 4 (RF-08.2): la
+-- revisión no se cita, no cuenta en G4, y lo que queda de ella es qué ir a probar con personas.
+-- Una revisión sin ninguna de las dos es una etiqueta de simulación colgada de nada.
+--
+-- El contrato solo gobierna lo que viene del proveedor. Por la superficie concedida —que
+-- existe porque SYS-21 obliga a que todo flujo siga disponible sin AI— una `revision_simulada`
+-- sola commiteaba, y quedaba archivada así. Medido.
+--
+-- DIFERIDO porque el montaje legítimo es de varias sentencias: la materialización escribe la
+-- revisión, luego sus hallazgos, luego sus preguntas, y exigirlo al insertar haría imposible
+-- el camino real. Es el mismo motivo por el que el guard de «hallazgo sin cita y sin marca» es
+-- diferido, y por eso la respuesta correcta a «¿está completa?» solo existe en el commit.
+--
+-- Y cuelga TAMBIÉN del borrado de las hojas, porque si no sería una comprobación de NACIMIENTO
+-- y no un invariante: vaciar una revisión existente borrando sus hallazgos uno a uno la dejaría
+-- igual de vacía sin pasar por aquí. Cuando la que se va es la revisión entera, sus hojas caen
+-- en cascada y entonces no hay nada que comprobar — de ahí que la función pregunte primero si
+-- la revisión sigue existiendo.
+create function revision_simulada_completa_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare
+  v_revision uuid;
+  v_ws uuid;
+begin
+  if tg_table_name = 'revision_simulada' then
+    v_revision := new.id;
+    v_ws := new.workspace_id;
+  else
+    v_revision := old.revision_id;
+    v_ws := old.workspace_id;
+  end if;
+  if not exists (select 1 from revision_simulada r
+                  where r.id = v_revision and r.workspace_id = v_ws) then
+    return null;
+  end if;
+  if not exists (select 1 from hallazgo_simulado h
+                  where h.revision_id = v_revision and h.workspace_id = v_ws) then
+    raise exception 'esa revisión simulada se queda sin hallazgos: una sesión sin ninguna lectura es una etiqueta de simulación colgada de nada (RF-08.2). Escribe al menos uno, o borra la revisión entera';
+  end if;
+  if not exists (select 1 from pregunta_de_test q
+                  where q.revision_id = v_revision and q.workspace_id = v_ws) then
+    raise exception 'esa revisión simulada se queda sin preguntas de test: son lo único que una simulación le puede entregar a la etapa 4, porque sus hallazgos no se citan ni cuentan en G4 (RF-08.2). Escribe al menos una, o borra la revisión entera';
+  end if;
+  return null;
+end;
+$fn$;
+
+revoke execute on function revision_simulada_completa_guard() from public;
+
+create constraint trigger revision_simulada_completa
+  after insert on revision_simulada
+  deferrable initially deferred
+  for each row execute function revision_simulada_completa_guard();
+create constraint trigger revision_simulada_completa
+  after delete on hallazgo_simulado
+  deferrable initially deferred
+  for each row execute function revision_simulada_completa_guard();
+create constraint trigger revision_simulada_completa
+  after delete on pregunta_de_test
+  deferrable initially deferred
+  for each row execute function revision_simulada_completa_guard();
+
+-- ── Y el linaje inverso, atado como el de sus seis hermanas ──
+--
+-- `propuesta_ai_id` nació sin clave ajena, y es la ÚNICA de las siete columnas de sello que no
+-- la tiene: `insight`, `entrada_kpi`, `oportunidad`, `outcome_review`, `evidencia` y
+-- `criterio_exito` la llevan compuesta con el workspace. Sin ella, el código privilegiado
+-- —seed, importaciones, backfills— puede dejar una revisión apuntando a una propuesta que no
+-- existe o que es de otro tenant, y la procedencia permanente que esta columna representa deja
+-- de estar garantizada por la base.
+--
+-- El ciclo entre las dos tablas es el mismo que ya tienen las otras seis y se recorre igual:
+-- la propuesta nace sin objeto, el objeto nace con su sello, y el puntero de vuelta se pone
+-- después. Las dos columnas son anulables, así que no hay huevo ni gallina.
+alter table revision_simulada add constraint revision_simulada_propuesta_fk
+  foreign key (propuesta_ai_id, workspace_id) references propuesta_ai (id, workspace_id);
 
 -- ── Y el aislamiento de escritura, por el mismo camino ──
 --

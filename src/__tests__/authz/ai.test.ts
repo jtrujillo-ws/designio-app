@@ -804,6 +804,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       /* Y el post mortem, que es el quinto objeto sellado — y el único cuyo sello apunta a una
        * propuesta que NO lo creó, porque la fila ya existía. La FK es la misma. */
       await admin`update outcome_review set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      /* Y la revisión simulada, que es el SEXTO objeto sellado y el que trajo la clave ajena
+       * del linaje inverso: sin soltarla, la limpieza muere borrando la propuesta y el error
+       * sale nombrando `usuario`, que no dice nada de dónde está. */
+      await admin`update revision_simulada set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -1068,6 +1072,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // sentidos —`propuesta_ai.entrada_kpi_id` y `entrada_kpi.propuesta_ai_id`—, así que hay
       // que soltarlo antes de borrar cualquiera de los dos extremos.
       await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y la revisión simulada, el sexto: su `propuesta_ai_id` tiene clave ajena desde la
+      // ronda 7, así que también hay que soltarlo antes de borrar la propuesta.
+      await admin`update revision_simulada set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
@@ -6949,6 +6956,38 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   }
 
   /**
+   * Una revisión escrita A MANO y COMPLETA, en UNA transacción.
+   *
+   * El suelo exige en el commit al menos un hallazgo y al menos una pregunta de test, así que
+   * un fixture que solo inserta la cabecera ya no entra — y esa es la regla, no un estorbo: una
+   * sesión vacía es una etiqueta de simulación colgada de nada. Se monta entera aquí para que
+   * cada sonda siga midiendo LO SUYO en vez de tropezar con esto.
+   *
+   * El hallazgo nace como HIPÓTESIS porque no trae cita, que es lo que el otro guard exige.
+   */
+  async function revisionAMano(
+    tx: TransactionSql,
+    ws: string,
+    conceptoId: string,
+    arquetipoId: string,
+    actorId: string,
+    sintesis = 'Una lectura',
+  ): Promise<string> {
+    const [r] = await tx`insert into revision_simulada
+      (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+      values (${ws}, ${conceptoId}, ${arquetipoId}, ${sintesis}, ${actorId})
+      returning id`;
+    const id = r!.id as string;
+    await tx`insert into hallazgo_simulado
+      (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+      values (${ws}, ${id}, 0, 'Una lectura del perfil', 'Se sigue del arquetipo.', true)`;
+    await tx`insert into pregunta_de_test
+      (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+      values (${ws}, ${id}, null, 0, '¿Qué harías aquí?', '')`;
+    return id;
+  }
+
+  /**
    * C4 por el camino real, y lo que aceptar deja escrito.
    *
    * Mide de una vez las dos cosas que hacen de C4 lo que es: que la sesión se materializa
@@ -7251,16 +7290,23 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const admin = sqlAdmin();
       const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
       const escribir = () =>
-        conUsuario(curadorId, (tx) => tx`insert into revision_simulada
-          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
-          values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})`);
+        conUsuario(curadorId, (tx) => revisionAMano(tx, wsC, conceptoId, lenteA, curadorId));
       // Mientras es CANDIDATO, entra: la puerta se cierra por el estado, no por otra cosa.
       await escribir();
       await admin`delete from revision_simulada where concepto_id = ${conceptoId}`;
       await admin`update concepto set estado = 'pasa',
         decidido_por = ${curadorId}, decidido_en = now()
         where id = ${conceptoId}`;
-      await expect(escribir()).rejects.toThrow(/row-level security|violates row-level/i);
+      /*
+       * DOS CAPAS, y desde la ronda 7 la que contesta es la de dentro: el recheck del candado
+       * es un trigger BEFORE, así que corre ANTES de que RLS evalúe su `with check`. La
+       * política sigue ahí y sigue haciendo falta —gobierna también qué ve y qué borra este
+       * rol—, pero para un INSERT tardío el mensaje que sale es el del guard, que además dice
+       * POR QUÉ. Se aceptan los dos: lo que esta sonda mide es que no entra.
+       */
+      await expect(escribir()).rejects.toThrow(
+        /row-level security|violates row-level|ya no es candidato/i,
+      );
     });
   });
 
@@ -7434,14 +7480,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * seguía pareciendo aceptable y reventaba contra la clave única al insertar. El lote las
        * separa: la hermana lleva el sello de una propuesta de esta llamada, la de a mano no.
        */
-      const [aMano] = await conUsuario(curadorId, (tx) => tx`insert into revision_simulada
-        (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
-        values (${wsC}, ${conceptoId}, ${lenteB}, 'Escrita a mano', ${curadorId}) returning id`);
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Escrita a mano'),
+      );
       const conAjena = await panelPropuestas(curadorId, wsC);
       const tocada = conAjena.pendientes.find((x) => x.id === propuestaB);
       expect(tocada, 'la propuesta desapareció del panel').toBeDefined();
       expect(tocada!.anclaEstado).toBe('material-de-revision-movido');
-      await admin`delete from revision_simulada where id = ${aMano!.id as string}`;
+      await admin`delete from revision_simulada where id = ${aMano}`;
 
       // LA PRIMERA: con las dos lentes ya revisadas, el concepto deja de ofrecerse y pedir otro
       // lote no encuentra nada que revisar. Que la ventana avanza se ve aquí llegando a cero.
@@ -7630,22 +7676,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ).rejects.toThrow(/row-level security|violates row-level/i);
 
       // Y las hojas: con la revisión ya creada, decidir el concepto cierra también sus hijos.
-      const [rev] = await conUsuario(curadorId, (tx) => tx`insert into revision_simulada
-        (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
-        values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId}) returning id`);
+      const rev = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteA, curadorId),
+      );
       // `orden` distinto en cada intento: con el mismo, el segundo choca contra la clave única
       // de `(revision_id, orden)` y la sonda mediría ESA y no la puerta del estado. Lo dijo la
       // neutralización al fallar con «duplicate key» en vez de con la política.
       const hallazgo = (orden: number) =>
         conUsuario(curadorId, (tx) => tx`insert into hallazgo_simulado
           (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
-          values (${wsC}, ${rev!.id as string}, ${orden}, 'Un hallazgo',
+          values (${wsC}, ${rev}, ${orden}, 'Un hallazgo',
                   'Se sigue del perfil.', true)`);
       // Con el concepto candidato, entra: la puerta la cierra el estado y no otra cosa.
-      await hallazgo(0);
+      await hallazgo(1);
       await admin`update concepto set estado = 'pasa',
         decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
-      await expect(hallazgo(1)).rejects.toThrow(/row-level security|violates row-level/i);
+      // Ver la nota de «no entra después de que el concepto se decida»: el guard del candado
+      // es BEFORE y contesta antes que la política. Las dos siguen puestas.
+      await expect(hallazgo(2)).rejects.toThrow(
+        /row-level security|violates row-level|ya no es candidato/i,
+      );
 
       /*
        * Y BORRAR pide lo mismo que escribir, en las cuatro tablas.
@@ -7662,15 +7712,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * mide es que NO BORRÓ NADA y que lo de antes sigue ahí.
        */
       await conUsuario(curadorId, (tx) => tx`delete from hallazgo_simulado
-        where revision_id = ${rev!.id as string} and workspace_id = ${wsC}`);
+        where revision_id = ${rev} and workspace_id = ${wsC}`);
       await conUsuario(curadorId, (tx) => tx`delete from revision_simulada
-        where id = ${rev!.id as string} and workspace_id = ${wsC}`);
+        where id = ${rev} and workspace_id = ${wsC}`);
       const [quedan] = await admin`select
-          (select count(*)::int from revision_simulada where id = ${rev!.id as string}) as revision,
+          (select count(*)::int from revision_simulada where id = ${rev}) as revision,
           (select count(*)::int from hallazgo_simulado
-             where revision_id = ${rev!.id as string}) as hallazgos`;
+             where revision_id = ${rev}) as hallazgos`;
       expect(quedan!.revision, 'la revisión se borró con el concepto ya decidido').toBe(1);
-      expect(quedan!.hallazgos, 'un hallazgo se borró con el concepto ya decidido').toBe(1);
+      expect(quedan!.hallazgos, 'un hallazgo se borró con el concepto ya decidido').toBe(2);
     });
   });
 
@@ -8000,9 +8050,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();
       const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
-      const nueva = () => admin`insert into revision_simulada
-        (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
-        values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})`;
+      const nueva = () =>
+        admin.begin((tx) => revisionAMano(tx, wsC, conceptoId, lenteA, curadorId));
       await nueva();
       await expect(nueva()).rejects.toThrow(/revision_simulada_concepto_id_arquetipo_id_key/);
     });
@@ -8187,6 +8236,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           await tx`insert into hallazgo_simulado
             (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
             values (${wsC}, ${r!.id as string}, 0, 'Sin sostén', 'Nada detrás', false)`;
+          // Y su pregunta, porque sin ninguna caería el guard de completitud y la sonda
+          // mediría ESE en vez del sostén del hallazgo.
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Y bien?', '')`;
         }),
       ).rejects.toThrow(/no se marca como hipótesis/);
     });
@@ -8531,6 +8585,161 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         },
       });
       expect(objetoId).toBeTruthy();
+    });
+  });
+
+  /**
+   * El sello de procedencia está ATADO en todas las que lo llevan, no en casi todas.
+   *
+   * `propuesta_ai_id` es la traza permanente de qué propuesta creó una fila, y siete tablas la
+   * tienen. `revision_simulada` nació sin clave ajena: por el código privilegiado —seed,
+   * importaciones, backfills— podía quedar apuntando a una propuesta inexistente o de otro
+   * tenant, y entonces la procedencia deja de estar garantizada por la base y pasa a ser una
+   * costumbre.
+   *
+   * Se barre el ESQUEMA y no una lista escrita aquí: la octava tabla que lleve la columna entra
+   * sola en este censo, que es justo lo que falló esta vez.
+   *
+   * Lo que NO se exige es unicidad: ninguna de las siete la tiene, y el uno-a-uno lo impone el
+   * otro extremo —el guard de materialización pide que el objeto haya NACIDO en la aceptación
+   * que lo sella, así que una segunda propuesta no puede adoptar uno que ya existía—.
+   */
+  it('toda tabla con sello de propuesta lo tiene atado al tenant', async () => {
+    const admin = sqlAdmin();
+    const conSello = await admin`select c.table_name from information_schema.columns c
+      join information_schema.tables t on t.table_name = c.table_name
+       and t.table_schema = c.table_schema and t.table_type = 'BASE TABLE'
+      where c.table_schema = 'public' and c.column_name = 'propuesta_ai_id'
+      order by c.table_name`;
+    expect(conSello.length, 'ninguna tabla lleva el sello: el censo no mide nada').toBeGreaterThan(
+      1,
+    );
+    const sinAtar: string[] = [];
+    for (const fila of conSello) {
+      const tabla = fila.table_name as string;
+      const [atada] = await admin`select count(*)::int as n from pg_constraint
+        where conrelid = ${tabla}::regclass and contype = 'f'
+          and confrelid = 'propuesta_ai'::regclass
+          and pg_get_constraintdef(oid) like '%(propuesta_ai_id, workspace_id)%'`;
+      if ((atada!.n as number) === 0) sinAtar.push(tabla);
+    }
+    expect(
+      sinAtar,
+      'estas tablas guardan de qué propuesta salió su fila y nada lo garantiza: el puntero puede señalar a una propuesta que no existe, o a una de otro workspace',
+    ).toEqual([]);
+  });
+
+  /**
+   * El veredicto que llega MIENTRAS la escritura espera el candado.
+   *
+   * Las políticas piden concepto `candidato`, y eso cierra la escritura tardía SECUENCIAL. No
+   * la concurrente: RLS se evalúa con la instantánea de la sentencia, tomada antes de que el
+   * trigger se quedara esperando el candado del reto, y Postgres no vuelve a evaluar la
+   * política porque un BEFORE se haya bloqueado. El guard ya sabe esto —por eso vuelve a
+   * preguntar por la ventana del reto con el candado en la mano— y preguntaba solo la mitad:
+   * `reto_admite_conceptos`, nunca el estado del concepto. Ese estado lo añadí yo dos rondas
+   * después de escribir el recheck, y no lo llevé hasta aquí.
+   *
+   * La carrera se monta a propósito, no se espera a que ocurra: la otra transacción toma el
+   * candado ANTES y suelta el veredicto dentro, así que el orden está fijado y la sonda no es
+   * intermitente.
+   */
+  it('C4 no deja entrar una revisión cuyo veredicto llegó mientras esperaba el candado', async () => {
+    await enWorkspaceLimpio('c4-veredicto-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+
+      // El otro: toma el candado del reto y decide el concepto DENTRO, sin cerrar todavía.
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update concepto set estado = 'pasa',
+          decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      // Y la escritura, que toma su instantánea AHORA —con el concepto todavía candidato para
+      // ella— y se queda esperando el candado dentro del trigger.
+      const escritura = conUsuario(curadorId, (tx) =>
+        tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó tarde', ${curadorId})`,
+      );
+      // Hasta que de verdad esté bloqueada en el candado: se lee de `pg_locks`, no de un
+      // tiempo de espera, que es lo que haría intermitente a esta prueba.
+      for (let i = 0; i < 200; i++) {
+        const [espera] = await admin`select count(*)::int as n from pg_locks
+          where locktype = 'advisory' and not granted`;
+        if ((espera!.n as number) > 0) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const [bloqueada] = await admin`select count(*)::int as n from pg_locks
+        where locktype = 'advisory' and not granted`;
+      expect(bloqueada!.n, 'la escritura no llegó a esperar el candado: la sonda no mide la carrera').toBe(1);
+
+      soltar();
+      await elOtro;
+      await expect(escritura).rejects.toThrow(/ya no es candidato|veredicto/i);
+    });
+  });
+
+  /**
+   * Y una sesión escrita a mano no entra vacía.
+   *
+   * El contrato pide al menos un hallazgo y al menos una pregunta de test —y las preguntas son
+   * lo único que una simulación puede legítimamente producir para la etapa 4 (RF-08.2)—, pero
+   * el contrato solo gobierna lo que viene del proveedor. Por la superficie concedida, una
+   * `revision_simulada` sola commitea: queda en el archivo una lectura sin nada leído y sin
+   * nada que probar, con la etiqueta de simulación puesta.
+   *
+   * Se mide en los dos sentidos, que es lo que separa «no entra vacía» de «no entra a mano».
+   */
+  it('C4 no archiva una revisión sin hallazgos ni preguntas', async () => {
+    await enWorkspaceLimpio('c4-revision-vacia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura sin nada detrás', ${curadorId})`,
+        ),
+      ).rejects.toThrow(/sin hallazgos|sin preguntas|vacía/i);
+
+      // Y entera sí entra: hallazgo con su cita y su pregunta, en la misma transacción.
+      const escrita = await conUsuario(curadorId, async (tx) => {
+        const [r] = await tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura entera', ${curadorId})
+          returning id`;
+        const [h] = await tx`insert into hallazgo_simulado
+          (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+          values (${wsC}, ${r!.id as string}, 0, 'Se va por el tiempo',
+                  'Dice que abandona si tarda.', false)
+          returning id`;
+        await tx`insert into hallazgo_simulado_evidencia
+          (hallazgo_id, evidencia_id, workspace_id)
+          values (${h!.id as string}, ${evB}, ${wsC})`;
+        await tx`insert into pregunta_de_test
+          (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+          values (${wsC}, ${r!.id as string}, ${h!.id as string}, 0, '¿Cuánto esperarías?', '')`;
+        return r!.id as string;
+      });
+      expect(escrita, 'la revisión completa no entró').toBeTruthy();
+      expect(evA, 'el fixture perdió la evidencia de la primera lente').toBeTruthy();
     });
   });
 

@@ -1422,14 +1422,35 @@ ejecutarlo, para que un borrado irreversible no pueda ser un clic.
 
 - `disposicion_motivo_no_ejecutable` es **la única función** que dice por qué no se puede ejecutar,
   y la invocan la pantalla y el guard: el botón no se ofrece cuando la base lo va a rechazar y no se
-  esconde cuando sí procedía.
-- `ejecutar_disposicion` deriva del catálogo de Postgres el conjunto de tablas alcanzadas, vacía el
-  workspace con los triggers de dominio apagados (`session_replication_role = replica`, que **exige
-  superusuario** en la conexión administrativa; si no lo es, falla con error propio `DS003` antes de
-  tocar nada), recuenta al final y deja una **constancia sellada** (`constancia_disposicion`, hash
-  verificable fuera de la base) con el inventario.
-- La fila `workspace` queda como **lápida** (ancla de la constancia); el nombre de la organización
-  no sobrevive en ella, solo en el texto del acuerdo.
+  esconde cuando sí procedía. Comprueba membresía, rol, cuenta activa, que el workspace no esté ya
+  borrado, que haya acuerdo vigente sin ejecutar y con la retención cumplida (calendario fijado en
+  UTC), que exista una exportación completa en ámbito archivo que **vio** ese acuerdo y, solo para
+  el `borrado`, la doble firma y que **todos los adjuntos cupieran** en esa exportación (ver abajo).
+- `ejecutar_disposicion` deriva del catálogo de Postgres el conjunto de tablas alcanzadas y hace
+  cosas distintas según la **modalidad**:
+  - **`archivo`, no destructivo**: no borra ninguna fila. Recuenta lo que queda **conservado** en
+    ese conjunto, y desde ahí el workspace queda **congelado** a escrituras (ver abajo). La fila
+    `workspace` ni se cuenta ni se congela: conserva su nombre y su cupo de llamadas AI. Es
+    reversible: registrar un acuerdo nuevo es lo que revierte un archivo.
+  - **`borrado`, destructivo**: vacía el workspace con los triggers de dominio apagados
+    (`session_replication_role = replica`, que **exige superusuario** en la conexión
+    administrativa; si no lo es, falla con error propio `DS003` antes de tocar nada), recuenta al
+    final y aborta entero si algo quedó. La fila `workspace` queda como **lápida** (ancla de la
+    constancia): el nombre se sustituye por «Workspace borrado por acuerdo» y el cupo se anula; el
+    nombre de la organización solo sobrevive en el texto del acuerdo.
+  - En las dos modalidades deja una **constancia sellada** (`constancia_disposicion`, hash
+    verificable fuera de la base) con los conteos, el alcance escrito según la modalidad y la
+    remediación (qué material salió a proveedores AI, por modelo, con cuántos ítems y consentimientos).
+- **Límite del borrado por peso de adjuntos**: la exportación embebe adjuntos hasta 25 MiB por paquete
+  y lista el resto con su `sha256`; como entrega vale, como prueba de un borrado no, porque esos
+  bytes nunca salieron. Por eso `disposicion_motivo_no_ejecutable` **rechaza el `borrado`** cuando la
+  suma de adjuntos del workspace supera el presupuesto, y el mensaje sugiere descargarlos y
+  retirarlos hasta bajar de él. Ese remedio solo existe en la aplicación para adjuntos de **ítems
+  pendientes**: la política de DELETE sobre `archivo_importado` y el candado `archivo_item_candado`
+  impiden quitar el original de un ítem ya curado. Un workspace con más de 25 MiB en adjuntos
+  curados **no puede borrarse desde la aplicación**: o se acuerda un `archivo` (que no destruye
+  nada) o interviene la conexión administrativa. Queda anotado como parcial en el Definition of
+  Done (`23`) y en la deuda de la hoja de ruta (`30`).
 - **Congelación por disposición**: un trigger sobre las tablas con `workspace_id` impide escribir en
   un workspace ya dispuesto; el bucle que lo instala es idempotente para que las tablas nuevas lo
   hereden (#39 lo copia). Con **excepciones deliberadas**: `evento_dominio` y
@@ -1701,7 +1722,7 @@ tasa de corrección humana ya se puede derivar de `contenido` vs `contenido_orig
 | Prueba «AI off» del loop completo | **Parcial**: pruebas de degradación (`ai/__tests__/degradacion.test.ts`, `authz/ai.test.ts`) y la app funciona sin key; no hay recorrido E2E del loop con flag |
 | Evals de grounding con línea base | **Diseñado** |
 | Escaneo y validación en la bandeja | **Parcial**: validación de formato, saneado y presupuesto de bytes; sin escaneo de malware |
-| Export/borrado completo verificado contra manifiesto | **Construido** (catálogo contrastado contra FKs vivas; constancia sellada) |
+| Export/borrado completo verificado contra manifiesto | **Parcial**: exportación y disposición construidas (catálogo contrastado contra FKs vivas; constancia sellada), pero el `borrado` se rechaza cuando los adjuntos superan los 25 MiB del paquete, y el remedio en la aplicación (retirar adjuntos) solo alcanza a los de ítems pendientes; con adjuntos curados por encima del presupuesto solo cabe el `archivo` o la conexión administrativa (capítulo 17) |
 | Auditoría cubriendo el catálogo de acciones | **Parcial**: las transiciones y decisiones se emiten desde guards de la base, así que el SQL directo deja acta; las altas y parte de la curaduría (ítems, evidencia curada, adjuntos, insights propuestos, contradicciones, retos, servicios, journeys, arquetipos, decisiones, segmentos, invitaciones) emiten su evento desde el servicio en la misma transacción, sin trigger de tabla, y no hay un censo automático que contraste el catálogo de acciones con los eventos |
 | Secretos en secret manager; cifrado | **Parcial**: variables/secrets de Railway por environment; TLS y cifrado at-rest del Postgres gestionado; BYOAI espera al secret manager |
 | Condiciones de proveedores AI registradas | **Diseñado** (documento operativo pendiente) |
@@ -1841,6 +1862,10 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
   alcance también en el INSERT, y el invariante que importa (no sellar una HMW que no vio todo) lo
   sostiene el guard diferido. Cerrarla del todo es un cambio transversal a todas las capacidades
   (anotado en #45).
+- El **borrado acordado** de un workspace con más de 25 MiB de adjuntos curados no tiene camino en
+  la aplicación: la comprobación de bytes lo rechaza y solo se pueden retirar adjuntos de ítems
+  pendientes. Hace falta exportación por object storage o un paquete multi-parte antes de que ese
+  workspace pueda borrarse sin la conexión administrativa (capítulo 17).
 
 ## Decisiones abiertas del paquete de diseño
 

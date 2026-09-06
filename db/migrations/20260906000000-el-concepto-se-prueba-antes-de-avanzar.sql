@@ -301,28 +301,48 @@ create policy concepto_actualizar on concepto
 create policy concepto_evidencia_select on concepto_evidencia
   for select using (is_workspace_member(app_user_id(), workspace_id));
 
--- Enlazar la prueba: mientras el concepto siga por decidir. Añadir evidencia de test a un
--- concepto ya juzgado cambiaría, después del hecho, en qué se apoyó ese juicio — el mismo
--- argumento que cierra `oportunidad_insight` tras el veredicto.
+-- ── EL EXPEDIENTE SE ARMA HASTA QUE G4 LO MIRA, NO HASTA EL VEREDICTO ──
+--
+-- Aquí decía «mientras el concepto siga por decidir», y era mi razonamiento, no una regla de
+-- nadie: «añadir evidencia a un concepto ya juzgado cambiaría en qué se apoyó ese juicio».
+-- Suena bien y crea un callejón sin salida, que se ve en cuanto se junta con el eje tiempo de
+-- los derechos:
+--
+--   el concepto pasa con su prueba → los derechos de esa evidencia se revocan (una cláusula
+--   que vence, un cliente que se echa atrás) → G4 se niega, y con razón → y no hay forma de
+--   enlazar una prueba de recambio, porque el veredicto no se revierte, la N/A ya no cabe
+--   —hubo test— y la lectura está congelada.
+--
+-- El reto entero se queda sin G4 salvo que se puedan devolver unos derechos que a lo mejor se
+-- retiraron por un motivo legal. Un gate sin salida no es rigor, es una avería.
+--
+-- La ventana correcta es la de G4, no la del veredicto. Lo que el veredicto congela es lo que
+-- AFIRMÓ —la razón, el umbral, la lectura y si la alcanzó, y eso sigue congelado—; el
+-- EXPEDIENTE que el gate va a mirar se sigue armando hasta que el gate lo mira. Después sí se
+-- cierra, y lo cierra `reto_admite_conceptos`, que es la ventana de G4.
+--
+-- El resto de la exclusión no se mueve: sigue sin caber enlazar prueba a un concepto con N/A
+-- aprobada, y el umbral sigue sin poder escribirse con evidencia enlazada.
 create policy concepto_evidencia_insert on concepto_evidencia
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and exists (select 1 from concepto c
       where c.id = concepto_evidencia.concepto_id
         and c.workspace_id = concepto_evidencia.workspace_id
-        and c.estado = 'candidato'
         -- Y sin N/A: o no aplicaba hacer el test, o aplicaba y hay prueba. Nunca las dos.
         and titulo_normalizado(c.test_na_justificacion) = ''
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
+-- Y desenlazar, por la misma ventana y por el mismo caso: una prueba cuyos derechos se
+-- retiraron hay que poder quitarla del expediente. Quitarla y no poner otra deja el gate
+-- bloqueado por «sin evidencia», que es la verdad y se lee en el motivo.
 create policy concepto_evidencia_delete on concepto_evidencia
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and exists (select 1 from concepto c
       where c.id = concepto_evidencia.concepto_id
         and c.workspace_id = concepto_evidencia.workspace_id
-        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -538,17 +558,7 @@ begin
       if not reto_admite_conceptos(v_reto, v_fila.workspace_id) then
         raise exception 'la etapa 4 de ese reto está cerrada: o su G4 está aprobado sin la etapa reabierta, o el reto ya no admite trabajo de método';
       end if;
-      -- Y el ESTADO del concepto, que es la otra condición que miró la política del enlace.
-      -- Releer una y dejar a la hermana con la foto vieja es el mismo error una capa más
-      -- adentro: el enlace califica con el concepto todavía 'candidato', espera detrás del
-      -- UPDATE que lo pasa, y al soltarse ata una prueba a un concepto ya juzgado.
-      if v_concepto is not null and not exists (
-        select 1 from concepto c
-         where c.id = v_concepto and c.workspace_id = v_fila.workspace_id
-           and c.estado = 'candidato') then
-        raise exception 'ese concepto ya se decidió: su evidencia de test no se toca';
-      end if;
-      -- Y el tercer sentido de la exclusión N/A ⇄ prueba: enlazar una a un concepto que ya
+      -- Y la exclusión N/A ⇄ prueba, que es la otra condición que miró la política: enlazar una a un
       -- lleva su N/A aprobada. Se relee aquí y no solo en la política por lo mismo que la
       -- ventana: RLS se evaluó con la instantánea del inicio de la sentencia, y la N/A puede
       -- estar aprobándose en otra transacción a la que este candado acaba de dejar pasar.

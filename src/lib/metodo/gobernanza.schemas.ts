@@ -165,4 +165,21 @@ export type GobernanzaDeProyecto = {
   reaperturas: ReaperturaDeProyecto[];
   /** Segmentos del workspace: el mapeo n:m del arquetipo se elige entre estos (RF-01.7). */
   segmentosDisponibles: { id: string; nombre: string }[];
+  /**
+   * Conceptos del reto: sobre uno de ellos decide un pasa/muere (RF-04.10).
+   *
+   * Con el estado dentro porque la pantalla lo enseña: elegir «El que ya murió» para un
+   * pasa/muere es raro pero no imposible —la decisión y el veredicto son dos escrituras del
+   * mismo acto y pueden llegar en cualquier orden—, y quien decide tiene que ver cuál es cuál.
+   */
+  conceptos: { id: string; titulo: string; estado: EstadoConcepto }[];
+};
+
+/** El ciclo de vida de un concepto, tal como lo escribe su tabla. */
+export const ESTADOS_CONCEPTO = ['candidato', 'pasa', 'muere'] as const;
+export type EstadoConcepto = (typeof ESTADOS_CONCEPTO)[number];
+export const ETIQUETA_ESTADO_CONCEPTO: Record<EstadoConcepto, string> = {
+  candidato: 'candidato',
+  pasa: 'pasa',
+  muere: 'muere',
 };

@@ -448,7 +448,24 @@ export async function gobernanzaDeProyecto(
         coalesce((
           select jsonb_agg(jsonb_build_object('id', s.id, 'nombre', s.nombre) order by s.nombre)
           from segmento s where s.workspace_id = p.workspace_id
-        ), '[]'::jsonb) as segmentos_disponibles
+        ), '[]'::jsonb) as segmentos_disponibles,
+        -- Los CONCEPTOS del reto, que es sobre lo que decide un pasa/muere (RF-04.10). Van en
+        -- la misma sentencia y no en una consulta aparte por lo de siempre: el formulario que
+        -- los ofrece y la validación que los exige tienen que mirar la misma foto, o la
+        -- pantalla ofrece uno que el endpoint ya no admite.
+        --
+        -- TODOS, no solo los candidatos: la lista es el selector de «sobre qué decido», y una
+        -- decisión pasa/muere se registra JUNTO con el veredicto del concepto o justo después
+        -- —son dos escrituras del mismo acto—, así que filtrar por «candidato» dejaría fuera
+        -- exactamente el caso normal. Cuál de ellos tiene ya su decisión lo dice la pantalla
+        -- con lo que ya tiene: «decisiones» trae su «conceptoId».
+        coalesce((
+          select jsonb_agg(jsonb_build_object('id', c.id, 'titulo', c.titulo,
+                                              'estado', c.estado)
+                   order by c.titulo)
+          from concepto c
+          where c.reto_id = p.reto_id and c.workspace_id = p.workspace_id
+        ), '[]'::jsonb) as conceptos
       from proyecto p
       where p.id = ${proyectoId} and p.workspace_id = ${workspaceId}`;
     if (!fila) return null;
@@ -457,6 +474,7 @@ export async function gobernanzaDeProyecto(
       arquetipos: fila.arquetipos as GobernanzaDeProyecto['arquetipos'],
       reaperturas: fila.reaperturas as GobernanzaDeProyecto['reaperturas'],
       segmentosDisponibles: fila.segmentos_disponibles as GobernanzaDeProyecto['segmentosDisponibles'],
+      conceptos: fila.conceptos as GobernanzaDeProyecto['conceptos'],
     };
   });
 }

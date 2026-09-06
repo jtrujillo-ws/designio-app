@@ -700,6 +700,61 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     ).rejects.toThrow(/check constraint/);
   });
 
+  /**
+   * Una prueba que pierde sus derechos se puede REEMPLAZAR mientras G4 siga pendiente.
+   *
+   * Es el callejón que abría mi propia regla anterior —«el enlace, solo mientras el concepto
+   * siga por decidir»— en cuanto se juntaba con el eje tiempo de los derechos: el concepto
+   * pasa con su prueba, los derechos se retiran, G4 se niega con razón, y no había forma de
+   * enlazar un recambio porque el veredicto no se revierte, la N/A ya no cabe —hubo test— y la
+   * lectura está congelada. El reto entero se quedaba sin G4.
+   *
+   * La ventana correcta es la del GATE: lo que el veredicto congela es lo que afirmó; el
+   * expediente que G4 va a mirar se sigue armando hasta que G4 lo mira.
+   */
+  it('la prueba de un concepto pasado se reemplaza mientras G4 siga pendiente', async () => {
+    const admin = sqlAdmin();
+    const { reto, gateId } = await nuevoRetoConG4();
+    const c = await nuevoConcepto('Pasado con material que caducó', reto);
+    await conUsuario(leadId, (tx) => tx`update concepto set umbral_test = '6 de 8'
+      where id = ${c} and workspace_id = ${ws}`);
+    await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
+      (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaId})`);
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set estado = 'pasa', test_lectura = '7 de 8', test_alcanza_umbral = true
+      where id = ${c} and workspace_id = ${ws}`);
+
+    // Se retiran los derechos DESPUÉS del veredicto: G4 se niega, y con razón.
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+      where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    await expect(
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where id = ${gateId}`,
+    ).rejects.toThrow(/derechos vigentes/);
+
+    // Y aquí está la salida: quitar la muerta y poner una viva, con el concepto ya juzgado.
+    await conUsuario(leadId, (tx) => tx`delete from concepto_evidencia
+      where concepto_id = ${c} and evidencia_id = ${evidenciaId} and workspace_id = ${ws}`);
+    await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
+      (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaDelChecklist})`);
+    // Y la salida no es una puerta trasera: lo que el veredicto afirmó sigue congelado. Se
+    // comprueba ANTES de firmar el gate, que es cuando el guard puede hablar — después, la
+    // ventana cerrada filtra la fila y el UPDATE no falla, no alcanza nada.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update concepto set test_lectura = '8 de 8'
+        where id = ${c} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/ya se decidió/);
+
+    await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      where id = ${gateId}`;
+    const [tras] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(tras!.estado).toBe('aprobado');
+
+    // Y devolver los derechos para no dejarle el arnés roto a los casos de después.
+    await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+      where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+  });
+
   /** Quien no hace método no propone conceptos: es trabajo de diseño, no de lectura. */
   it('un stakeholder no puede crear conceptos', async () => {
     await expect(

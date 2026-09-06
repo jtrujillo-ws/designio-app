@@ -21,6 +21,7 @@ import {
   COLOR_ARQUETIPO,
   ETIQUETA_ALCANCE,
   ETIQUETA_ESTADO_ARQUETIPO,
+  ETIQUETA_ESTADO_CONCEPTO,
   ETIQUETA_TIPO_DECISION,
   TIPOS_DECISION,
   type GobernanzaDeProyecto,
@@ -84,6 +85,7 @@ export function SeccionGobernanza({
         decisiones={gobernanza.decisiones}
         insightsValidados={insightsValidados}
         hayMasInsights={hayMasInsights}
+        conceptos={gobernanza.conceptos}
         esLead={esLead}
         onCambio={onCambio}
         onError={onError}
@@ -119,6 +121,7 @@ function BloqueDecisiones({
   decisiones,
   insightsValidados,
   hayMasInsights,
+  conceptos,
   esLead,
   onCambio,
   onError,
@@ -128,6 +131,7 @@ function BloqueDecisiones({
   decisiones: GobernanzaDeProyecto['decisiones'];
   insightsValidados: { id: string; titulo: string }[];
   hayMasInsights: boolean;
+  conceptos: GobernanzaDeProyecto['conceptos'];
   esLead: boolean;
   onCambio: () => Promise<void>;
   onError: (e: string | null) => void;
@@ -138,6 +142,9 @@ function BloqueDecisiones({
   const [titulo, setTitulo] = useState('');
   const [fundamento, setFundamento] = useState('');
   const [insightIds, setInsightIds] = useState<string[]>([]);
+  /* Vacío = «ninguno elegido». Solo viaja cuando el tipo lo pide, que es lo que el contrato
+   * exige en los dos sentidos: un pasa/muere decide un concepto, y solo él lo decide. */
+  const [conceptoId, setConceptoId] = useState('');
   const [ocupado, setOcupado] = useState(false);
 
   async function registrar() {
@@ -145,13 +152,24 @@ function BloqueDecisiones({
     onError(null);
     try {
       const r = await aprobarDecision({
-        data: { workspaceId, gateId, tipo, titulo, fundamento, insightIds },
+        data: {
+          workspaceId,
+          gateId,
+          tipo,
+          titulo,
+          fundamento,
+          insightIds,
+          /* `undefined` y no `''`: el esquema espera un uuid o la ausencia, y una cadena vacía
+           * sería un tercer valor que ninguno de los dos lados sabe leer. */
+          ...(tipo === 'pasa-muere' && conceptoId ? { conceptoId } : {}),
+        },
       });
       if (r.ok) {
         setAbierto(false);
         setTitulo('');
         setFundamento('');
         setInsightIds([]);
+        setConceptoId('');
         await onCambio();
       } else onError(r.error);
     } catch {
@@ -272,6 +290,23 @@ function BloqueDecisiones({
               </option>
             ))}
           </Select>
+          {tipo === 'pasa-muere' && (
+            <Select value={conceptoId} onChange={(e) => setConceptoId(e.target.value)}>
+              <option value="">Concepto que se decide…</option>
+              {conceptos.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.titulo}
+                  {c.estado === 'candidato' ? '' : ` · ${ETIQUETA_ESTADO_CONCEPTO[c.estado]}`}
+                </option>
+              ))}
+            </Select>
+          )}
+          {tipo === 'pasa-muere' && conceptos.length === 0 && (
+            <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
+              Este reto no tiene conceptos todavía: un pasa/muere decide SOBRE uno (RF-04.10).
+              Créalos en la etapa 4 antes de registrar la decisión.
+            </span>
+          )}
           <Input
             placeholder="Qué se decidió"
             value={titulo}

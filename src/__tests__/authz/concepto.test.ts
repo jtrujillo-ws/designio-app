@@ -622,6 +622,84 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
       where id = ${c} and workspace_id = ${ws}`);
   });
 
+  /**
+   * La N/A y una prueba registrada se excluyen, en los tres sentidos.
+   *
+   * Yo mismo lo había escrito en prosa —«no aplica» es mentira cuando el test se hizo y salió
+   * corto— y no lo exigía nada: el `or` del CHECK acepta la N/A mire lo que mire la lectura,
+   * así que un concepto con `test_alcanza_umbral = false` al que se le añadía una
+   * justificación antes del veredicto pasaba, y G4 se saltaba con él la evidencia, los
+   * derechos y el umbral de una vez.
+   *
+   * Tres puertas porque son tres escrituras distintas: la lectura sobre una N/A puesta, la N/A
+   * sobre una prueba enlazada, y el enlace sobre una N/A aprobada.
+   */
+  it('la N/A del test y una prueba registrada no caben en el mismo concepto', async () => {
+    const { reto } = await nuevoRetoConG4();
+
+    // 1. Lectura sobre N/A puesta: lo para el CHECK de la fila.
+    const conNa = await nuevoConcepto('Con N/A y sin test', reto);
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set test_na_justificacion = 'Proceso interno, sin usuario que testear'
+      where id = ${conNa} and workspace_id = ${ws}`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update concepto
+        set test_lectura = '2 de 8', test_alcanza_umbral = false
+        where id = ${conNa} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/check constraint/);
+
+    // 2. Enlace sobre N/A aprobada.
+    await expect(
+      conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
+        (workspace_id, concepto_id, evidencia_id) values (${ws}, ${conNa}, ${evidenciaId})`),
+    ).rejects.toThrow(/N\/A de test aprobada|row-level security|policy/i);
+
+    // 3. N/A sobre prueba enlazada: el caso que de verdad se colaba.
+    const conTest = await nuevoConcepto('Con test que se quedó corto', reto);
+    await conUsuario(leadId, (tx) => tx`update concepto set umbral_test = '6 de 8'
+      where id = ${conTest} and workspace_id = ${ws}`);
+    await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
+      (workspace_id, concepto_id, evidencia_id) values (${ws}, ${conTest}, ${evidenciaId})`);
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set test_lectura = '2 de 8', test_alcanza_umbral = false
+      where id = ${conTest} and workspace_id = ${ws}`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update concepto
+        set test_na_justificacion = 'Mejor digamos que no aplicaba'
+        where id = ${conTest} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/ya tiene prueba de test enlazada|check constraint/);
+  });
+
+  /**
+   * Un tabulador no es una justificación.
+   *
+   * `btrim` de un argumento quita ESPACIOS y nada más, así que un tabulador pasaba por «texto
+   * no vacío»: el trigger le sellaba aprobador, la fila lo daba por válido y las
+   * comprobaciones de G4 se saltaban enteras la evidencia y el umbral. Es la misma lección que
+   * ya pagó la razón de una reapertura, y la función que la cerró —`titulo_normalizado`— es la
+   * que este esquema usa para «texto vacío».
+   */
+  it('una N/A en blanco con tabuladores no cuenta como aprobada', async () => {
+    const admin = sqlAdmin();
+    const { reto } = await nuevoRetoConG4();
+    const c = await nuevoConcepto('Con N/A de mentira', reto);
+
+    // Guardar el blanco no falla —es texto, y guardarlo no afirma nada— pero NO se firma: sin
+    // justificación de verdad no hay a quién atribuirle la excepción. Con `btrim`, el trigger
+    // le sellaba aprobador aquí mismo.
+    await conUsuario(leadId, (tx) => tx`update concepto set test_na_justificacion = ${'\t\n  '}
+      where id = ${c} and workspace_id = ${ws}`);
+    const [sinFirma] = await admin`select test_na_aprobado_por from concepto where id = ${c}`;
+    expect(sinFirma!.test_na_aprobado_por).toBeNull();
+
+    // Y sobre todo: no abre la puerta. Con `btrim`, este UPDATE pasaba —el `or` de la N/A daba
+    // por buena la cadena de tabuladores— y el concepto avanzaba sin prueba ninguna.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update concepto set estado = 'pasa'
+        where id = ${c} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/check constraint/);
+  });
+
   /** Quien no hace método no propone conceptos: es trabajo de diseño, no de lectura. */
   it('un stakeholder no puede crear conceptos', async () => {
     await expect(

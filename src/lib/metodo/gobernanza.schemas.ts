@@ -27,15 +27,20 @@ export const RegistrarDecisionSchema = z.object({
   /**
    * Qué concepto se decide, cuando la decisión es un pasa/muere (RF-04.10).
    *
-   * Opcional porque el resto de tipos no decide ningún concepto, y porque hay decisiones
-   * 'pasa-muere' anteriores a que la tabla existiera. La ATADURA —un concepto solo cuelga de
-   * una decisión de ese tipo— es un CHECK de la base; aquí se anticipa para que la pantalla
-   * diga qué pasa en vez de enseñar un 23514.
+   * Opcional en el TIPO y obligatorio en el REFINE, que no es lo mismo: el resto de tipos no
+   * decide ningún concepto, y un pasa/muere sin concepto no es una decisión incompleta, es un
+   * pasa/muere que no dice sobre qué. La compatibilidad que las filas antiguas necesitan es
+   * que la COLUMNA admita nulos —hay decisiones 'pasa-muere' anteriores a que la tabla
+   * existiera—, y eso no obliga a seguir aceptando altas nuevas sin él.
+   *
+   * La atadura al revés —un concepto solo cuelga de una decisión de ese tipo— es un CHECK de
+   * la base; aquí se anticipan las dos para que la pantalla diga qué pasa en vez de enseñar
+   * un 23514.
    */
   conceptoId: z.string().uuid().optional(),
-}).refine((d) => d.conceptoId === undefined || d.tipo === 'pasa-muere', {
+}).refine((d) => (d.tipo === 'pasa-muere') === (d.conceptoId !== undefined), {
   path: ['conceptoId'],
-  message: 'Solo una decisión de tipo pasa/muere decide un concepto',
+  message: 'Una decisión pasa/muere decide un concepto, y solo ella lo decide',
 });
 export type RegistrarDecision = z.infer<typeof RegistrarDecisionSchema>;
 

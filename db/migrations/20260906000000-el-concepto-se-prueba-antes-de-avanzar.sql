@@ -57,7 +57,13 @@ create table concepto (
   -- claro quién la firmó. Misma forma que la N/A de `checklist_item`, por la misma razón.
   test_na_justificacion text not null default '',
   test_na_aprobado_por uuid,
-  check ((btrim(test_na_justificacion) <> '') = (test_na_aprobado_por is not null)),
+  -- `titulo_normalizado` y no `btrim`, en ésta y en todas las de aquí abajo. El `btrim` de un
+  -- argumento quita ESPACIOS y nada más: un tabulador o un salto de línea pasan por «texto no
+  -- vacío», y con la superficie concedida eso bastaba para poner una N/A en blanco —el trigger
+  -- le sellaba aprobador, la fila la daba por válida y las comprobaciones de G4 se saltaban
+  -- enteras la evidencia y el umbral—. Es la misma lección que ya pagó la razón de una
+  -- reapertura, y la función que la cerró es la que este esquema usa para «texto vacío».
+  check ((titulo_normalizado(test_na_justificacion) <> '') = (test_na_aprobado_por is not null)),
   -- ── EL UMBRAL, que es la primera mitad de SYS-13 y faltaba entera ──
   --
   -- «Evidencia de test que alcance EL UMBRAL DEFINIDO». Enlazar una evidencia no dice nada de
@@ -94,7 +100,7 @@ create table concepto (
   -- forma con la que este esquema trata siempre un juicio humano: se registra, se firma y
   -- queda auditable, en vez de simularse con una comparación que no significa nada.
   test_alcanza_umbral boolean,
-  check ((btrim(test_lectura) <> '') = (test_alcanza_umbral is not null)),
+  check ((titulo_normalizado(test_lectura) <> '') = (test_alcanza_umbral is not null)),
   -- Lo que AVANZA dice una de dos cosas: «la N/A está aprobada, por esto» o «el umbral era X,
   -- la lectura fue Y, y SÍ lo alcanzó». Nunca ninguna, y nunca una lectura que no llegó: un
   -- concepto cuyo test no alcanzó el listón no pasa —muere con su razón, que es la otra mitad
@@ -102,8 +108,23 @@ create table concepto (
   -- y salió corto. El que muere y el que sigue candidato no deben nada: SYS-13 habla de «cada
   -- concepto que avanza».
   check (estado <> 'pasa'
-         or btrim(test_na_justificacion) <> ''
-         or (btrim(umbral_test) <> '' and test_alcanza_umbral)),
+         or titulo_normalizado(test_na_justificacion) <> ''
+         or (titulo_normalizado(umbral_test) <> '' and test_alcanza_umbral)),
+  -- Y la N/A EXCLUYE una prueba registrada, que es lo que faltaba para que la frase de arriba
+  -- signifique algo.
+  --
+  -- Dicho estaba —«no aplica» es mentira cuando el test se hizo y salió corto— y no estaba
+  -- exigido: el `or` de arriba acepta la N/A mire lo que mire la lectura, así que un concepto
+  -- con `test_alcanza_umbral = false` al que se le añadía una justificación antes del veredicto
+  -- pasaba, y G4 se saltaba con él la evidencia, los derechos y el umbral de una vez. La regla
+  -- que yo mismo había escrito en prosa no la cumplía ninguna comprobación.
+  --
+  -- Se excluye contra la LECTURA y no contra el umbral: declarar el listón y no llegar a
+  -- probar es una secuencia legítima —el test se cae, el equipo aprueba la N/A— y ahí el
+  -- listón declarado es historia útil, no una contradicción. Lo que no cabe es haber medido y
+  -- decir que no aplicaba.
+  check (titulo_normalizado(test_na_justificacion) = ''
+         or titulo_normalizado(test_lectura) = ''),
   creado_por uuid not null,
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
@@ -290,6 +311,8 @@ create policy concepto_evidencia_insert on concepto_evidencia
       where c.id = concepto_evidencia.concepto_id
         and c.workspace_id = concepto_evidencia.workspace_id
         and c.estado = 'candidato'
+        -- Y sin N/A: o no aplicaba hacer el test, o aplicaba y hay prueba. Nunca las dos.
+        and titulo_normalizado(c.test_na_justificacion) = ''
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -375,7 +398,15 @@ begin
     if old.estado <> 'candidato' then
       raise exception 'ese concepto ya se decidió: la N/A del test se aprueba antes del veredicto, no después (SYS-13)';
     end if;
-    if btrim(new.test_na_justificacion) <> '' then
+    if titulo_normalizado(new.test_na_justificacion) <> '' then
+      -- La otra mitad de la exclusión N/A ⇄ prueba, la que el CHECK de la fila no alcanza: si
+      -- hay prueba ENLAZADA, el test se hizo, y «no aplica» ya no es una frase disponible. Sin
+      -- esto, la exclusión contra la lectura se sortea dejando la lectura en blanco y colgando
+      -- la evidencia — el mismo resultado, por la puerta de al lado.
+      if exists (select 1 from concepto_evidencia ce
+        where ce.concepto_id = new.id and ce.workspace_id = new.workspace_id) then
+        raise exception 'ese concepto ya tiene prueba de test enlazada: la N/A dice que no aplica hacer el test, y aquí se hizo. Desenlázala si de verdad no aplicaba (SYS-13)';
+      end if;
       select g.rol_aprobador into v_rol_del_gate
         from gate_instancia g
         join proyecto p on p.id = g.proyecto_id and p.workspace_id = g.workspace_id
@@ -516,6 +547,16 @@ begin
          where c.id = v_concepto and c.workspace_id = v_fila.workspace_id
            and c.estado = 'candidato') then
         raise exception 'ese concepto ya se decidió: su evidencia de test no se toca';
+      end if;
+      -- Y el tercer sentido de la exclusión N/A ⇄ prueba: enlazar una a un concepto que ya
+      -- lleva su N/A aprobada. Se relee aquí y no solo en la política por lo mismo que la
+      -- ventana: RLS se evaluó con la instantánea del inicio de la sentencia, y la N/A puede
+      -- estar aprobándose en otra transacción a la que este candado acaba de dejar pasar.
+      if tg_op = 'INSERT' and v_concepto is not null and exists (
+        select 1 from concepto c
+         where c.id = v_concepto and c.workspace_id = v_fila.workspace_id
+           and titulo_normalizado(c.test_na_justificacion) <> '') then
+        raise exception 'ese concepto tiene una N/A de test aprobada: o no aplicaba hacer el test, o aplicaba y hay prueba, pero no las dos (SYS-13)';
       end if;
     end if;
   end if;
@@ -824,7 +865,7 @@ begin
     from concepto c
     where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
       and c.estado = 'pasa'
-      and btrim(c.test_na_justificacion) = ''
+      and titulo_normalizado(c.test_na_justificacion) = ''
       and not exists (select 1 from concepto_evidencia ce
         where ce.concepto_id = c.id and ce.workspace_id = c.workspace_id)
     order by c.titulo asc
@@ -848,7 +889,7 @@ begin
     from concepto c
     where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
       and c.estado = 'pasa'
-      and btrim(c.test_na_justificacion) = ''
+      and titulo_normalizado(c.test_na_justificacion) = ''
       -- Con evidencia enlazada, y solo entonces: al que no tiene ninguna ya lo nombra la rama
       -- de arriba, y decirle además que su prueba perdió los derechos sería contarle dos veces
       -- lo mismo con la segunda mitad mintiendo — no perdió nada, es que nunca hubo.
@@ -870,8 +911,8 @@ begin
     from concepto c
     where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
       and c.estado = 'pasa'
-      and btrim(c.test_na_justificacion) = ''
-      and (btrim(c.umbral_test) = '' or c.test_alcanza_umbral is not true)
+      and titulo_normalizado(c.test_na_justificacion) = ''
+      and (titulo_normalizado(c.umbral_test) = '' or c.test_alcanza_umbral is not true)
     order by c.titulo asc
     limit 1;
     if v_falta_concepto is not null then

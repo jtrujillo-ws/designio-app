@@ -498,7 +498,10 @@ export async function gobernanzaDeProyecto(
                               'preguntas', coalesce((
                                 select jsonb_agg(jsonb_build_object(
                                          'id', q.id, 'pregunta', q.pregunta,
-                                         'escenario', q.escenario)
+                                         'escenario', q.escenario,
+                                         -- Puede ser null, y por eso no va en jsonb_strip_nulls
+                                         -- ni en un coalesce: «de ningún hallazgo» es un valor.
+                                         'hallazgoId', q.hallazgo_id)
                                        order by q.orden)
                                 from pregunta_de_test q
                                 where q.revision_id = r.id and q.workspace_id = r.workspace_id

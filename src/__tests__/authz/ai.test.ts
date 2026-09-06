@@ -9199,7 +9199,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   it('una revisión aceptada llega a quien decide el pasa/muere, con sus preguntas', async () => {
     await enWorkspaceLimpio('c4-lectura', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();
-      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
       const [proy] = await admin`insert into proyecto
         (workspace_id, reto_id, codigo, titulo, creado_por)
         values (${wsC}, ${retoC}, 'P-C4', 'Proyecto de la lectura', ${curadorId})
@@ -9229,7 +9229,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   },
                 ],
                 preguntas: [
-                  { pregunta: '¿Qué te haría entregar la cédula?', escenario: 'Alta con verificación diferida' },
+                  {
+                    pregunta: '¿Qué te haría entregar la cédula?',
+                    escenario: 'Alta con verificación diferida',
+                    hallazgoIndice: 0,
+                  },
+                  { pregunta: '¿Hasta dónde llegarías antes de irte?', escenario: '' },
                 ],
                 confianzaPropuesta: 'media',
               },
@@ -9268,8 +9273,49 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         'Entrevista D-01',
       ]);
       expect(rev!.hallazgos[1]!.citas, 'una hipótesis no cita nada').toEqual([]);
-      expect(rev!.preguntas.map((q) => q.pregunta)).toEqual(['¿Qué te haría entregar la cédula?']);
+      expect(rev!.preguntas.map((q) => q.pregunta)).toEqual([
+        '¿Qué te haría entregar la cédula?',
+        '¿Hasta dónde llegarías antes de irte?',
+      ]);
       expect(rev!.preguntas[0]!.escenario).toBe('Alta con verificación diferida');
+
+      /*
+       * Y DE QUÉ HALLAZGO NACE CADA PREGUNTA.
+       *
+       * La base lo guarda —`pregunta_de_test.hallazgo_id`, con clave ajena compuesta a
+       * `hallazgo_simulado (id, revision_id)`— y la tarjeta de la propuesta pendiente lo dice
+       * («Nace del hallazgo N»). La proyección lo dejaba caer, así que el rastro de un riesgo
+       * simulado a la pregunta que hay que ir a probar se cortaba EXACTAMENTE al aceptar, que
+       * es cuando se está decidiendo el pasa/muere.
+       *
+       * Las dos ramas, porque el enlace es opcional: la primera pregunta nace del hallazgo
+       * observado, la segunda no nace de ninguno.
+       */
+      const [enLaBase] = await admin`select count(*)::int as n from pregunta_de_test
+        where revision_id = ${rev!.id} and hallazgo_id is not null`;
+      expect(enLaBase!.n, 'la base no guardó el enlace: la sonda no mide la pérdida').toBe(1);
+      expect(rev!.preguntas.map((q) => q.hallazgoId)).toEqual([rev!.hallazgos[0]!.id, null]);
+
+      /*
+       * Y LA PROCEDENCIA SE DISTINGUE, que es el campo del que la pantalla cuelga su etiqueta.
+       *
+       * `revision_simulada` no es una tabla de la AI: SYS-21 deja escribir la sesión a mano, y
+       * esas filas llegan a esta misma proyección con `propuesta_ai_id` en null. La pantalla
+       * decía «simulación AI» sin mirar el campo y dos palabras después «escrita a mano»: las
+       * dos cosas a la vez, con una de ellas falsa, delante de quien firma un pasa/muere. La
+       * marca de simulación es de todas —eso es SYS-20— y la autoría no, así que la sonda pide
+       * las dos filas por el mismo lector y que el campo las separe.
+       */
+      const aMano = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Leída a mano por una persona'),
+      );
+      const gob2 = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const revs = gob2!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      expect(revs.length, 'la revisión escrita a mano no llega al mismo lector').toBe(2);
+      expect(
+        Object.fromEntries(revs.map((x) => [x.id, x.propuestaAiId])),
+        'la procedencia no distingue lo que propuso la AI de lo que escribió una persona',
+      ).toEqual({ [rev!.id]: propuestaId, [aMano]: null });
     });
   });
 

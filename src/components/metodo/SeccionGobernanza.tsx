@@ -831,6 +831,15 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
             <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
               {r.arquetipoEstado}
             </span>
+            {/*
+              * La etiqueta de SYS-20 va SIEMPRE —toda revisión de esta tabla es simulación, la
+              * escriba quien la escriba— pero la AUTORÍA no: decía «simulación AI» encima de
+              * una fila que dos palabras después se declaraba «escrita a mano», o sea las dos
+              * cosas a la vez y una de ellas falsa. Quien lee esto está firmando un pasa/muere;
+              * una procedencia contradictoria es de las que se resuelven creyendo la mitad
+              * equivocada. La marca de simulación y de dónde salió son dos hechos distintos y
+              * ahora se dicen por separado.
+              */}
             <span
               style={{
                 font: '600 10.5px var(--font-sans)',
@@ -840,13 +849,11 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
                 padding: '1px 5px',
               }}
             >
-              simulación AI
+              simulación
             </span>
-            {r.propuestaAiId === null && (
-              <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
-                escrita a mano
-              </span>
-            )}
+            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
+              {r.propuestaAiId === null ? 'escrita a mano' : 'propuesta por AI'}
+            </span>
           </header>
           <p style={{ font: '400 12px var(--font-sans)', margin: 0 }}>{r.sintesis}</p>
           <ul style={{ display: 'grid', gap: 5, margin: 0, paddingLeft: 16 }}>
@@ -873,14 +880,24 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
                 Qué ir a probar con personas
               </span>
               <ul style={{ display: 'grid', gap: 3, margin: 0, paddingLeft: 16 }}>
-                {r.preguntas.map((q) => (
-                  <li key={q.id} style={{ font: '400 12px var(--font-sans)' }}>
-                    {q.pregunta}
-                    {q.escenario !== '' && (
-                      <span style={{ color: 'var(--texto-3)' }}> · {q.escenario}</span>
-                    )}
-                  </li>
-                ))}
+                {r.preguntas.map((q) => {
+                  // Por TÍTULO, no por número. La tarjeta de la propuesta pendiente dice «Nace
+                  // del hallazgo N» porque ahí lo único que hay es el índice del contenido;
+                  // aquí el hallazgo ya es una fila con nombre, y un nombre no obliga a contar
+                  // viñetas hacia arriba para saber de qué se está hablando.
+                  const nace = r.hallazgos.find((h) => h.id === q.hallazgoId);
+                  return (
+                    <li key={q.id} style={{ font: '400 12px var(--font-sans)' }}>
+                      {q.pregunta}
+                      {q.escenario !== '' && (
+                        <span style={{ color: 'var(--texto-3)' }}> · {q.escenario}</span>
+                      )}
+                      {nace !== undefined && (
+                        <span style={{ color: 'var(--texto-3)' }}> · nace de «{nace.titulo}»</span>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           )}

@@ -215,7 +215,20 @@ export type RevisionSimuladaDeConcepto = {
     citas: string[];
   }[];
   /** Lo único que esta sesión le entrega a la etapa 4: qué ir a probar con personas. */
-  preguntas: { id: string; pregunta: string; escenario: string }[];
+  preguntas: {
+    id: string;
+    pregunta: string;
+    escenario: string;
+    /**
+     * De qué hallazgo nace, o `null` si no nace de ninguno.
+     *
+     * El enlace es opcional en la base y no es adorno: distingue «ve a comprobar ESTE riesgo
+     * que la simulación se inventó» de una pregunta suelta. La tarjeta de la propuesta
+     * pendiente ya lo dice —«Nace del hallazgo N»— y perderlo al aceptar cortaría el rastro
+     * justo cuando se está decidiendo el pasa/muere.
+     */
+    hallazgoId: string | null;
+  }[];
 };
 
 /** El ciclo de vida de un concepto, tal como lo escribe su tabla. */

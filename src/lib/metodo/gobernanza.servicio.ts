@@ -459,9 +459,55 @@ export async function gobernanzaDeProyecto(
         -- —son dos escrituras del mismo acto—, así que filtrar por «candidato» dejaría fuera
         -- exactamente el caso normal. Cuál de ellos tiene ya su decisión lo dice la pantalla
         -- con lo que ya tiene: «decisiones» trae su «conceptoId».
+        --
+        -- Y CON SUS REVISIONES SIMULADAS ACEPTADAS DENTRO. Iban a ninguna parte: C4 las
+        -- escribía y el panel de propuestas solo pinta lo que sigue en «estado = propuesta»,
+        -- así que en cuanto se aceptaban desaparecían de la única pantalla que las mostraba.
+        -- Las preguntas de test son lo único que una simulación le entrega a la etapa 4
+        -- (RF-08.2), y quien decide el pasa/muere es exactamente quien tiene que leerlas.
+        --
+        -- Va en la MISMA sentencia que los conceptos por lo de siempre: quien elige el concepto
+        -- y quien lee sus revisiones tienen que mirar la misma foto.
         coalesce((
-          select jsonb_agg(jsonb_build_object('id', c.id, 'titulo', c.titulo,
-                                              'estado', c.estado)
+          select jsonb_agg(jsonb_build_object(
+                   'id', c.id, 'titulo', c.titulo, 'estado', c.estado,
+                   'revisiones', coalesce((
+                     select jsonb_agg(jsonb_build_object(
+                              'id', r.id,
+                              'arquetipoNombre', a.nombre,
+                              'arquetipoEstado', a.estado,
+                              'sintesis', r.sintesis,
+                              'propuestaAiId', r.propuesta_ai_id,
+                              'hallazgos', coalesce((
+                                select jsonb_agg(jsonb_build_object(
+                                         'id', h.id, 'titulo', h.titulo,
+                                         'descripcion', h.descripcion,
+                                         'esHipotesis', h.es_hipotesis,
+                                         'citas', coalesce((
+                                           select jsonb_agg(e.titulo order by e.titulo)
+                                           from hallazgo_simulado_evidencia he
+                                           join evidencia e on e.id = he.evidencia_id
+                                            and e.workspace_id = he.workspace_id
+                                           where he.hallazgo_id = h.id
+                                             and he.workspace_id = h.workspace_id
+                                         ), '[]'::jsonb))
+                                       order by h.orden)
+                                from hallazgo_simulado h
+                                where h.revision_id = r.id and h.workspace_id = r.workspace_id
+                              ), '[]'::jsonb),
+                              'preguntas', coalesce((
+                                select jsonb_agg(jsonb_build_object(
+                                         'id', q.id, 'pregunta', q.pregunta,
+                                         'escenario', q.escenario)
+                                       order by q.orden)
+                                from pregunta_de_test q
+                                where q.revision_id = r.id and q.workspace_id = r.workspace_id
+                              ), '[]'::jsonb))
+                            order by a.nombre)
+                     from revision_simulada r
+                     join arquetipo a on a.id = r.arquetipo_id and a.workspace_id = r.workspace_id
+                     where r.concepto_id = c.id and r.workspace_id = c.workspace_id
+                   ), '[]'::jsonb))
                    order by c.titulo)
           from concepto c
           where c.reto_id = p.reto_id and c.workspace_id = p.workspace_id

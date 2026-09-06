@@ -72,6 +72,7 @@ import {
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
+import { gobernanzaDeProyecto } from '@/lib/metodo/gobernanza.servicio';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
 import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
@@ -7788,7 +7789,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const despues = await panelPropuestas(curadorId, wsC);
       const p2 = despues.pendientes.find((x) => x.id === p.id);
       expect(p2, 'la propuesta desapareció del panel').toBeDefined();
-      expect(p2!.anclaEstado).toBe('reto-no-admite');
+      // Y con NOMBRE PROPIO. Esta rama emitía `reto-no-admite`, que es el estado de C0 y cuyo
+      // texto habla de criterios y del ciclo candidato/activo del reto: nombraba otra etapa y
+      // otro objeto que los que de verdad se cerraron. Un motivo que apunta donde no es hace
+      // perder más tiempo que uno genérico, así que la ventana de C4 tiene el suyo.
+      expect(p2!.anclaEstado).toBe('revisiones-cerradas');
     });
   });
 
@@ -9172,6 +9177,99 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (evento!.payload as Record<string, unknown>).propuestaAiId,
         'el libro anota como escrita a mano una revisión que salió de una propuesta',
       ).toBe(propuestaId);
+    });
+  });
+
+  /**
+   * Y lo aceptado SE LEE: la revisión llega a quien decide el pasa/muere.
+   *
+   * C4 escribía y nadie leía. Un barrido del código de producción lo dejaba claro: las únicas
+   * menciones a `revision_simulada` fuera de migraciones y pruebas eran tres `not exists` —la
+   * ventana de lentes, que las descuenta sin mirar su contenido—, dos `insert into`, y el
+   * catálogo de exportación, que las poda del entregable. En cuanto la propuesta se aceptaba
+   * desaparecía del panel, que solo pinta `estado = 'propuesta'`.
+   *
+   * Y lo que se perdía no es un detalle: las preguntas de test son lo ÚNICO que una simulación
+   * le entrega a la etapa 4 (RF-08.2), porque sus hallazgos no se citan ni cuentan en G4. Sin
+   * lector, la capacidad producía datos que nadie podía usar.
+   *
+   * Se mide por el camino real y hasta la proyección que alimenta la pantalla: generar, aceptar,
+   * y leer la gobernanza del proyecto como la lee quien registra el pasa/muere.
+   */
+  it('una revisión aceptada llega a quien decide el pasa/muere, con sus preguntas', async () => {
+    await enWorkspaceLimpio('c4-lectura', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4', 'Proyecto de la lectura', ${curadorId})
+        returning id`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'No entrega el documento sin saber para qué.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                  {
+                    titulo: 'Quizá abandone el alta',
+                    descripcion: 'Extrapolando, se iría antes de terminar.',
+                    esHipotesis: true,
+                    citas: [],
+                  },
+                ],
+                preguntas: [
+                  { pregunta: '¿Qué te haría entregar la cédula?', escenario: 'Alta con verificación diferida' },
+                ],
+                confianzaPropuesta: 'media',
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+
+      // Y ya no está en el panel: por eso hace falta el otro lector.
+      const despues = await panelPropuestas(curadorId, wsC);
+      expect(
+        despues.pendientes.some((x) => x.id === propuestaId),
+        'la propuesta aceptada sigue en el panel: la sonda no mide la pérdida',
+      ).toBe(false);
+
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const concepto = gob!.conceptos.find((c) => c.id === conceptoId);
+      expect(concepto, 'el concepto no llega a la gobernanza').toBeDefined();
+      expect(concepto!.revisiones.length, 'la revisión aceptada no se lee desde ninguna parte').toBe(1);
+      const [rev] = concepto!.revisiones;
+      expect(rev!.arquetipoNombre).toBe('El desconfiado digital');
+      expect(rev!.sintesis).toBe('No entrega el documento sin saber para qué.');
+      expect(rev!.propuestaAiId, 'la revisión no dice de qué propuesta salió').toBe(propuestaId);
+      expect(rev!.hallazgos.map((h) => h.esHipotesis)).toEqual([false, true]);
+      expect(rev!.hallazgos[0]!.citas, 'la cita no llega con el título del documento').toEqual([
+        'Entrevista D-01',
+      ]);
+      expect(rev!.hallazgos[1]!.citas, 'una hipótesis no cita nada').toEqual([]);
+      expect(rev!.preguntas.map((q) => q.pregunta)).toEqual(['¿Qué te haría entregar la cédula?']);
+      expect(rev!.preguntas[0]!.escenario).toBe('Alta con verificación diferida');
     });
   });
 

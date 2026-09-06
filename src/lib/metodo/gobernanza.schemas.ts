@@ -172,7 +172,50 @@ export type GobernanzaDeProyecto = {
    * pasa/muere es raro pero no imposible —la decisión y el veredicto son dos escrituras del
    * mismo acto y pueden llegar en cualquier orden—, y quien decide tiene que ver cuál es cuál.
    */
-  conceptos: { id: string; titulo: string; estado: EstadoConcepto }[];
+  conceptos: {
+    id: string;
+    titulo: string;
+    estado: EstadoConcepto;
+    /**
+     * Y LAS REVISIONES SIMULADAS QUE YA SE ACEPTARON SOBRE ÉL.
+     *
+     * Sin esto, C4 escribía y nadie leía: la revisión, sus hallazgos, sus citas y las preguntas
+     * de test entraban en la base y salían del panel —que solo pinta `estado = 'propuesta'`— sin
+     * ninguna pantalla detrás. Las preguntas son lo único que una simulación le entrega a la
+     * etapa 4 (RF-08.2), así que dejarlas sin lector es dejar la capacidad sin entregar.
+     *
+     * Las cinco capacidades que materializan tienen su sitio donde leer lo aceptado: los
+     * insights en `/insights`, las entradas de KPI en el registry, las HMW en el portafolio, el
+     * post mortem en medición. Ésta es el de C4.
+     */
+    revisiones: RevisionSimuladaDeConcepto[];
+  }[];
+};
+
+/**
+ * Una sesión de revisión simulada, tal como la lee quien decide el pasa/muere.
+ *
+ * Con la lente y su estado por delante, porque es lo que dice DESDE QUÉ perfil se leyó, y con
+ * la marca de simulación en cada hallazgo: SYS-20 pide que no se pueda confundir con
+ * investigación, y eso vale también donde se lee, no solo donde se guarda.
+ */
+export type RevisionSimuladaDeConcepto = {
+  id: string;
+  arquetipoNombre: string;
+  arquetipoEstado: string;
+  sintesis: string;
+  /** De qué propuesta salió, o `null` si la escribió una persona (SYS-21). */
+  propuestaAiId: string | null;
+  hallazgos: {
+    id: string;
+    titulo: string;
+    descripcion: string;
+    esHipotesis: boolean;
+    /** Los documentos que sostienen la lectura, por título. Vacío en una hipótesis. */
+    citas: string[];
+  }[];
+  /** Lo único que esta sesión le entrega a la etapa 4: qué ir a probar con personas. */
+  preguntas: { id: string; pregunta: string; escenario: string }[];
 };
 
 /** El ciclo de vida de un concepto, tal como lo escribe su tabla. */

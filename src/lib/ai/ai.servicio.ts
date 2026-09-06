@@ -1717,12 +1717,16 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
          * la relectura del material o en la política de inserción— con un motivo que quien
          * revisa no había podido ver venir. Y la huella no lo tapa: el material no lleva
          * dentro ni el gate ni la etapa, así que no se mueve cuando ellos se cierran.
+         *
+         * Con estado PROPIO, no el «reto-no-admite» de C0: aquel texto habla de criterios y
+         * del ciclo candidato/activo del reto, y aquí lo cerrado es la etapa 4. Ver el
+         * comentario de «revisiones-cerradas» en ESTADOS_ANCLA.
          */
         when not exists (
           select 1 from concepto c3
           where c3.id = p.concepto_id and c3.workspace_id = p.workspace_id
             and reto_admite_conceptos(c3.reto_id, c3.workspace_id))
-          then 'reto-no-admite'
+          then 'revisiones-cerradas'
         else 'disponible'
       end`,
     material: (f) => materialDeRevision(revisionDeLaFila(f)).texto,

@@ -17,6 +17,7 @@ import {
   revalidarDecisionRevisada,
   veredictoDeArquetipo,
 } from '@/lib/metodo/gobernanza.functions';
+import type { RevisionSimuladaDeConcepto } from '@/lib/metodo/gobernanza.schemas';
 import {
   COLOR_ARQUETIPO,
   ETIQUETA_ALCANCE,
@@ -300,6 +301,11 @@ function BloqueDecisiones({
                 </option>
               ))}
             </Select>
+          )}
+          {tipo === 'pasa-muere' && conceptoId !== '' && (
+            <RevisionesDelConcepto
+              revisiones={conceptos.find((c) => c.id === conceptoId)?.revisiones ?? []}
+            />
           )}
           {tipo === 'pasa-muere' && conceptos.length === 0 && (
             <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--warn)' }}>
@@ -786,5 +792,100 @@ function BloqueReaperturas({
         </div>
       )}
     </Card>
+  );
+}
+
+/**
+ * Lo que las revisiones simuladas ya aceptadas dijeron sobre este concepto.
+ *
+ * Se pinta junto al selector del pasa/muere porque es ahí donde sirve: quien decide si el
+ * concepto pasa o muere es quien tiene que haber leído lo que las lentes vieron y, sobre todo,
+ * QUÉ IR A PROBAR — las preguntas de test son lo único que una simulación le entrega a la
+ * etapa 4 (RF-08.2). Antes de esto la sesión se guardaba y desaparecía: el panel de propuestas
+ * solo pinta lo pendiente.
+ *
+ * La etiqueta de SIMULACIÓN va arriba y en cada hallazgo que sea hipótesis, no como adorno:
+ * SYS-20 pide que esto no se pueda confundir con investigación, y donde se LEE es donde esa
+ * confusión ocurriría.
+ */
+function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeConcepto[] }) {
+  if (revisiones.length === 0) return null;
+  return (
+    <div style={{ display: 'grid', gap: 10, gridColumn: '1 / -1' }}>
+      <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--texto-2)' }}>
+        Revisiones simuladas aceptadas · {revisiones.length}
+      </span>
+      {revisiones.map((r) => (
+        <article
+          key={r.id}
+          style={{
+            display: 'grid',
+            gap: 6,
+            padding: 10,
+            border: '1px solid var(--linea)',
+            borderRadius: 6,
+          }}
+        >
+          <header style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            <strong style={{ font: '600 12.5px var(--font-sans)' }}>{r.arquetipoNombre}</strong>
+            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
+              {r.arquetipoEstado}
+            </span>
+            <span
+              style={{
+                font: '600 10.5px var(--font-sans)',
+                color: 'var(--warn)',
+                border: '1px solid var(--warn)',
+                borderRadius: 3,
+                padding: '1px 5px',
+              }}
+            >
+              simulación AI
+            </span>
+            {r.propuestaAiId === null && (
+              <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
+                escrita a mano
+              </span>
+            )}
+          </header>
+          <p style={{ font: '400 12px var(--font-sans)', margin: 0 }}>{r.sintesis}</p>
+          <ul style={{ display: 'grid', gap: 5, margin: 0, paddingLeft: 16 }}>
+            {r.hallazgos.map((h) => (
+              <li key={h.id} style={{ font: '400 12px var(--font-sans)' }}>
+                <strong style={{ fontWeight: 600 }}>{h.titulo}</strong>
+                {h.esHipotesis && (
+                  <span style={{ color: 'var(--texto-3)' }}> · hipótesis, no observado</span>
+                )}
+                <br />
+                {h.descripcion}
+                {h.citas.length > 0 && (
+                  <span style={{ color: 'var(--texto-3)' }}>
+                    {' '}
+                    · se apoya en {h.citas.join(', ')}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {r.preguntas.length > 0 && (
+            <div style={{ display: 'grid', gap: 3 }}>
+              <span style={{ font: '600 11px var(--font-sans)', color: 'var(--texto-2)' }}>
+                Qué ir a probar con personas
+              </span>
+              <ul style={{ display: 'grid', gap: 3, margin: 0, paddingLeft: 16 }}>
+                {r.preguntas.map((q) => (
+                  <li key={q.id} style={{ font: '400 12px var(--font-sans)' }}>
+                    {q.pregunta}
+                    {q.escenario !== '' && (
+                      <span style={{ color: 'var(--texto-3)' }}> · {q.escenario}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </article>
+      ))}
+    </div>
   );
 }

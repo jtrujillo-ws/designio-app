@@ -922,6 +922,15 @@ export const ESTADOS_ANCLA = [
   'criterios-congelados',
   'registry-firmado',
   'reto-no-admite',
+  /*
+   * La etapa 4 cerrada, que NO es «el reto no admite criterios».
+   *
+   * C4 reutilizaba aquel estado y el texto de la pantalla habla de criterios y de su ciclo
+   * candidato/activo: mandaba a quien revisa a la etapa y al objeto equivocados, cuando lo que
+   * de verdad se cerró son las revisiones simuladas. Un motivo que nombra otra cosa es peor que
+   * uno genérico: hace perder el tiempo buscando donde no es.
+   */
+  'revisiones-cerradas',
   'gate-decidido',
   'checklist-avanzado',
   'reto-archivado',

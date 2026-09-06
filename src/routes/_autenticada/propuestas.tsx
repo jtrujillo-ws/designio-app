@@ -151,6 +151,7 @@ const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
   'insight-no-validado': false,
   'material-no-comparable': false,
   'reto-no-admite': false,
+  'revisiones-cerradas': false,
   'gate-decidido': false,
   'checklist-avanzado': false,
   'reto-archivado': false,
@@ -203,6 +204,8 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ya hay una entrada con ese nombre en el registry, y el nombre es su clave: corrígelo antes de aceptar, o rechaza la propuesta.',
   'reto-no-admite':
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
+  'revisiones-cerradas':
+    'La etapa 4 de ese reto ya no admite revisiones simuladas: o su G4 está aprobado sin la etapa reabierta, o el reto ya no admite trabajo de método. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
     'Ese gate ya se decidió: este informe describe un estado que ya pasó. Puedes leerlo, pero lo que dice que falta ya no aplica.',
   'reto-archivado':

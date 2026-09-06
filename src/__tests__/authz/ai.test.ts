@@ -31,7 +31,7 @@ import {
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
-import { parsearContenido } from '@/lib/ai/ai.contenido';
+import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
@@ -77,6 +77,7 @@ import {
 } from '@/lib/ai/ai.schemas';
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
+import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
 import {
   EscribirRevisionAManoSchema,
   borrarRevisionAMano,
@@ -10598,6 +10599,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(rota, 'el panel entero se cayó por una fila a la que le falta una clave').toBeTruthy();
       // Cero citas es la respuesta honesta: no hay dónde buscarlas.
       expect(rota!.citas).toEqual([]);
+      // Y el panel dice que no la certifica, que es lo que la pantalla necesita para no
+      // atravesarla: sin esto, la ficha de C4 hacía `.map` sobre `undefined` y se llevaba la
+      // ruta entera, con el botón de rechazar dentro.
+      expect(rota!.contenidoLegible).toBe(false);
+      expect(rota!.contenido).toBeNull();
       // Aceptarla sigue siendo imposible, que es la otra mitad: esto no abre una puerta.
       await expect(
         aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId }),
@@ -10608,6 +10614,75 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (await panelPropuestas(curadorId, wsC)).pendientes.some((x) => x.id === propuestaId),
       ).toBe(false);
     });
+  });
+
+  /*
+   * EL CENSO DE LA PUERTA, sobre las NUEVE y no sobre la que lo cobró.
+   *
+   * Lo que se midió antes de ponerla: con un contenido al que le falta una clave, SIETE de las
+   * nueve fichas de la pantalla revientan («Cannot read properties of undefined (reading
+   * 'map')»), y lo que se cae con ellas no es una tarjeta sino la ruta entera —con el botón de
+   * rechazar dentro, que es lo único que esa fila admite—. Las otras dos no revientan por
+   * casualidad: sólo leen escalares. O sea que la regla no es de C4, es de las nueve, y por eso
+   * la puerta está en la proyección y no en la ficha que lo cobró.
+   *
+   * Y mide las dos direcciones. Sólo el `false` habría pasado con una puerta que dijera que no
+   * a todo —y entonces NINGUNA propuesta sería presentable, que es la avería opuesta y peor—.
+   */
+  it('el panel certifica el contenido de las nueve capacidades, y sólo cuando lo cumple', () => {
+    /*
+     * C5 entra al censo con una remediación puesta AQUÍ, y el motivo está en su fixture: el de
+     * por omisión va vacío a propósito —una remediación tiene que señalar una señal real del
+     * grafo, y un id inventado haría nacer torcida toda propuesta de C5 que no lo pisara—, así
+     * que no cumple su propio contrato, que pide al menos una. Lo cazó este censo, que era su
+     * trabajo. Lo que se mide aquí es la FORMA; que la señal exista lo comprueba el servicio y
+     * eso se mide en las sondas de C5. Dejar a C5 fuera habría sido peor que arreglarle el
+     * fixture: un censo con una excepción no es un censo.
+     */
+    const queCumple: Record<CapacidadActiva, ContenidoPropuesta> = {
+      ...CONTENIDO_POR_CAPACIDAD,
+      C5: {
+        ...(CONTENIDO_POR_CAPACIDAD.C5 as ContenidoRemediacionJourney),
+        remediaciones: [
+          {
+            nodoId: crypto.randomUUID(),
+            codigo: CODIGOS_SENAL[0]!,
+            comoCerrarlo: 'Cierra la señal editando el nodo.',
+          },
+        ],
+      },
+    };
+    for (const capacidad of CAPACIDADES_ACTIVAS) {
+      expect(contenidoLegible(capacidad, queCumple[capacidad]), capacidad).toBe(true);
+      // Lo que la ficha atravesaría: un objeto sin las claves que su capacidad declara.
+      expect(contenidoLegible(capacidad, {}), capacidad).toBe(false);
+      expect(contenidoLegible(capacidad, null), capacidad).toBe(false);
+    }
+    /*
+     * Y una capacidad sin esquema declarado tampoco se certifica. No es un caso de laboratorio:
+     * las filas traen las DIEZ de SPEC-08 y el registro cubre las ACTIVAS, así que una escrita
+     * por un servidor más nuevo llega aquí. Sin forma declarada no hay nada que certificar, y
+     * la respuesta es fallar cerrado —la pantalla tiene su propio aviso para ese caso, que dice
+     * lo que sí arregla: actualizar la aplicación—.
+     */
+    expect(contenidoLegible('C1-D', CONTENIDO_POR_CAPACIDAD.C4)).toBe(false);
+  });
+
+  /*
+   * Y la otra mitad del censo, del lado de la pantalla: que la puerta siga siendo UNA.
+   *
+   * El compilador ya lo sujeta —en la rama ilegible el contenido es `null`, así que los tres
+   * sitios que lo atraviesan no compilan sin preguntar—, pero un error de tipos se calla con
+   * un `as` y este censo no. Cuenta la lectura, que es lo que no puede multiplicarse: nueve
+   * fichas leyendo cada una por su cuenta es exactamente la forma en que esto se rompió.
+   */
+  it('la pantalla de propuestas lee el contenido de la fila por una sola puerta', async () => {
+    const fuente = await readFile('src/routes/_autenticada/propuestas.tsx', 'utf8');
+    const lecturas = fuente.match(/propuesta\.contenido\b/g) ?? [];
+    expect(
+      lecturas.length,
+      'el contenido de la fila se lee en más de un sitio: la puerta que lo certifica es una, y cada lectura de más es una ficha que puede atravesar lo que no cumple su capacidad',
+    ).toBe(1);
   });
 
   it('C4: una cita con un id que no es uuid no tumba el panel entero', async () => {
@@ -10662,9 +10737,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const panel = await panelPropuestas(curadorId, wsC);
       const rota = panel.pendientes.find((x) => x.id === propuestaId);
       expect(rota, 'el panel entero se cayó por una sola fila con un id torcido').toBeTruthy();
-      // Y la fila torcida se recorta: un id que no nombra ningún documento no autoriza nada.
-      const c = rota!.contenido as ContenidoRevisionSimulada;
-      expect(c.hallazgos[0]!.citas[0]!.fragmento).toBe(PASAJE_RETIRADO);
+      /*
+       * Y la fila torcida viaja SIN contenido. Antes viajaba con él y con el pasaje recortado
+       * —un id que no nombra ningún documento no autoriza nada—, y eso seguía siendo un
+       * contenido que no cumple el contrato de su capacidad tipado como si lo cumpliera: la
+       * pantalla lo atravesaba entero. Ahora el panel lo marca ilegible y no lo manda, así que
+       * el pasaje tampoco puede escaparse por aquí. El recorte de pasajes sigue medido donde
+       * SÍ se ve —con un id válido de un documento que quien lee no puede recibir—, que es su
+       * caso de verdad.
+       */
+      expect(rota!.contenidoLegible).toBe(false);
+      expect(rota!.contenido).toBeNull();
+      expect(rota!.contenidoOriginal).toBeNull();
       // Lo que importa de verdad: se puede DECIDIR, que es lo que la avería impedía.
       await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
       expect(

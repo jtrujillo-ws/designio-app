@@ -100,6 +100,7 @@ import {
 } from './ai.schemas';
 import {
   CITAS_DEL_CONTENIDO,
+  contenidoLegible,
   ESQUEMA_DE_CONTENIDO,
   parsearContenido,
   TESTIMONIO_ADICIONAL,
@@ -2204,17 +2205,31 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     if (!definicion?.pajarDeLaCita) return presenciaLiteralPorCita(material ?? '', [c])[0]!;
     return presenciaLiteralPorCita(definicion.pajarDeLaCita(f, c) ?? '', [c])[0]!;
   });
-  return {
+  // El original solo viaja cuando difiere: una corrección nunca oculta lo que la AI había
+  // dicho de verdad (SYS-17).
+  const originalEnviado =
+    JSON.stringify(contenido) === JSON.stringify(original) ? null : original;
+  /*
+   * Y si el contenido que se envía tiene la forma que su capacidad declara.
+   *
+   * Lo contesta AQUÍ y no la pantalla porque los validadores son solo-servidor y tienen que
+   * seguir siéndolo (`check:bundle`), y sobre lo que SE ENVÍA y no sobre lo almacenado: el
+   * recorte de arriba ya sustituyó los pasajes vetados, así que preguntar por la fila cruda
+   * habría certificado una forma distinta de la que la pantalla recibe.
+   *
+   * Las DOS, porque las dos viajan —`original` aunque se elida por ser idéntico: lo que se
+   * certifica es la forma, y elidirlo no la cambia—. Y con la capacidad sin esquema —las que
+   * el registro no cubre— la respuesta es `false`: sin forma declarada no hay nada que
+   * certificar, y la pantalla ya tiene su propio aviso para ese caso.
+   */
+  const legible = contenidoLegible(f.capacidad as string, contenido, original);
+  const comun = {
     id: f.id as string,
     capacidad: f.capacidad as PropuestaEnPanel['capacidad'],
     destino: f.destino as PropuestaEnPanel['destino'],
     estado: f.estado as PropuestaEnPanel['estado'],
     esSimulacion: f.es_simulacion as boolean,
     confianza: f.confianza === null ? null : Number(f.confianza),
-    contenido,
-    // El original solo viaja cuando difiere: una corrección nunca oculta lo que la AI
-    // había dicho de verdad (SYS-17).
-    contenidoOriginal: JSON.stringify(contenido) === JSON.stringify(original) ? null : original,
     citas: citas.map((c, i) => ({
       fragmento: c.fragmento,
       localizacion: c.localizacion,
@@ -2263,6 +2278,15 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
     creadoEn: (f.creado_en as Date).toISOString(),
     revisadaEn: f.revisada_en ? (f.revisada_en as Date).toISOString() : null,
   };
+  /*
+   * Y el contenido entra por la rama que le corresponde. La FILA ilegible sigue viajando —lo
+   * que la pantalla necesita de ella es poder rechazarla, y para eso tiene que llegar— pero
+   * su contenido no: si no se puede pintar, no hace falta ahí, y no mandándolo la garantía
+   * deja de depender de que nadie lo atraviese.
+   */
+  return legible
+    ? { ...comun, contenidoLegible: true, contenido, contenidoOriginal: originalEnviado }
+    : { ...comun, contenidoLegible: false, contenido: null, contenidoOriginal: null };
 }
 
 /**
@@ -5834,6 +5858,21 @@ async function aceptarPropuestaEnTransaccion(
     await rolParaCapacidad(tx, actorId, entrada.workspaceId, p.capacidad);
 
     let contenido = p.contenido;
+    /*
+     * Aquí NO se vuelve a validar lo almacenado con el esquema entero, y no es un olvido.
+     *
+     * Se probó: una comprobación general de `contenidoLegible` delante de todo apagaba
+     * mensajes MÁS específicos que ya existen y que sí dicen qué está mal. Medido con la
+     * sonda del enlace pregunta→hallazgo: pasó de «esa pregunta dice nacer de un hallazgo que
+     * el lote no trae» a un «no tiene la forma que su capacidad declara» que no le dice a
+     * nadie dónde mirar. Es la misma regla de la corrección —la comprobación que NOMBRA el
+     * campo va antes que la que habla del conjunto—, aplicada al orden entre capas.
+     *
+     * Lo que sí protege esta fila es de dos lados: cada capacidad tiene sus guards en la base
+     * y sus comprobaciones en la materialización, y la pantalla ni siquiera ofrece «Aceptar»
+     * sobre una fila que el panel marcó ilegible. La pantalla es más estricta que el suelo,
+     * que es el sentido seguro de la discrepancia: no enseña un botón que la base rechazaría.
+     */
     // PRESENTE, no verdadera: la frontera transporta la corrección sin juzgarla (`unknown`),
     // así que un `null` enviado como corrección es una corrección con forma inválida —y muere
     // abajo con su mensaje—, no una aceptación de lo propuesto.

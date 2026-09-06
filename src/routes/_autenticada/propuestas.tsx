@@ -1238,14 +1238,34 @@ const PRESENTACION_POR_CAPACIDAD: Record<
  */
 const PRESENTACION_DESCONOCIDA = (capacidad: string) => ({
   rotulo: `Propuesta de la capacidad ${capacidad}`,
-  ficha: () => (
-    <span style={{ font: '400 12.5px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
-      Esta pantalla no sabe presentar el contenido de esta capacidad. Puedes descartarla; para
-      leerla, actualiza la aplicación.
-    </span>
-  ),
   sinAccion: null as string | null,
 });
+
+/**
+ * Y los DOS motivos por los que una fila no se presenta, que envejecen por separado y se
+ * escriben distinto porque las salidas que ofrecen no son la misma.
+ *
+ * El primero es de VERSIÓN: la fila la escribió un servidor que sabe más que este cliente, así
+ * que actualizar la aplicación la vuelve legible. El segundo es de la FILA: su contenido no
+ * tiene la forma que su capacidad declara —sólo se llega ahí por la superficie SQL concedida,
+ * o sobreviviendo a un apretón del esquema entre releases— y actualizar no arregla nada;
+ * lo único que esa fila admite es cerrarla.
+ *
+ * Ninguno de los dos esconde la fila, que es lo que importa: lo que se perdería no es una
+ * tarjeta bonita, es el único control que la fila admite.
+ */
+const MOTIVO_CAPACIDAD_DESCONOCIDA =
+  'Esta pantalla no sabe presentar el contenido de esta capacidad. Puedes descartarla; para leerla, actualiza la aplicación.';
+const MOTIVO_CONTENIDO_ILEGIBLE =
+  'El contenido de esta propuesta no tiene la forma que su capacidad declara, así que esta pantalla no lo puede mostrar ni ofrecerlo para aceptar. Puedes rechazarla.';
+
+function CuerpoNoPresentable({ motivo }: { motivo: string }) {
+  return (
+    <span style={{ font: '400 12.5px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
+      {motivo}
+    </span>
+  );
+}
 
 /**
  * Y lo que solo tiene sentido si la propuesta MATERIALIZA algo, por DESTINO — que es quien
@@ -1428,26 +1448,53 @@ function TarjetaPropuesta({
   const [ocupado, setOcupado] = useState(false);
   const conocida = PRESENTACION_POR_CAPACIDAD[propuesta.capacidad as CapacidadActiva];
   const presentacion = conocida ?? PRESENTACION_DESCONOCIDA(propuesta.capacidad);
+  /**
+   * El contenido con la forma de su capacidad, y `null` cuando el servidor NO la certifica.
+   *
+   * Ésta es la única lectura del contenido de la fila en toda la pantalla, y por eso la puerta
+   * es una sola (hay un censo que lo cuenta). No es una convención que haya que recordar: la fila llega como unión
+   * discriminada, así que en la rama ilegible el contenido es `unknown` y los tres sitios que
+   * lo atraviesan —la ficha, el bloqueo propio del destino y el formulario de corrección— no
+   * compilan hasta pasar por aquí. Medido antes de ponerla: siete de las nueve fichas
+   * revientan con un contenido al que le falta una clave, y se llevan por delante la ruta
+   * entera —incluido el botón de rechazar, que es lo único que esa fila admite—.
+   *
+   * Quién puede contestarlo: el servidor, porque los validadores de contenido son
+   * solo-servidor y `check:bundle` vigila que sigan estándolo.
+   */
+  const contenido: ContenidoPropuesta | null = propuesta.contenidoLegible
+    ? propuesta.contenido
+    : null;
   /*
    * Y sin presentación NO hay materialización, aunque el destino sí se conozca.
    *
-   * Las dos cosas envejecen por separado: una capacidad nueva puede materializar un destino
+   * Las tres cosas envejecen por separado: una capacidad nueva puede materializar un destino
    * que este cliente ya conocía —evidencia, criterio— mientras su contenido tiene una forma
-   * que no sabe pintar. Consultando solo el destino, la tarjeta decía «no sé presentar esto,
-   * puedes descartarla» y ofrecía al lado «Aceptar» y «Corregir»: aceptar a ciegas lo que
-   * acaba de declararse ilegible, y un formulario que castea el contenido a la forma de SU
-   * destino, que no tiene por qué ser la de esta capacidad.
+   * que no sabe pintar, y una fila de una capacidad conocida puede traer un contenido que no
+   * cumple lo que esa capacidad declara. Consultando solo el destino, la tarjeta decía «no sé
+   * presentar esto, puedes descartarla» y ofrecía al lado «Aceptar» y «Corregir»: aceptar a
+   * ciegas lo que acaba de declararse ilegible, y un formulario que castea el contenido a la
+   * forma de SU destino, que no tiene por qué ser la de esta capacidad.
    *
    * Se derivan del MISMO hallazgo para que no puedan discrepar. Rechazar sigue disponible,
-   * que es la salida que el propio texto de la ficha ofrece.
+   * que es la salida que el propio texto del aviso ofrece.
+   *
+   * Y la pantalla queda MÁS estricta que el suelo, no al revés: cada capacidad tiene sus
+   * guards en la base y sus comprobaciones al materializar, con mensajes que dicen qué está
+   * mal; poner delante de todos ellos una comprobación general del esquema los apagaba (se
+   * midió). Así que aquí se apaga el botón, y quien llame por otro camino se sigue encontrando
+   * con el mensaje específico que le corresponda. El sentido seguro de la discrepancia es
+   * éste: no ofrecer lo que la base rechazaría.
    */
   const materializacion =
-    conocida !== undefined && propuesta.destino !== null ? MATERIALIZACION[propuesta.destino] : null;
+    conocida !== undefined && contenido !== null && propuesta.destino !== null
+      ? MATERIALIZACION[propuesta.destino]
+      : null;
   const anclaDisponible = propuesta.anclaEstado === 'disponible';
   // La otra precondición que la base impone SIEMPRE y que no es del ancla, sino del contenido.
   // Va aparte de `anclaDisponible` porque no caduca con el tiempo —nació así— y su salida es
   // distinta: no es rechazar, es corregir. Y la declara el DESTINO, no un ternario.
-  const bloqueoPropio = materializacion?.bloqueoPropio(propuesta.contenido) ?? null;
+  const bloqueoPropio = contenido === null ? null : (materializacion?.bloqueoPropio(contenido) ?? null);
   const citasPresentes = propuesta.citas.filter((c) => c.presenteLiteral === true).length;
   // `null` es NO COMPROBABLE, y no cabe en el recuento de arriba: el material que el panel
   // recompone ya no es el que vio el modelo, así que ni «aparece» ni «no aparece» son verdad.
@@ -1508,7 +1555,13 @@ function TarjetaPropuesta({
         Alcance: {propuesta.anclaTitulo}
       </span>
 
-      {presentacion.ficha(propuesta.contenido, leerEtiqueta(propuesta.etiquetas))}
+      {conocida !== undefined && contenido !== null ? (
+        conocida.ficha(contenido, leerEtiqueta(propuesta.etiquetas))
+      ) : (
+        <CuerpoNoPresentable
+          motivo={conocida === undefined ? MOTIVO_CAPACIDAD_DESCONOCIDA : MOTIVO_CONTENIDO_ILEGIBLE}
+        />
+      )}
 
       {propuesta.citas.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1652,8 +1705,9 @@ function TarjetaPropuesta({
       {propuesta.estado === 'propuesta' &&
         puedeRevisar &&
         corrigiendo &&
+        contenido !== null &&
         materializacion?.formulario({
-          inicial: propuesta.contenido,
+          inicial: contenido,
           ocupado,
           onEnviar: decidir,
           onCancelar: () => setCorrigiendo(false),

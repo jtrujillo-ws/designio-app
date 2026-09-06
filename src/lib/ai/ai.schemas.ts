@@ -1020,7 +1020,7 @@ export type CitaConPresencia = {
   presenteLiteral: boolean | null;
 };
 
-export type PropuestaEnPanel = {
+type PropuestaEnPanelComun = {
   id: string;
   capacidad: CapacidadAI;
   /**
@@ -1032,10 +1032,6 @@ export type PropuestaEnPanel = {
   estado: EstadoPropuesta;
   esSimulacion: boolean;
   confianza: number | null;
-  contenido: ContenidoPropuesta;
-  /** Se envía solo cuando difiere del contenido vigente (una corrección): la propuesta
-   * original nunca se pierde de vista. */
-  contenidoOriginal: ContenidoPropuesta | null;
   citas: CitaConPresencia[];
   /**
    * Cómo se llaman los ids que el contenido nombra: `{ id → etiqueta }`.
@@ -1081,6 +1077,57 @@ export type PropuestaEnPanel = {
   creadoEn: string;
   revisadaEn: string | null;
 };
+
+/**
+ * Una fila del panel, y con ella la ÚNICA pregunta que la pantalla no puede contestar sola:
+ * si el contenido de esa fila tiene la forma que su capacidad declara.
+ *
+ * No la puede contestar porque los validadores son solo-servidor —`ai.contenido` lleva el
+ * centinela que `check:bundle` busca en el bundle del navegador— y no deben dejar de serlo:
+ * son código muerto en el cliente desde que la frontera de la corrección es `unknown`. Así
+ * que la contesta quien SÍ tiene el esquema, al proyectar, y viaja como parte de la fila.
+ *
+ * Y viaja como DISCRIMINANTE y no como una bandera al lado, porque una bandera hay que
+ * acordarse de consultarla. Con la unión, el contenido de una fila ilegible es `unknown` y el
+ * compilador rechaza los tres sitios que lo atraviesan —la ficha, el bloqueo propio del
+ * destino y el formulario de corrección— hasta que la pantalla pregunte. Medido antes de
+ * ponerla: SIETE de las nueve fichas revientan con un contenido al que le falta una clave
+ * («Cannot read properties of undefined (reading 'map')»), y lo que se cae con ellas no es
+ * una tarjeta, es la ruta entera y con ella el único control que esa fila admite: rechazarla.
+ *
+ * Cubre las DOS que se envían. `contenidoOriginal` hoy solo se serializa, pero separarlas
+ * habría dejado la mitad sin red el día que alguien lo pinte campo a campo, y esa mitad es
+ * justo la que no se puede corregir.
+ *
+ * Y la fila ilegible viaja SIN contenido, no con el contenido bajo un tipo opaco. Se intentó
+ * `unknown` primero y la frontera lo rechaza —«Type may not be serializable»—, que resultó ser
+ * la pregunta correcta hecha por otro sitio: si la pantalla no lo puede pintar, tampoco tiene
+ * por qué recibirlo. Así la garantía deja de ser sólo del compilador; un contenido malformado
+ * no llega al navegador. Lo que la fila sí sigue trayendo entera es todo lo que hace falta
+ * para cerrarla: su capacidad, su ancla, su estado y su id.
+ *
+ * `false` no significa «la AI se equivocó»: un contenido nace y se corrige pasando por
+ * `parsearContenido`, así que una fila ilegible llegó por la superficie SQL concedida o
+ * sobrevivió a un apretón del esquema entre releases. En los dos casos la respuesta es la
+ * misma —no se presenta y no se materializa, se rechaza— y por eso el suelo la repite al
+ * aceptar: la pantalla y la base no pueden decir cosas distintas sobre la misma fila.
+ *
+ * Los dos `null` de la rama legible y la ilegible NO significan lo mismo, y por eso el
+ * discriminante y no un `contenido: ContenidoPropuesta | null` a secas: en la legible,
+ * `contenidoOriginal: null` es «idéntico al vigente, no hubo corrección»; en la ilegible es
+ * «no se envía». Sin la bandera delante, las dos ausencias se leerían igual.
+ */
+export type PropuestaEnPanel = PropuestaEnPanelComun &
+  (
+    | {
+        contenidoLegible: true;
+        contenido: ContenidoPropuesta;
+        /** Se envía solo cuando difiere del contenido vigente (una corrección): la propuesta
+         * original nunca se pierde de vista. */
+        contenidoOriginal: ContenidoPropuesta | null;
+      }
+    | { contenidoLegible: false; contenido: null; contenidoOriginal: null }
+  );
 
 export type CandidatoAncla = {
   id: string;

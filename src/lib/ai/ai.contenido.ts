@@ -340,8 +340,9 @@ export type ContenidoInsight = z.infer<typeof ContenidoInsightSchema>;
  * del grafo con la que se armó el prompt. Una remediación de una señal inexistente es una
  * avería inventada, y de las caras: manda a alguien a arreglar un grafo que estaba bien.
  *
- * `remediaciones` PUEDE venir vacío: un grafo sin señales es un resultado legítimo, y además
- * el bueno.
+ * Y un grafo SIN señales no llega hasta aquí: el servicio se niega a pedir un informe sobre un
+ * grafo limpio, que es el resultado legítimo y además el bueno. Por eso `remediaciones` pide al
+ * menos una —el porqué, entero, está en el propio campo—.
  */
 export const ContenidoRemediacionJourneySchema = z
   .object({
@@ -1168,4 +1169,26 @@ export function parsearContenido(
   valor: unknown,
 ): ContenidoPropuesta {
   return ESQUEMA_DE_CONTENIDO[capacidad].parse(valor);
+}
+
+/**
+ * Y la misma pregunta sin excepción: ¿este valor tiene la forma que esa capacidad declara?
+ *
+ * El MISMO esquema que `parsearContenido`, a propósito. Quien proyecta el panel necesita
+ * contestarla para toda una página de filas —una excepción por fila tumbaría el panel entero,
+ * que es justo la avería que esto viene a cerrar— y quien acepta necesita contestarla para
+ * una; con dos comprobaciones distintas, la pantalla y el suelo podrían discrepar sobre la
+ * misma fila y quien revisa vería un botón que la base rechaza (o al revés).
+ *
+ * `capacidad` entra como `string` porque las filas traen las DIEZ de SPEC-08 y aquí solo hay
+ * esquema para las ACTIVAS. Una capacidad sin esquema es ilegible, que es lo que hay que
+ * contestar sin saber su forma: fallar cerrado. La pantalla, que además sabe si conoce la
+ * capacidad, distingue los dos motivos al escribir el aviso.
+ */
+export function contenidoLegible(capacidad: string, ...valores: unknown[]): boolean {
+  const esquema = ESQUEMA_DE_CONTENIDO[capacidad as CapacidadActiva] as
+    | (typeof ESQUEMA_DE_CONTENIDO)[CapacidadActiva]
+    | undefined;
+  if (esquema === undefined) return false;
+  return valores.every((v) => esquema.safeParse(v).success);
 }

@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-06.17';
+export const PROMPT_VERSION = 'ai-2026-09-06.20';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -1220,8 +1220,28 @@ export function promptPostMortem(expediente: ExpedienteDePostMortem): {
       'Las desviaciones salen del tablero de conciliación y nombran el elemento por el id que va entre corchetes, copiado. No inventes elementos ni constataciones: lo que quedó distinto ya lo escribió quien lo miró, y tu lectura es por qué importa.',
       'Si un criterio no tiene dato, dilo así —con el motivo registrado— en vez de estimarlo.',
       'Cita literal del material lo que afirmes. Sin citas, la narrativa es prosa sobre datos que nadie puede comprobar.',
-    ].join('\n\n'),
-    alcanceResumen: `Post mortem de ${expediente.codigo}: ${expediente.lecturas.length} lecturas de criterio y ${elementos} elementos conciliados`,
+      /*
+       * Y el aviso del recorte, que C7 era la ÚNICA capacidad en no dar.
+       *
+       * Todas las demás le dicen al modelo que su material se truncó. Aquí no, y con la puerta
+       * que #49 le puso —una desviación sobre un elemento que no llegó descarta el LOTE— el
+       * silencio salía caro: el modelo seguiría nombrando la cola que no vio y el lote entero,
+       * pagado, se tiraría. Decírselo es lo único que puede cambiar lo que devuelve; la puerta
+       * solo puede rechazar lo que ya llegó.
+       *
+       * Nombra el TABLERO y no «el material» a secas porque es la conciliación la que se come
+       * el corte: va la última del cuerpo, así que es lo primero que se pierde. Y avisa de las
+       * dos cosas que la ausencia estropea —señalar lo que no ve, y dar por completo un
+       * recuento de lo desviado—, porque la segunda no la corta ninguna puerta: un «tres de
+       * doce elementos se desviaron» sobre una cola truncada es una frase entera y falsa.
+       */
+      material.truncado
+        ? `(El material se truncó a ${MAX_MATERIAL} caracteres y lo que falta es la COLA DEL TABLERO de conciliación: no señales desviaciones sobre elementos que no ves, ni des por completo ningún recuento de lo desviado.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `Post mortem de ${expediente.codigo}: ${expediente.lecturas.length} lecturas de criterio y ${elementos} elementos conciliados${material.truncado ? ', truncado' : ''}`,
   };
 }
 

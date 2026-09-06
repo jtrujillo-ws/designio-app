@@ -36,6 +36,8 @@ import {
   evidenciaQueLlegoAlModelo,
   elementosQueLlegaronAlModelo,
   materialDePostMortem,
+  promptPostMortem,
+  type ExpedienteDePostMortem,
   MAX_MATERIAL,
 } from '@/lib/ai/ai.prompts';
 import {
@@ -6914,6 +6916,59 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     }
     // Y que la sonda haya recorrido de verdad la frontera, no un tramo llano.
     expect(bajadas).toBeGreaterThan(1);
+  });
+
+  /**
+   * Y antes de rechazar, DECIRLO: el prompt avisa cuando el tablero se truncó.
+   *
+   * C7 era la única capacidad cuyo prompt no daba ese aviso. La puerta de arriba solo puede
+   * rechazar lo que ya llegó —con el lote pagado—; el aviso es lo único que puede cambiar lo
+   * que el modelo devuelve. Y avisa de dos cosas, no de una: no señalar lo que no ve, y no dar
+   * por completo ningún recuento de lo desviado. La segunda no la corta ninguna puerta —«tres
+   * de doce elementos se desviaron» sobre una cola truncada es una frase entera y falsa—, así
+   * que si el aviso no la nombra, no la nombra nadie.
+   */
+  it('el prompt del post mortem avisa de que el tablero se truncó, y de qué falta', () => {
+    const expediente = (n: number): ExpedienteDePostMortem => ({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      metricaObjetivo: 'M',
+      lecturas: [],
+      conciliacion: [
+        {
+          proyectoCodigo: 'P-01',
+          designVersionCodigo: 'DV-01',
+          elementos: Array.from({ length: n }, (_, i) => ({
+            elementoId: `a7b8c9d0-0000-4000-8000-${String(i).padStart(12, '0')}`,
+            elementoTitulo: `Elemento ${i}`,
+            tipo: 'pantalla',
+            operacion: 'alta',
+            estado: 'desviado',
+            releaseCodigo: 'REL-3',
+            releaseResponsable: 'Equipo de alta',
+            releaseFecha: '2026-04-02',
+            queQuedoDistinto: 'Salió sin el paso de explicación',
+            razonDesviacion: 'Se cortó por plazo',
+          })),
+        },
+      ],
+    });
+    // Sin recorte no hay aviso: un aviso que sale siempre no dice nada.
+    const corto = promptPostMortem(expediente(2));
+    expect(materialDePostMortem(expediente(2)).truncado).toBe(false);
+    expect(corto.usuario).not.toContain('se truncó');
+    expect(corto.alcanceResumen).not.toContain('truncado');
+
+    // Y con el tablero recortado, el aviso y sus dos mitades.
+    const largo = promptPostMortem(expediente(400));
+    expect(materialDePostMortem(expediente(400)).truncado).toBe(true);
+    expect(largo.usuario).toContain('se truncó');
+    expect(largo.usuario).toContain('COLA DEL TABLERO');
+    expect(largo.usuario).toContain('no señales desviaciones sobre elementos que no ves');
+    expect(largo.usuario).toContain('ni des por completo ningún recuento');
+    // El resumen de alcance también lo dice: es lo que queda en el lineage.
+    expect(largo.alcanceResumen).toContain('truncado');
   });
 
   it('C7 no admite una desviación sobre un elemento que el recorte no dejó llegar', async () => {

@@ -694,7 +694,7 @@ describe('el contrato del prompt y su versión se mueven juntos', () => {
    * el commit en que deja de serlo. Aquí, además, la etiqueta la LEE el código: la comparación
    * del material guardado con el de hoy solo vale entre propuestas del mismo render.
    */
-  const VERSION_ANOTADA = 'ai-2026-09-06.17';
+  const VERSION_ANOTADA = 'ai-2026-09-06.20';
   const HUELLA_ANOTADA = 'cfb264531233d94efd1b8ae3b410713e76d4497920737cb0c5fe03347fc6af03';
 
   /**

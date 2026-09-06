@@ -1005,8 +1005,14 @@ una sola sentencia** para que no puedan discrepar entre sí.
 
 ## Releases
 
-- Se **planifican** desde una design version aprobada (`RL-n`, fecha objetivo, responsable) y se les
-  **asignan elementos**. Un elemento está **a lo sumo** en un release (clave primaria de
+- Se **planifican** (`RL-n`, fecha objetivo, responsable) desde una design version que siga **a cargo
+  de su proyecto**: la aprobada vigente y también una ya `superada` **por otro proyecto**, porque su
+  G6 sigue exigiendo que cada elemento tenga release y su G7 que cada uno quede constatado
+  (`design_versions_a_cargo_del_proyecto` excluye solo las que reemplazó una versión no borrador
+  del **mismo** proyecto, y la política `release_insert` y la pantalla siguen esa función). Cuando
+  fue el propio proyecto el que la reemplazó no se abren releases nuevos ni se le mete trabajo a
+  los que había; lo que quedó abierto sí se **cierra** desde la pantalla (desplegar, constatar o
+  quitar alcance), y G7 lo espera. A los releases se les **asignan elementos**. Un elemento está **a lo sumo** en un release (clave primaria de
   `release_elemento`); mientras G6 está pendiente el borrador del plan admite asignar, mover y
   **quitar**, y un elemento puede quedar sin release. **Aprobar G6 exige que todo elemento de la design
   version tenga release** (RF-06.4), y desde entonces un elemento cubierto solo se **mueve** de un
@@ -1201,7 +1207,11 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 6. **Materialización**: solo al aceptar, en la misma transacción y firmado por quien acepta, nace el
    objeto de destino con `propuesta_ai_id`; un constraint diferido verifica que lo materializado
    coincide con lo propuesto (por ejemplo, que cada cita de C2 exista entre las creadas, o que la
-   traza de una HMW de C3 sea exactamente el conjunto de insights que sus citas nombran).
+   traza de una HMW de C3 sea exactamente el conjunto de insights que sus citas nombran). La
+   **excepción es C7**: su ancla es el propio `outcome_review`, así que aceptar **no crea una fila**
+   sino que actualiza en el sitio sus cuatro columnas narrativas (el veredicto y la casilla de
+   diseño experimental no se tocan); quien acepta queda registrado en la propuesta, no como creador
+   del review, y la procedencia se fija por `xmin` del review sobre la propuesta.
 
 ## Presupuesto y degradación
 

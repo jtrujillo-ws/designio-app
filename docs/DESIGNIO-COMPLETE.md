@@ -6,7 +6,7 @@ language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 8fff9be, 2026-09-06). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta b0d578f, 2026-09-06). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,13 +17,14 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `8fff9be`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `b0d578f`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
 > [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
 > [#46](https://github.com/jtrujillo-ws/designio-app/pull/46),
-> [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) y
-> [#49](https://github.com/jtrujillo-ws/designio-app/pull/49)). Donde el paquete de diseño y el código
+> [#47](https://github.com/jtrujillo-ws/designio-app/pull/47),
+> [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) y
+> [#50](https://github.com/jtrujillo-ws/designio-app/pull/50)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -57,7 +58,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47 y #49 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49 y #50 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -1038,7 +1039,10 @@ veredicto honesto (ADR-0007).
   tablero con el recorte del material (`elementosQueLlegaronAlModelo`, como C3 con sus insights y C5
   con su topología), y una desviación sobre un elemento fuera del tablero, constatado como aprobado
   o dejado fuera por el recorte se rechaza como `fuera-de-contrato` con el consejo de acortar la
-  descripción del reto. El material es **determinista**: el tablero de conciliación de todos los proyectos del reto
+  descripción del reto. Desde [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) el prompt además **avisa al modelo de qué se cortó** (la cola
+  del tablero, o las lecturas por criterio cuando el corte cae antes) y le prohíbe dar por completo
+  cualquier recuento sobre material truncado; C7 entra también en la huella del contrato de
+  `PROMPT_VERSION`. El material es **determinista**: el tablero de conciliación de todos los proyectos del reto
   (`conciliacion_del_reto`, la misma lectura que dibuja G7) y la lectura por criterio de
   `resultado_criterio`; los snapshots crudos no entran, porque ya están resumidos en lo que el lead
   constató. **No propone** el veredicto (RF-07.8) ni la casilla de diseño experimental (SYS-24, la
@@ -1699,7 +1703,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (un archivo por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai, concepto) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#49): **906 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#50): **898 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1711,7 +1715,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem) y [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem) , [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7) y [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -1931,7 +1935,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Seis días de construcción (2026-09-01 a 2026-09-06), 45 commits en `agents`, cada uno un
+Seis días de construcción (2026-09-01 a 2026-09-06), 46 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -1981,6 +1985,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-05 | #46 | El concepto existe, y no avanza sin haberse probado |
 | 09-05 | #47 | El post mortem se redacta sobre lo constatado, no sobre lo que se recuerda |
 | 09-06 | #49 | El recorte también decide qué desviaciones puede afirmar el post mortem |
+| 09-06 | #50 | C7 era la única capacidad que no le decía al modelo que su material se truncó |
 
 ---
 

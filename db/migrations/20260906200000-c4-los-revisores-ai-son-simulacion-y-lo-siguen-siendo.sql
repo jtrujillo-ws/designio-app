@@ -634,14 +634,20 @@ begin
   end loop;
 end $$;
 
+
 -- ══════════════════════════════════════════════════════════════════════════════════════════
 -- Y EL GUARD DE MATERIALIZACIÓN, CON LAS RAMAS DE C4
 -- ══════════════════════════════════════════════════════════════════════════════════════════
 --
--- Se reescribe ENTERO porque `create or replace` sustituye, no parchea: el cuerpo que sigue
--- sale de `pg_get_functiondef` sobre la versión viva —la que dejó C3— con las ramas de C4
--- insertadas donde les toca. Copiar una versión anterior habría revertido en silencio lo que
--- las tres capacidades intermedias añadieron, y eso no lo dice ningún error.
+-- ⚠ CUIDADO AL INTEGRAR: esto REEMPLAZA el cuerpo vivo de `propuesta_ai_materializacion_guard`.
+-- `create or replace` SUSTITUYE, no parchea, así que el cuerpo que sigue sale de
+-- `pg_get_functiondef` sobre la versión viva EN EL MOMENTO DE ESCRIBIRLO —la que dejó C7— con
+-- las ramas de C4 insertadas donde les toca.
+--
+-- Y se rehízo una vez por eso mismo: la primera versión de esta migración salió de la versión
+-- que dejó C3, y al integrar C7 —que se mergeó antes— habría revertido en silencio sus cuatro
+-- ramas. Ningún error lo dice; solo se ve leyendo el orden de las migraciones. La regla es
+-- releer la función VIVA cada vez que esta rama se pone al día con `agents`.
 CREATE OR REPLACE FUNCTION public.propuesta_ai_materializacion_guard()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -651,9 +657,11 @@ AS $function$
 declare
   v_filas integer;
   -- El reto de C4, que no llega por columna: su ancla es el CONCEPTO, y el reto está un salto
-  -- más allá. A una variable porque hace falta dos veces —el candado y el archivado— y porque
-  -- pasarle NULL a `pg_advisory_xact_lock` no da error: es estricta, devuelve NULL y no toma
-  -- nada. Un candado que se salta en silencio es peor que uno que falta.
+  -- más allá. A una variable —y no a una subconsulta en línea como la de C7, que sí puede
+  -- porque `outcome_review` es 1:1 con su reto y siempre existe— porque aquí hace falta dos
+  -- veces (el candado y el archivado) y porque pasarle NULL a `pg_advisory_xact_lock` no da
+  -- error: es estricta, devuelve NULL y no toma nada. Un candado que se salta en silencio es
+  -- peor que uno que falta.
   v_reto uuid;
 begin
   if not is_workspace_member(app_user_id(), new.workspace_id) then
@@ -703,11 +711,20 @@ begin
   if new.registry_id is not null then
     perform pg_advisory_xact_lock(hashtextextended('designio:registry:' || new.registry_id, 42));
   end if;
-  -- Y el del reto de C4, que se alcanza por su concepto. Es la MISMA clave que la de arriba
-  -- —«designio:reto:»— y por eso va aquí y no más abajo: las dos son la misma cola, y tomarlas
-  -- en momentos distintos de la función sería tomar la misma clave dos veces en órdenes
-  -- distintos según la capacidad. `propuesta_ai_un_ancla` garantiza que solo una de las dos
-  -- ramas corre, así que no hay par que ordenar entre ellas.
+  -- Y el del RETO del post mortem, que es la clave que toma quien lo completa
+  -- (`bloquearReto`). Como las otras dos: arriba del todo, porque el orden de los candados es
+  -- una propiedad de la transacción entera y no de la regla que lo necesita. `outcome_review`
+  -- es 1:1 con su reto, así que la clave sale de él y no hay una nueva que ordenar.
+  if new.outcome_review_id is not null then
+    perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || (
+      select o.reto_id from outcome_review o
+      where o.id = new.outcome_review_id and o.workspace_id = new.workspace_id), 42));
+  end if;
+  -- Y el del reto de C4, que se alcanza por su concepto. Es la MISMA clave que las dos de
+  -- arriba —«designio:reto:»— y por eso va aquí y no más abajo: las tres son la misma cola, y
+  -- tomarlas en momentos distintos de la función sería tomar la misma clave en órdenes
+  -- distintos según la capacidad. `propuesta_ai_un_ancla` garantiza que solo una de las ramas
+  -- corre, así que no hay par que ordenar entre ellas.
   if new.concepto_id is not null then
     select c.reto_id into v_reto from concepto c
       where c.id = new.concepto_id and c.workspace_id = new.workspace_id;
@@ -758,6 +775,28 @@ begin
       and o.creado_por = new.revisada_por
       and o.estado = 'propuesta') then
     raise exception 'la oportunidad materializada cuelga del reto de la propuesta, la firma quien aceptó y nace por decidir: aceptar una HMW la pone en el portafolio, no la aprueba (SYS-19)';
+  end if;
+  -- ── EL POST MORTEM: EL ANCLA ES EL OBJETO ──
+  --
+  -- Las seis anteriores comprueban que existe una fila NUEVA con la forma esperada. Aquí la
+  -- fila es vieja por construcción —el review lo abrió el lead al cerrarse la última ventana
+  -- de medición (RF-07.7), y C7 se ancla en él justamente porque ya existe—, así que lo que
+  -- se comprueba es otra cosa: que siga siendo un BORRADOR.
+  --
+  -- Un post mortem completado es inmutable, y con razón: lleva el veredicto firmado con nombre
+  -- y fecha. Escribirle la narrativa después de cerrado cambiaría el documento sobre el que
+  -- alguien puso su firma. La política de `outcome_review` ya lo impide por su lado; aquí se
+  -- repite porque el camino de ACEPTACIÓN es otra escritura y llega por otra puerta, que es el
+  -- mismo motivo por el que la entrada KPI repite lo suyo.
+  --
+  -- No se exige «lo firma quien aceptó»: nadie CREA esta fila en la aceptación, y `creado_por`
+  -- es de quien abrió el post mortem semanas antes. Quien aceptó consta donde tiene que
+  -- constar, en `revisada_por` de la propia propuesta.
+  if new.destino = 'outcome-review' and not exists (
+    select 1 from outcome_review o
+    where o.id = new.outcome_review_id and o.workspace_id = new.workspace_id
+      and o.estado = 'borrador') then
+    raise exception 'el post mortem materializado tiene que seguir siendo un borrador: uno completado lleva un veredicto firmado, y su narrativa ya no se reescribe (SYS-19)';
   end if;
 
   -- ── PROCEDENCIA, que no es lo mismo que PARECIDO ──
@@ -884,6 +923,43 @@ begin
     where oi.oportunidad_id = new.oportunidad_id and oi.workspace_id = new.workspace_id
       and oi.xmin <> pg_current_xact_id()::xid) then
     raise exception 'la traza de la oportunidad materializada tiene que haber nacido en esta misma aceptación (SYS-19)';
+  end if;
+  -- ── LA PROCEDENCIA DE UNA EDICIÓN ──
+  --
+  -- `xmin` a secas, y aquí sí es lo correcto en vez de la aproximación que las otras tuvieron
+  -- que reforzar. Dice «esta transacción escribió esta versión de la fila», que es exactamente
+  -- lo que hay que exigir cuando lo materializado es una EDICIÓN: el par con `creado_en =
+  -- now()` existe en las otras para distinguir insertar de actualizar, y aquí no hay nada que
+  -- distinguir — la fila es vieja a propósito y lo que se sella es su versión nueva.
+  --
+  -- Sin esto, la puerta es la de siempre: redactar la narrativa a mano y DESPUÉS marcar
+  -- aceptada la propuesta pendiente, y el post mortem consta escrito por la AI. Lo que se
+  -- mueve con eso no es una fila: es la tasa de corrección humana, y hacia el lado optimista.
+  if new.destino = 'outcome-review' and not exists (
+    select 1 from outcome_review o
+    where o.id = new.outcome_review_id and o.workspace_id = new.workspace_id
+      and o.xmin = pg_current_xact_id()::xid) then
+    raise exception 'el post mortem materializado tiene que haberlo escrito esta misma aceptación: una propuesta no puede apropiarse de una narrativa que ya estaba (SYS-19)';
+  end if;
+  -- ── Y LO QUE SE ACEPTÓ ES LO QUE SE LEYÓ ──
+  --
+  -- Mismo argumento que la proyección de la HMW de C3: la procedencia dice que esta
+  -- transacción escribió la fila, no QUÉ escribió. Con solo `xmin`, aceptar la propuesta y
+  -- escribir en el review un texto distinto —en la misma transacción— pasa las dos
+  -- comprobaciones, y queda un post mortem que no dice lo que el humano leyó al aceptar,
+  -- firmado como si lo dijera.
+  --
+  -- Los cuatro campos, que son los que C7 propone. El veredicto no está, ni la casilla del
+  -- diseño experimental: no se proponen, así que el review puede traer lo que traiga en ellos
+  -- sin que esta comprobación tenga nada que decir.
+  if new.destino = 'outcome-review' and not exists (
+    select 1 from outcome_review o
+    where o.id = new.outcome_review_id and o.workspace_id = new.workspace_id
+      and o.contribucion       = new.contenido ->> 'contribucion'
+      and o.factores_externos  = new.contenido ->> 'factoresExternos'
+      and o.hipotesis_abiertas = new.contenido ->> 'hipotesisAbiertas'
+      and o.aprendizajes       = new.contenido ->> 'aprendizajes') then
+    raise exception 'el post mortem escrito no dice lo que dice la propuesta que se aceptó (SYS-19)';
   end if;
   -- Y SYS-15, en el instante en que la HMW empieza a existir: al menos un insight. No es una
   -- regla nueva —la puerta de G3 la exige sobre todo el portafolio, y aprobar una oportunidad
@@ -1061,7 +1137,6 @@ begin
               and h2.orden = (p.pr->>'hallazgoIndice')::integer)))) then
     raise exception 'las preguntas de test de la revisión materializada no dicen lo que dice la propuesta: el texto, el escenario y de qué hallazgo nacen se copian tal cual de la propuesta aceptada (SYS-19)';
   end if;
-
 
 
   -- ── El consentimiento, en el ÚLTIMO instante ──
@@ -1614,6 +1689,17 @@ begin
     update revision_simulada set propuesta_ai_id = new.id
       where id = new.revision_simulada_id and workspace_id = new.workspace_id
         and propuesta_ai_id is null;
+    get diagnostics v_filas = row_count;
+  elsif new.destino = 'outcome-review' then
+    -- SIN `propuesta_ai_id is null`, y es la única rama que lo omite. Las otras sellan un
+    -- objeto que NACE, y un objeto tiene una sola procedencia para siempre. Ésta sella una
+    -- EDICIÓN: la columna dice de qué propuesta salió la narrativa que hay ahora, así que un
+    -- segundo borrador aceptado la sustituye, igual que sustituyó al texto. Con el guardián
+    -- puesto, el segundo intento moriría diciendo «ese objeto ya cuelga de otra propuesta»,
+    -- que es verdad y no viene al caso: la primera sigue archivada y legible (SYS-17), que es
+    -- donde vive la historia.
+    update outcome_review set propuesta_ai_id = new.id
+      where id = new.outcome_review_id and workspace_id = new.workspace_id;
     get diagnostics v_filas = row_count;
   else
     raise exception 'destino de propuesta AI sin sello de procedencia: % — un destino nuevo tiene que decir qué objeto sella (SYS-19)', coalesce(new.destino, '(sin destino)');

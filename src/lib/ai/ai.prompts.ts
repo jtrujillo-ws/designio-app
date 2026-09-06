@@ -386,6 +386,105 @@ function cuerpoDeOportunidades(reto: RetoConInsights): {
 }
 
 /**
+ * Material de C4: EL CONCEPTO que se revisa, y detrás EL ARQUETIPO que hace de lente con la
+ * evidencia que lo sostiene.
+ *
+ * El orden no es de estilo. El recorte muerde por la cola, así que delante va lo que sin ello
+ * la respuesta no existe —el concepto— y detrás lo que puede llegar a medias sin invalidarla.
+ * Y la evidencia va la última de todas por la misma razón que en C3 los criterios: es lo que
+ * más ocupa, y un documento a medias sigue sirviendo para citar el trozo que llegó, que es
+ * exactamente lo que la presencia literal mide.
+ *
+ * La evidencia lleva TRAMOS, como la de C2: el pajar de una cita es el documento que la cita
+ * nombra, no el material entero. Sin ellos, un fragmento del testimonio de al lado saldría
+ * PRESENTE y quien revisa vería un verde prestado sobre la única señal contrastable que tiene.
+ *
+ * Y va la de ESE arquetipo y no la del reto entero, que es la decisión que hace de C4 lo que
+ * RF-08.2 pide y no un revisor genérico con un nombre encima: lo que hace del hallazgo la
+ * lectura de esta lente es que se apoye en lo que constituyó a esta lente. La base lo exige
+ * también, con un guard sobre `hallazgo_simulado_evidencia`.
+ */
+export type ArquetipoQueRevisa = {
+  id: string;
+  nombre: string;
+  definicion: string;
+  estado: string;
+  evidencia: { id: string; titulo: string; resumen: string }[];
+};
+
+type ConceptoARevisar = {
+  titulo: string;
+  descripcion: string;
+  umbralTest: string;
+  arquetipo: ArquetipoQueRevisa;
+};
+
+export function materialDeRevision(c: ConceptoARevisar): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Concepto que se revisa', c.titulo],
+      ['Arquetipo que revisa', c.arquetipo.nombre],
+      ['Estado del arquetipo', c.arquetipo.estado],
+    ],
+    cuerpoDeRevision(c).texto,
+  );
+}
+
+function cuerpoDeRevision(c: ConceptoARevisar): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+} {
+  const partes = [
+    'CONCEPTO QUE SE REVISA',
+    c.descripcion,
+    '',
+    // El umbral del test, cuando lo hay: es contra lo que las preguntas propuestas tienen que
+    // servir. Sin él, «propón preguntas para el test» no dice para qué test.
+    ...(c.umbralTest.trim() ? ['UMBRAL DE TEST YA DEFINIDO', c.umbralTest, ''] : []),
+    'ARQUETIPO DESDE EL QUE SE REVISA',
+    `${c.arquetipo.nombre}: ${c.arquetipo.definicion}`,
+    '',
+    'EVIDENCIA QUE SOSTIENE A ESTE ARQUETIPO (de aquí salen las citas; nada más se cita)',
+  ];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const e of c.arquetipo.evidencia) {
+    const linea = `[${e.id}] ${e.titulo}\n${e.resumen}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(e.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  return { texto: partes.join('\n'), tramos };
+}
+
+/** El tramo de UNA evidencia dentro del material de C4, para medir su presencia literal
+ * contra el documento que la cita nombra y no contra el material entero. Hermano exacto del
+ * de C2 y del de C3, con el mismo motivo escrito allí: se saca de AQUÍ, después del recorte,
+ * porque recomponerlo aparte reinicia el presupuesto y devuelve un texto que nadie mandó. */
+export function tramoDeEvidenciaEnRevision(c: ConceptoARevisar, evidenciaId: string): string {
+  const { texto, tramos } = cuerpoDeRevision(c);
+  const tramo = tramos.get(evidenciaId);
+  if (!tramo) return '';
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
+}
+
+/**
+ * Y qué evidencia del arquetipo llegó ENTERA al modelo.
+ *
+ * Misma pregunta que en C2 y por el mismo motivo, con una consecuencia propia: aquí la
+ * evidencia va la última del cuerpo, así que es lo primero que el recorte se come. Un
+ * arquetipo con muchos documentos enlazados puede llegar con la mitad, y entonces el alcance
+ * sellado tiene que decir la verdad —qué se enseñó— o el guard diferido daría por vistos
+ * documentos que nadie mandó.
+ */
+export function evidenciaQueLlegoAlRevisor(c: ConceptoARevisar): { ids: string[] } {
+  const { texto, tramos } = cuerpoDeRevision(c);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { ids: [...tramos].filter(([, [, fin]]) => fin <= cabe).map(([id]) => id) };
+}
+
+/**
  * Cuántos criterios de éxito llegaron ENTEROS al modelo EN EL MATERIAL DE C3.
  *
  * Hermana y no la misma que `criteriosQueLlegaronAlModelo`, que mide los de C6: son dos
@@ -910,6 +1009,43 @@ export const SISTEMA_OPORTUNIDADES = [
 ].join('\n');
 
 /**
+ * C4 es la única capacidad cuya salida NO ES EVIDENCIA DE NADA, y su sistema empieza por ahí.
+ *
+ * Un revisor AI por arquetipo simula una mirada; no la sustituye. SYS-20 lo dice en cuatro
+ * prohibiciones y las cuatro se le dicen al modelo, aunque las cuatro estén además cerradas
+ * por debajo —el contrato, la clave única, el CHECK del agregado sintético y la etiqueta
+ * imborrable—. Decírselas no es redundante: un modelo que entiende POR QUÉ no puede reportar
+ * porcentajes escribe una prosa distinta, no solo una que pasa el validador.
+ *
+ * Las tres cosas que este sistema tiene que conseguir, y por qué cada una:
+ *
+ * 1. Que hable DESDE el arquetipo y no sobre él. «El desconfiado digital probablemente
+ *    abandonaría» es una frase de analista; «no me fío de una app que me pide la cédula antes
+ *    de decirme para qué» es la lente puesta. La segunda se puede contrastar contra el
+ *    testimonio que sostiene al arquetipo; la primera no dice nada que alguien pueda ir a
+ *    comprobar.
+ * 2. Que separe lo que la evidencia sostiene de lo que está extrapolando. Es la regla más
+ *    fácil de romper sin querer, porque un buen revisor extrapola todo el rato — y ahí está
+ *    la diferencia entre una simulación honesta y una que se lee como investigación.
+ * 3. Que termine en PREGUNTAS PARA PERSONAS REALES. Es la única salida legítima de una
+ *    simulación: no valida nada, dice qué hay que ir a preguntar. Un lote sin preguntas ha
+ *    gastado dinero en una opinión.
+ */
+export const SISTEMA_REVISION = [
+  'Eres una capacidad de revisión adversarial de una plataforma de service design. Propones; una persona decide.',
+  'Revisas UN CONCEPTO desde UN ARQUETIPO del reto, usándolo como lente: qué fricciones, exclusiones, contradicciones y riesgos le ve ESE perfil a ESA solución candidata.',
+  'Lo que produces es SIMULACIÓN, y así queda etiquetado para siempre. No es evidencia, no sustituye a una entrevista ni a un test, y no cuenta para aprobar ningún gate. Escribe sabiendo eso: tu trabajo es decir qué habría que ir a comprobar, no comprobarlo.',
+  'Habla DESDE el arquetipo, no sobre él. Un hallazgo que empieza «este perfil probablemente…» es de analista; uno que nombra la fricción concreta que ese perfil encuentra en este concepto se puede contrastar.',
+  'Cada hallazgo que NO marques como hipótesis trae al menos una cita: un fragmento LITERAL de la evidencia que sostiene a este arquetipo (copiado carácter a carácter, sin parafrasear), con el id EXACTO entre corchetes y su localización. No inventes ids ni cites nada que no esté en el material.',
+  'Y lo que extrapoles, MÁRCALO como hipótesis. Extrapolar está bien y es la mitad del oficio; disimularlo convierte una simulación en una investigación falsa. Sin cita y sin marca, un hallazgo es una frase con voz de usuario y nada detrás.',
+  'NADA DE NÚMEROS INVENTADOS. Ni porcentajes, ni «N de cada M», ni cuántos usuarios harían algo. No has medido nada y no hay ninguna muestra detrás de ti: un número con forma de dato de campo se lee como investigación y esa confusión es exactamente lo que aquí está prohibido.',
+  'Termina en PREGUNTAS PARA EL TEST REAL: qué habría que preguntarle a una persona, y en qué escenario, para saber si lo que señalas ocurre de verdad. Ésa es la única salida legítima de una simulación, y de ahí sale su valor.',
+  'Di de qué hallazgo nace cada pregunta cuando nazca de uno: es la traza que conecta lo que simulaste con lo que se va a comprobar.',
+  'NO decidas el concepto. Tu revisión no lo aprueba ni lo mata: eso lo hace un test con personas y una decisión humana con su razón escrita.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
  * C6 redacta un CONTRATO, y por eso su sistema empieza diciendo lo que NO redacta.
  *
  * El Metric Registry es lo que el cliente se compromete a aportar y contra lo que se lee el
@@ -1241,6 +1377,42 @@ export function promptOportunidades(reto: {
       .filter(Boolean)
       .join('\n\n'),
     alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.insights.length} insights validados, ${reto.criterios.length} criterios (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+  };
+}
+
+/**
+ * Prompt de C4: un concepto, una lente, y lo que hay que ir a preguntar.
+ *
+ * Pide UNA sesión y no un lote: cada arquetipo es una llamada suya, porque una lente que se
+ * pronuncia sobre el concepto sabiendo lo que dijo la de al lado deja de ser una lente
+ * independiente — y la comparación entre arquetipos, que el prediseño sí pide («comparar cómo
+ * una decisión afectaría a distintos arquetipos»), la hace quien revisa leyendo las dos
+ * sesiones, que es donde esa comparación vale algo.
+ */
+export function promptRevision(c: {
+  titulo: string;
+  descripcion: string;
+  umbralTest: string;
+  arquetipo: ArquetipoQueRevisa;
+}): { usuario: string; alcanceResumen: string } {
+  const material = materialDeRevision(c);
+  return {
+    usuario: [
+      `Revisa el concepto del material desde el arquetipo «${c.arquetipo.nombre}», como si miraras la solución con sus ojos: qué fricciones, exclusiones o riesgos le encuentra.`,
+      material.bloque,
+      'Cada hallazgo que no marques como hipótesis cita al menos un fragmento LITERAL de la evidencia que sostiene a este arquetipo, por su id EXACTO entre corchetes. Lo que extrapoles, márcalo como hipótesis: las dos cosas son legítimas, confundirlas no.',
+      'Nada de porcentajes ni de «N de cada M»: no has medido nada, y un número con esa forma se lee como investigación.',
+      'Y termina en preguntas para el test con personas reales: qué preguntar, en qué escenario, y de qué hallazgo tuyo nace cada una.',
+      // Lo que no se pide, dicho: el veredicto del concepto es de las personas y tiene su
+      // propia puerta —un test real y una decisión con su razón escrita—.
+      'NO decidas el concepto ni digas si debería pasar o morir: tu revisión no es evidencia y no cuenta para el gate.',
+      material.truncado
+        ? `(El material se truncó a ${MAX_MATERIAL} caracteres: no cites nada de una evidencia que no ves entera.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `concepto «${c.titulo}» × arquetipo «${c.arquetipo.nombre}» (${c.arquetipo.estado}) · ${c.arquetipo.evidencia.length} evidencias del arquetipo (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 

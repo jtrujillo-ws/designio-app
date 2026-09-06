@@ -22,6 +22,7 @@ export type {
   ContenidoPostMortem,
   ContenidoPropuesta,
   ContenidoRemediacionJourney,
+  ContenidoRevisionSimulada,
 } from './ai.contenido';
 
 /** CTX-08 Capacidades AI — el pipeline único PropuestaAI (ADR-0012, SPEC-08). */
@@ -81,7 +82,17 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6', 'C3', 'C7'] as const;
+export const CAPACIDADES_ACTIVAS = [
+  'CI',
+  'C0',
+  'CT',
+  'C2',
+  'C5',
+  'C6',
+  'C3',
+  'C7',
+  'C4',
+] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
 export const DestinoSchema = z.enum([
@@ -97,6 +108,15 @@ export const DestinoSchema = z.enum([
    * de C7, que lo explica donde se comprueba.
    */
   'outcome-review',
+  /*
+   * El octavo, y el primero cuya salida NO es evidencia de nada. Una revisión simulada es la
+   * lectura de un arquetipo sobre un concepto, etiquetada como simulación de forma imborrable
+   * (SYS-20): se puede leer, puede originar preguntas para el test real, y no se puede citar
+   * en el checklist de un gate — no porque una regla lo prohíba, sino porque `checklist_item`
+   * no tiene dónde colgarla, que es lo que RF-08.3 quiere decir con «el tipo de objeto lo
+   * impide».
+   */
+  'revision-simulada',
 ]);
 export type Destino = z.infer<typeof DestinoSchema>;
 
@@ -174,6 +194,18 @@ export const MAX_ENTRADAS_KPI_POR_LOTE = 6;
  * criterios que ya existen.
  */
 export const MAX_OPORTUNIDADES_POR_LOTE = 5;
+/*
+ * El techo de C4: seis sesiones por lote, una por arquetipo.
+ *
+ * Es un techo del LOTE, no del reto: si un reto tiene más de seis arquetipos, el material se
+ * ofrece con los seis que caben y el resto se pide en otra vuelta. Seis ya es más de lo que
+ * alguien revisa de una sentada, y son revisiones de leer, no de tachar.
+ *
+ * Y no se sube pensando en cubrir «todos los arquetipos posibles»: eso sería el modo «N
+ * usuarios» que SYS-20 prohíbe, entrando por la puerta de atrás. Los arquetipos de un reto son
+ * los que emergieron de su evidencia, no una muestra.
+ */
+export const MAX_REVISIONES_POR_LOTE = 6;
 
 /**
  * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
@@ -198,7 +230,14 @@ export const MAX_REMEDIACIONES = 20;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id' | 'registry_id' | 'outcome_review_id';
+  columna:
+    | 'item_id'
+    | 'reto_id'
+    | 'gate_id'
+    | 'journey_id'
+    | 'registry_id'
+    | 'outcome_review_id'
+    | 'concepto_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -347,6 +386,7 @@ const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   journey_id: true,
   registry_id: true,
   outcome_review_id: true,
+  concepto_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -363,6 +403,7 @@ export const COLUMNA_DE_DESTINO: Record<
   | 'entrada_kpi_id'
   | 'oportunidad_id'
   | 'outcome_review_id'
+  | 'revision_simulada_id'
 > = {
   evidencia: 'evidencia_id',
   'criterio-exito': 'criterio_id',
@@ -383,6 +424,7 @@ export const COLUMNA_DE_DESTINO: Record<
    * diferido.
    */
   'outcome-review': 'outcome_review_id',
+  'revision-simulada': 'revision_simulada_id',
 };
 
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
@@ -723,6 +765,75 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     esSimulacion: false,
     roles: ROLES_CURADORES,
   },
+  C4: {
+    etiqueta: 'Concepto × arquetipos → revisión simulada y preguntas de test',
+    destino: 'revision-simulada',
+    /*
+     * EL CONCEPTO, y no el reto aunque los arquetipos sean del reto.
+     *
+     * Lo que se revisa es un concepto: la sesión dice «qué le ve ESTE arquetipo a ESTA
+     * solución candidata». Anclando en el reto —que era lo cómodo, porque de ahí salen las
+     * lentes— C4 se habría ofrecido sobre retos, y cada propuesta del lote habría tenido que
+     * decir por dentro a qué concepto se refiere: un id dentro del `contenido` en vez de una
+     * columna, o sea el tipo de dato que ninguna clave ajena comprueba y que el guard de
+     * materialización tendría que creerse.
+     *
+     * Y el lote es UNA PROPUESTA POR ARQUETIPO, que es lo que RF-08.2 llama «sesión por
+     * arquetipo»: cada una se acepta o se rechaza por su cuenta, porque cada lente es una
+     * lectura independiente y quedarse con dos de tres es un resultado legítimo.
+     */
+    ancla: {
+      columna: 'concepto_id',
+      etiqueta: 'Concepto por decidir',
+      enProsa: 'concepto candidato',
+      buscar: 'Buscar por título…',
+      vacia:
+        'No hay conceptos que revisar. Los revisores AI leen conceptos candidatos de un reto que tenga arquetipos con evidencia enlazada: crea el concepto en la etapa 4, o confirma antes los arquetipos en la 2.',
+      hayMas: (n) =>
+        `Hay más conceptos revisables de los que caben aquí: se listan los ${n} primeros por ` +
+        'título. Un concepto sale de la lista mientras sus revisiones propuestas esperan ' +
+        'revisión; para uno concreto, búscalo por su título.',
+      enCurso:
+        'Ese concepto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese concepto ya tiene revisiones propuestas esperando decisión: decídelas antes de pedir otras',
+    },
+    /*
+     * LOTE por arquetipo, con revisión POR ELEMENTO. El techo lo pone el número de arquetipos
+     * del reto, no una constante: un reto con dos lentes produce dos sesiones.
+     *
+     * El MÍNIMO es uno y no cero, al revés que C2 y C3. Allí «no hay nada que proponer» es una
+     * respuesta legítima del modelo sobre el fondo; aquí no hay juicio que hacer: si el reto
+     * tiene arquetipos con evidencia, cada uno tiene algo que decir sobre el concepto, y un
+     * lote vacío significaría que el modelo se negó a mirar. Cuando el reto NO tiene lentes,
+     * la capacidad no se ofrece siquiera —eso lo decide el ancla, no el lote—.
+     */
+    lote: { campo: 'revisiones', minimo: 1, maximo: MAX_REVISIONES_POR_LOTE },
+    /*
+     * `ROLES_CURADORES`, y aquí sí coincide con la base: `revision_simulada` y sus tres tablas
+     * hijas admiten `lead-boutique` y `disenador`, como las otras cinco tablas de destino. La
+     * excepción sigue siendo C7 y su `outcome_review`, que es lo que hizo falta este campo.
+     */
+    roles: ROLES_CURADORES,
+    /*
+     * El material son el concepto y los arquetipos del reto con la evidencia que los sostiene.
+     * Esa evidencia ya pasó por la puerta del consentimiento cuando entró por la bandeja, igual
+     * que en C2 y C3, así que la respuesta es la misma y por el mismo motivo.
+     */
+    exigeConsentimiento: false,
+    /*
+     * LA ÚNICA QUE SÍ, y por eso esta bandera existía desde la Fase 0 con este caso escrito en
+     * su comentario. SYS-20: los hallazgos de un revisor AI son simulación, la etiqueta es
+     * imborrable, y de aquí llega a `propuesta_ai.es_simulacion` sin que nadie tenga que
+     * acordarse de ponerla en el insert.
+     *
+     * Lo que la bandera NO hace, y conviene decirlo: no es la que impide citar la salida en un
+     * checklist. Eso lo impide el TIPO DE OBJETO —`checklist_item` no tiene columna donde
+     * colgar una revisión simulada—, que es lo que RF-08.3 pide y lo que un censo de la suite
+     * vigila. Una bandera se puede leer mal; una columna que no existe, no.
+     */
+    esSimulacion: true,
+  },
 };
 
 
@@ -830,6 +941,21 @@ export const ESTADOS_ANCLA = [
    * 7 es trabajo perfectamente normal: constatar elementos y registrar lecturas ES la etapa. */
   'post-mortem-cerrado',
   'conciliacion-cambiada',
+  /*
+   * Los dos de C4.
+   *
+   * Un concepto DECIDIDO cierra la puerta: una revisión simulada existe para dar preguntas al
+   * test que decide el pasa/muere, así que materializarla después del veredicto añade al
+   * expediente una lectura que parece haber informado la decisión y llegó tarde. La base lo
+   * exige también —la política de inserción pide `estado = 'candidato'`—, que es lo que impide
+   * que esta pantalla y aquélla discrepen.
+   *
+   * Y el MATERIAL MOVIDO, que aquí tiene tres mitades y por eso el nombre no menciona ninguna:
+   * el concepto se reescribe, el arquetipo se confirma o se refuta, o le enlazan evidencia
+   * nueva. Las tres cambian lo que la sesión leyó, y ninguna es más «la causa» que las otras.
+   */
+  'concepto-decidido',
+  'material-de-revision-movido',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

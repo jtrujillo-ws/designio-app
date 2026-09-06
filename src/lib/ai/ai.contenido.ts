@@ -383,7 +383,8 @@ export type ContenidoPropuesta =
   | ContenidoRemediacionJourney
   | ContenidoEntradaKpi
   | ContenidoOportunidad
-  | ContenidoPostMortem;
+  | ContenidoPostMortem
+  | ContenidoRevisionSimulada;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -620,6 +621,140 @@ export const ContenidoPostMortemSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
 
+/**
+ * C4 — la sesión de UN arquetipo revisando UN concepto (RF-08.2).
+ *
+ * La forma es casi la de C2 y no es casualidad: un hallazgo es una afirmación con citas y su
+ * marca de hipótesis, igual que las de un insight. Lo que cambia es de dónde sale la
+ * autoridad —allí, la evidencia; aquí, un arquetipo mirando la evidencia que lo sostiene— y
+ * qué se puede hacer con el resultado, que es lo que SYS-20 acota.
+ *
+ * Las tres reglas del invariante que viven en este contrato:
+ *
+ *  · `esHipotesis` sin citas, o citas: nunca ninguna de las dos. «Sus afirmaciones deben
+ *    derivarse del arquetipo y de evidencia real citada; cuando extrapolen, se marcan como
+ *    hipótesis» son las DOS clases legítimas de hallazgo, y la tercera —una frase con voz de
+ *    usuario, sin nada detrás y sin avisar de que no lo hay— es la avería que el invariante
+ *    teme. La base lo exige también, con un trigger diferido, porque una revisión se puede
+ *    escribir a mano sin pasar por aquí.
+ *
+ *  · Ni un agregado sintético en ningún texto. «El 70 % de los desconfiados abandonaría» es
+ *    la frase exacta que SYS-20 prohíbe, y la prohíbe porque ese 70 % no lo midió nadie. Aquí
+ *    se corta al parsear, con el motivo; en la base lo corta `sin_agregado_sintetico()`, que
+ *    es lo que sigue siendo verdad cuando nadie parsea.
+ *
+ *  · Y las preguntas de test, que son la ÚNICA salida legítima de una simulación: el journey
+ *    lo dice con el ejemplo —«señala riesgo de exclusión (simulación → origina una pregunta
+ *    del test)»—. Al menos una: una revisión que no deja ninguna pregunta que hacerle a una
+ *    persona real no ha servido para lo que existe.
+ */
+const AGREGADO_SINTETICO = /\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b/;
+const SIN_AGREGADO =
+  'sin porcentajes ni proporciones inventadas: una revisión simulada no mide nada, y un número con forma de dato de campo se lee como investigación (SYS-20)';
+
+const TextoDeRevision = (max: number) =>
+  z.string().trim().min(1).max(max).refine((t) => !AGREGADO_SINTETICO.test(t), SIN_AGREGADO);
+
+export const ContenidoRevisionSimuladaSchema = z
+  .object({
+    /* El arquetipo que hace de lente, por su id copiado del material. */
+    arquetipoId: IdCopiadoDelMaterial,
+    /* La lectura de conjunto: de qué va esta sesión, antes de bajar a los hallazgos. */
+    sintesis: TextoDeRevision(2000),
+    hallazgos: z
+      .array(
+        z.object({
+          titulo: TextoDeRevision(200),
+          descripcion: TextoDeRevision(2000),
+          /* SYS-20 / RF-08.2: lo que se extrapola se marca, no se disimula. */
+          esHipotesis: z.boolean(),
+          /*
+           * Y sus citas, con la MISMA forma que las de una afirmación de C2 —el documento por
+           * su id, el fragmento literal y dónde está—: la presencia literal se mide igual, y
+           * una segunda forma de cita habría sido una segunda cosa que mantener.
+           *
+           * El techo es cuatro y no seis: un hallazgo de revisión es más estrecho que una
+           * afirmación de insight, y cuatro fragmentos ya son más de lo que alguien contrasta
+           * de una sentada.
+           */
+          citas: z
+            .array(CitaDeAfirmacionSchema)
+            .max(4)
+            .refine(
+              (xs) =>
+                new Set(xs.map((c) => `${c.evidenciaId}\u0000${c.fragmento}\u0000${c.localizacion}`))
+                  .size === xs.length,
+              'un hallazgo no repite la misma cita: no añade sostén y deja sin comprobar lo que se materializa',
+            ),
+        }),
+      )
+      .min(1)
+      .max(6)
+      /*
+       * LA REGLA DEL INVARIANTE, y va como `superRefine` para que el error señale al hallazgo
+       * que falla: con seis en el lote, «alguno no se sostiene» obliga a quien revisa a
+       * buscarlo a mano.
+       */
+      .superRefine((xs, ctx) => {
+        xs.forEach((h, i) => {
+          if (!h.esHipotesis && h.citas.length === 0) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [i, 'citas'],
+              message:
+                'un hallazgo que no se marca como hipótesis cita al menos una evidencia real: sin cita y sin marca es una afirmación inventada con voz de usuario (RF-08.2, SYS-20)',
+            });
+          }
+        });
+      }),
+    preguntas: z
+      .array(
+        z.object({
+          pregunta: TextoDeRevision(500),
+          /* El montaje en el que preguntarla. Puede ir vacío: no toda pregunta lo necesita. */
+          escenario: z
+            .string()
+            .trim()
+            .max(1000)
+            .default('')
+            .refine((t) => !AGREGADO_SINTETICO.test(t), SIN_AGREGADO),
+          /*
+           * De qué hallazgo nace, POR SU ÍNDICE en la lista de arriba. Un índice y no un id
+           * porque cuando esta respuesta se escribe los hallazgos todavía no existen como
+           * filas; la aceptación lo traduce al id que acaba de nacer, y el guard diferido
+           * comprueba la traducción.
+           */
+          hallazgoIndice: z.number().int().min(0).max(5).optional(),
+        }),
+      )
+      .min(1)
+      .max(6),
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  /*
+   * Y el índice de cada pregunta apunta DENTRO del lote. Va en el `superRefine` del objeto y no
+   * en el del array porque la respuesta está en la OTRA lista: un array no puede mirarse contra
+   * su hermano, y el techo estático del campo (`max(5)`) solo acota la forma, no la relación.
+   *
+   * Fuera de rango no es un matiz: la aceptación dejaría la pregunta colgando de nada y la traza
+   * simulación → test real se rompería en silencio, que es justo la que hace legítima a esta
+   * capacidad.
+   */
+  .superRefine((c, ctx) => {
+    c.preguntas.forEach((q, i) => {
+      if (q.hallazgoIndice !== undefined && q.hallazgoIndice >= c.hallazgos.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['preguntas', i, 'hallazgoIndice'],
+          message:
+            'esa pregunta dice nacer de un hallazgo que el lote no trae: la traza de la simulación al test real es lo que hace legítima a esta capacidad, así que no puede apuntar a nada',
+        });
+      }
+    });
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoRevisionSimulada = z.infer<typeof ContenidoRevisionSimuladaSchema>;
+
 export const ESQUEMA_DE_CONTENIDO: Record<
   CapacidadActiva,
   z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>
@@ -632,6 +767,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   C6: ContenidoEntradaKpiSchema,
   C3: ContenidoOportunidadSchema,
   C7: ContenidoPostMortemSchema,
+  C4: ContenidoRevisionSimuladaSchema,
 };
 
 /**
@@ -682,6 +818,20 @@ export const CITAS_DEL_CONTENIDO: Record<
   C2: (c) =>
     (c as ContenidoInsight).afirmaciones.flatMap((a) =>
       a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
+    ),
+  /*
+   * C4 igual que C2, y por la misma razón exacta: sus citas viven DENTRO de cada hallazgo
+   * —una cita sostiene UN hallazgo concreto, y aplanarlas perdería cuál sostiene a cuál— y
+   * cada una nombra su documento, porque el material lleva varios (la evidencia que sostiene
+   * al arquetipo que revisa).
+   *
+   * Un hallazgo marcado como HIPÓTESIS puede no traer ninguna, y eso no rompe nada aquí: la
+   * lista sale más corta, la presencia literal se mide sobre lo que hay, y el contrato ya
+   * garantizó que la ausencia de citas viene con la marca puesta.
+   */
+  C4: (c) =>
+    (c as ContenidoRevisionSimulada).hallazgos.flatMap((h) =>
+      h.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
     ),
   // C5 las guarda arriba, como las tres primeras: sus remediaciones no son el sujeto de las
   // citas —lo es el grafo entero—, así que no hay nada que anidar.
@@ -736,6 +886,33 @@ export const TESTIMONIO_ADICIONAL: Record<
   CI: null,
   C0: null,
   CT: null,
+  C4: {
+    parte: (c) => ({
+      arquetipoId: (c as ContenidoRevisionSimulada).arquetipoId,
+      hipotesis: (c as ContenidoRevisionSimulada).hallazgos.map((h) => h.esHipotesis),
+    }),
+    /*
+     * DOS cosas, y las dos por la misma frase que ya está escrita en la entrada de C6: la
+     * parte que se puede contrastar no la reescribe quien revisa.
+     *
+     * El `arquetipoId` porque es la LENTE: dice desde qué perfil se hizo la lectura, y
+     * cambiarlo al corregir convierte la sesión del «apurado de RR. HH.» en la del
+     * «desconfiado digital» conservando sus frases. Es fabricar una voz, que es justo lo que
+     * SYS-20 existe para impedir.
+     *
+     * Y `esHipotesis`, que es la mitad del invariante que se puede borrar sin que se note. Un
+     * hallazgo propuesto como extrapolación y «corregido» a afirmación es una simulación que
+     * pasa a leerse como investigación, y la propuesta seguiría diciendo `true` en su
+     * contenido original mientras el objeto de al lado dice que no. La base lo comprueba
+     * también, al materializar; esto lo corta antes, donde se puede decir el motivo.
+     *
+     * Lo que SÍ se corrige, que es la otra mitad: el título y la descripción de cada hallazgo,
+     * la síntesis y las preguntas de test. Un hallazgo bien fundado y mal redactado se
+     * arregla, no se tira — y las preguntas son consejo, como las remediaciones de C5.
+     */
+    motivo:
+      'De una revisión simulada no se corrigen ni el arquetipo que la firma ni la marca de hipótesis de sus hallazgos: la lente dice desde qué perfil se leyó, y la marca separa lo que se apoya en evidencia de lo que se extrapola (SYS-20). Corrige los textos, o rechaza la revisión.',
+  },
   /*
    * C3 no añade nada, y eso es una respuesta y no un hueco: lo único que en esta capacidad es
    * testimonio del modelo —a qué insights se apoya— vive DENTRO de las citas, que ya son

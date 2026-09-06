@@ -6,7 +6,7 @@ language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta b0d578f, 2026-09-06). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 90c2d87, 2026-09-06). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,14 +17,15 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `b0d578f`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `90c2d87`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
 > [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
 > [#46](https://github.com/jtrujillo-ws/designio-app/pull/46),
 > [#47](https://github.com/jtrujillo-ws/designio-app/pull/47),
-> [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) y
-> [#50](https://github.com/jtrujillo-ws/designio-app/pull/50)). Donde el paquete de diseño y el código
+> [#49](https://github.com/jtrujillo-ws/designio-app/pull/49),
+> [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) y
+> [#51](https://github.com/jtrujillo-ws/designio-app/pull/51)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -33,10 +34,12 @@ language: es
 
 ## Cómo está organizado este documento
 
-El documento sigue la **navegación del lateral del workspace 1:1**: cada destino del lateral
+El documento sigue los **destinos del lateral del workspace 1:1**: cada destino del lateral
 (Loop, Bandeja de importación, Aprobaciones, Evidencia, Insights, Biblioteca, Journeys, Versions y
 releases, Propuestas AI, Personas, Segmentos, Exportación, Disposición, Auditoría) tiene su capítulo,
-y las pantallas de detalle (proyecto, journey, design version) cuelgan del capítulo que las abre.
+y las pantallas de detalle (proyecto, journey, design version) cuelgan del capítulo que las abre. Los
+capítulos van en el orden del loop; el lateral, desde #51, agrupa esos mismos destinos por clase
+(lo que espera, material y razonamiento, diseño y entrega, gobierno), sin quitar ni añadir ninguno.
 Tiene cuatro partes:
 
 1. **Visión general** (`00`) — qué es Designio, para quién, el loop J1–J7, la cadena de trazabilidad,
@@ -58,7 +61,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49 y #50 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49, #50 y #51 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -500,7 +503,7 @@ El detalle de cada fila está en el capítulo correspondiente y en la hoja de ru
 
 # Catálogo funcional
 
-Sigue el orden del lateral del workspace. Cada capítulo describe qué se puede hacer, qué impone la
+Recorre los destinos del lateral del workspace en el orden del loop. Cada capítulo describe qué se puede hacer, qué impone la
 base (porque en Designio "lo que la base rechaza, la pantalla no lo ofrece"), quién puede hacerlo, en
 qué estado está y de qué spec sale.
 
@@ -517,12 +520,23 @@ del handoff: un **lateral en negro violeta** que navega el árbol y un contenido
 
 | Zona | Contenido |
 |---|---|
-| **Lateral** | Marca tipográfica `designio.`; selector de **workspace activo** (una fila por membresía; cambiarlo remonta la pantalla); árbol **Cliente → Servicios → Retos → Proyectos** con el estado de cada reto pintado con el color del journey en que está (`J2`… `J7`, `cerrado`, o punteado para candidatos nacidos del post mortem); fila «+ Nuevo servicio» que abre un formulario en el sitio; sección **Workspace** con los destinos (Bandeja, Aprobaciones, Evidencia, Insights, Biblioteca, Journeys, Versions y releases, Propuestas AI, Personas, Segmentos, Exportación, Disposición y, para los roles que la ven, Auditoría) y contadores de lo que espera |
+| **Lateral** | Marca tipográfica `designio.`; selector de **workspace activo** (una fila por membresía; cambiarlo remonta la pantalla); árbol **Cliente → Servicios → Retos → Proyectos** con el estado de cada reto pintado con el color del journey en que está (`J2`… `J7`, `cerrado`, o punteado para candidatos nacidos del post mortem); fila «+ Nuevo servicio» que abre un formulario en el sitio; y los destinos del workspace agrupados por clase desde [#51](https://github.com/jtrujillo-ws/designio-app/pull/51): **«Te espera»** arriba del árbol con exactamente los destinos que tienen contador (Aprobaciones con lo pendiente del rol, Bandeja con lo sin curar; a cero el bloque no existe y la fila vuelve a su estante), dos estantes de consulta siempre visibles, **«Material y razonamiento»** (Bandeja, Aprobaciones cuando no esperan, Evidencia, Insights, Oportunidades HMW, Segmentos) y **«Diseño y entrega»** (Journeys, Versions y releases, Propuestas AI con el sufijo «propone», Biblioteca), y **«Gobierno del workspace»** plegado en una fila que cuenta lo que el rol ve (Personas, Exportación, Disposición y, para los roles que la ven, Auditoría), con una nota que nombra solo esos destinos y la preferencia de abierto o cerrado recordada en el navegador por usuario y workspace |
 | **Topbar** | Buscador del workspace (busca de verdad: servicios, retos, proyectos, journeys, design versions, evidencia e insights, hasta 5 por clase y 20 en total, mínimo 2 caracteres) y salida de sesión. No repite marca, cliente ni usuario: esos son del lateral |
 | **Cabecera de arco** | Servicio seleccionado (estado de ruta `?servicio=`), reto y proyecto actuales, cifras del reto (criterios, gates cerrados, release vivo) y la barra del arco J1→J7 |
 | **Spotlight** | El journey **en curso** con su descripción, el gate abierto y el enlace a la pantalla donde se trabaja; con el loop cerrado enseña J7 hecho |
 | **Te toca a ti** | Lo que espera **a quien mira**, según su rol: gates que puede aprobar, derechos pendientes, insights por validar, design versions en borrador. Una aprobación que espera al sponsor no aparece como tarea del lead |
 | **Siete tarjetas J1–J7** | Estado (hecho, en curso, próximo) derivado de los gates; cada tarjeta enlaza a su pantalla; si el servicio aún no tiene proyecto, la tarjeta lo dice en vez de fingir un enlace |
+
+## Cómo se agrupa el lateral
+
+Regla pura (`src/lib/loop/lateral.ts`), compartida entre cliente y servidor y probada sin pintar
+nada: la bandeja solo cuenta para quien la cura (lead y diseñador), así que a un sponsor no se le
+promueve a «Te espera»; el filtrado por rol es el de siempre (Auditoría solo para
+`ROLES_AUDITORIA`; Disposición se enseña a todos y solo cambia el rótulo a «Constancias que
+conservas» para quien no decide la disposición); ningún destino se pierde ni se repite al agrupar.
+En el riel estrecho cada fila es su abreviatura de tres letras y los estantes los separa un
+hairline. El árbol pinta sus cuatro niveles (ADR-0003): cada proyecto del reto cuelga como subfila
+con el proyecto actual destacado. Fuente: handoff «Loop · impacto visual», turno 4a.
 
 ## Cómo se deriva el estado del loop
 
@@ -1241,8 +1255,9 @@ fila enlaza a la pantalla donde se decide con el contexto delante.
 | Design versions en borrador | Aprobarlas congela su snapshot | Lead |
 
 Una clase que el rol no decide no se enseña; una que sí decide y está vacía lo dice, para que "no hay
-nada" no se confunda con "no te toca". El mismo cálculo alimenta «Te toca a ti» en el Loop y los
-contadores del lateral. Fuente: SPEC-01 (portal), SPEC-04. PR [#41](https://github.com/jtrujillo-ws/designio-app/pull/41).
+nada" no se confunda con "no te toca". El mismo cálculo alimenta «Te toca a ti» en el Loop y el
+contador de Aprobaciones que, cuando es mayor que cero, sube la fila al bloque «Te espera» del
+lateral. Fuente: SPEC-01 (portal), SPEC-04. PR [#41](https://github.com/jtrujillo-ws/designio-app/pull/41).
 
 ---
 
@@ -1773,7 +1788,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (un archivo por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai, concepto) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#50): **898 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#51): **907 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1785,7 +1800,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem) , [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7) y [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) y [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -2005,7 +2020,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Seis días de construcción (2026-09-01 a 2026-09-06), 46 commits en `agents`, cada uno un
+Seis días de construcción (2026-09-01 a 2026-09-06), 47 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -2056,6 +2071,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-05 | #47 | El post mortem se redacta sobre lo constatado, no sobre lo que se recuerda |
 | 09-06 | #49 | El recorte también decide qué desviaciones puede afirmar el post mortem |
 | 09-06 | #50 | C7 era la única capacidad que no le decía al modelo que su material se truncó |
+| 09-06 | #51 | El lateral deja de ser una lista: lo pendiente arriba, el árbol entero y el gobierno plegado |
 
 ---
 

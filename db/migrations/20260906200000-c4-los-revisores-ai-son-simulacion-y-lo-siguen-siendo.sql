@@ -71,6 +71,51 @@ $fn$;
 revoke execute on function sin_agregado_sintetico(text) from public;
 grant execute on function sin_agregado_sintetico(text) to designio_app;
 
+-- ── EL DERECHO QUE VENCE HOY, SOBRE LA EVIDENCIA QUE DE VERDAD SE MANDA ──
+--
+-- Hermana de `derecho_del_reto_que_vence_ya`, que C2 usa, y hace falta aparte por una razón
+-- concreta: aquélla recorre TODOS los arquetipos del reto, y el lote de C4 manda solo las
+-- lentes de su ventana —las que tienen evidencia, las no revisadas todavía, y como mucho seis—.
+-- Preguntar por el reto entero bloquearía una llamada legítima por un permiso que vence en un
+-- arquetipo que este lote ni siquiera enseña. Ésta recibe LA LISTA de lo que se manda.
+--
+-- El margen no es de medianoche: se pregunta por el día ENTERO. Un permiso que vence HOY no
+-- llega vivo al final del camino —entre la llamada y el sello hay un commit, la respuesta del
+-- proveedor y una revisión humana, que no ocurre en el mismo minuto—, así que mañana la
+-- aceptación fallaría con DR001 y quedaría una revisión pagada, leída y solo tirable. Con el
+-- último día ya fuera, además, no queda medianoche que cruzar: `current_date` se congela al
+-- empezar la transacción, así que una que arranca a las 23:59 despacharía pasada la medianoche
+-- un documento cuyo permiso ya expiró.
+--
+-- `evidencia_usable` no se toca: es LA definición de «se puede usar» y para leer o citar HOY
+-- sigue siendo la correcta. Ésta es una pregunta distinta y más estricta, y solo puede errar en
+-- la dirección de no gastar.
+--
+-- Anti-oráculo como sus hermanas: `security definer` y concedida al rol de aplicación, así que
+-- sin la primera rama contestaría por workspaces ajenos —y lo que contesta es el TÍTULO de un
+-- documento de otro cliente—.
+create function derecho_que_vence_ya(p_evidencias uuid[], p_ws uuid) returns text
+language sql stable security definer set search_path = public, pg_temp as $fn$
+  select case
+    when session_user = 'designio_app' and not is_workspace_member(app_user_id(), p_ws)
+      then null
+    else (
+      select e.titulo
+        from derecho_uso du
+        join evidencia e on e.id = du.evidencia_id and e.workspace_id = du.workspace_id
+       where du.workspace_id = p_ws
+         and du.evidencia_id = any (p_evidencias)
+         and du.estado = 'concedido' and du.ambito in ('cliente', 'publico')
+         and du.vence_en is not null
+         and du.vence_en <= timezone('UTC', now())::date
+       order by e.titulo asc
+       limit 1)
+  end
+$fn$;
+
+revoke execute on function derecho_que_vence_ya(uuid[], uuid) from public;
+grant execute on function derecho_que_vence_ya(uuid[], uuid) to designio_app;
+
 -- ── La sesión de revisión: un arquetipo, un concepto, una lectura ──
 create table revision_simulada (
   id uuid primary key default gen_random_uuid(),

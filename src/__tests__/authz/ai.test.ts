@@ -7800,6 +7800,174 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  /**
+   * Un permiso que vence HOY no llega vivo al final del camino.
+   *
+   * `evidencia_usable` dice que se puede citar hoy, y es cierto: es LA definición y no se toca.
+   * Pero entre pedir la revisión y aceptarla hay un commit, la respuesta del proveedor y una
+   * lectura humana, que no ocurre en el mismo minuto. Mañana la aceptación fallaría con DR001 y
+   * quedaría una revisión pagada, leída entera y solo tirable.
+   *
+   * Es la puerta que C2 ya tiene, con una diferencia que importa: la de C2 recorre TODOS los
+   * arquetipos del reto, y el lote de C4 manda solo las lentes de su ventana. Preguntar por el
+   * reto entero bloquearía una llamada legítima por un permiso de un arquetipo que este
+   * material ni siquiera enseña, así que `derecho_que_vence_ya` recibe la lista de lo que se
+   * manda. La sonda mide las dos direcciones.
+   */
+  it('C4 no gasta una llamada con un derecho de cita que vence hoy', async () => {
+    await enWorkspaceLimpio('c4-vence', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const pedir = () =>
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              revisiones: [
+                {
+                  arquetipoId: lenteA,
+                  sintesis: 'Este perfil llega con la guardia alta.',
+                  hallazgos: [
+                    {
+                      titulo: 'Pide confianza antes de darla',
+                      descripcion: 'Entrega el documento cuando entiende para qué.',
+                      esHipotesis: false,
+                      citas: [
+                        {
+                          evidenciaId: evA,
+                          fragmento: 'No entrego la cédula sin saber para qué.',
+                          localizacion: 'resumen',
+                        },
+                      ],
+                    },
+                  ],
+                  preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+                  confianzaPropuesta: 'media' as const,
+                },
+              ],
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        );
+
+      // El permiso del documento de UNA lente vence hoy: no se llama al proveedor.
+      await admin`update derecho_uso set vence_en = timezone('UTC', now())::date
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      await expect(pedir()).rejects.toThrow(/vence hoy/);
+      const [nada] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(nada!.n, 'se llamó al proveedor con un permiso que vence hoy').toBe(0);
+
+      // Y con el permiso renovado, la llamada sale.
+      await admin`update derecho_uso set vence_en = timezone('UTC', now())::date + 30
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+      await pedir();
+      const [una] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(una!.n).toBe(1);
+
+      /*
+       * Y la otra dirección, que es la que separa esto de la puerta de C2: un permiso que vence
+       * hoy en una lente que este lote NO manda no bloquea nada.
+       *
+       * La lente fuera del lote se construye por el ÚNICO camino donde este acotado cambia algo:
+       * POR ENCIMA DEL TOPE. Las ya revisadas las quita antes el propio lector —su ventana no
+       * las trae—, así que una revisión escrita a mano no mediría esto: lo dijo la
+       * neutralización, que no movía la sonda. Lo que sí queda dentro de `material.arquetipos` y
+       * fuera del lote es el arquetipo que no cabe en las seis sesiones.
+       */
+      // La propuesta del lote anterior se acepta: con una pendiente no se puede pedir otra.
+      await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: (await panelPropuestas(curadorId, wsC)).pendientes.find(
+          (x) => x.capacidad === 'C4',
+        )!.id,
+      });
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evB}`;
+      let ultimaEvidencia = '';
+      for (let i = 0; i < MAX_REVISIONES_POR_LOTE; i++) {
+        const [ev] = await admin`insert into evidencia
+          (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+          values (${wsC}, ${fte!.fuente_id as string}, ${`Entrevista Z-${i}`},
+                  'Lo dijo quien la dio.', '{}'::jsonb, ${curadorId}) returning id`;
+        await admin`insert into derecho_uso
+          (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+          values (${wsC}, ${ev!.id as string}, 'concedido', 'cliente',
+                  'Consentimiento del participante', ${curadorId}, now(), ${curadorId})`;
+        // `Zz…` ordena detrás de las dos del fixture, así que la última es la que no cabe.
+        const [arq] = await admin`insert into arquetipo
+          (workspace_id, reto_id, nombre, definicion, creado_por)
+          values (${wsC}, ${retoC}, ${`Zz lente ${i}`}, 'Perfil emergente', ${curadorId})
+          returning id`;
+        await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+          values (${wsC}, ${arq!.id as string}, ${ev!.id as string})`;
+        ultimaEvidencia = ev!.id as string;
+      }
+      // 2 + 6 = 8 lentes con evidencia y un tope de 6: las dos últimas quedan fuera del lote.
+      const enElLote = await conUsuario(curadorId, async (tx) => {
+        const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+        return lentesDelLote(material!.arquetipos).lentes.flatMap((a) =>
+          a.evidencia.map((e) => e.id),
+        );
+      });
+      expect(enElLote).not.toContain(ultimaEvidencia);
+
+      // Su permiso vence hoy, y la llamada sale igual: solo se mira lo que se manda. El lote
+      // nuevo propone `lenteB`, que es la que sigue sin revisar de las dos del fixture.
+      await admin`update derecho_uso set vence_en = timezone('UTC', now())::date
+        where evidencia_id = ${ultimaEvidencia} and workspace_id = ${wsC}`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteB,
+                sintesis: 'La segunda lente, con su documento vivo.',
+                hallazgos: [
+                  {
+                    titulo: 'El tiempo manda',
+                    descripcion: 'Abandona si tarda.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evB,
+                        fragmento: 'Si tarda más de un café, lo dejo.',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const [dos] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${wsC} and capacidad = 'C4'`;
+      expect(dos!.n, 'un permiso de una lente fuera del lote bloqueó la llamada').toBe(2);
+    });
+  });
+
   it('C4 no admite dos sesiones del mismo arquetipo sobre el mismo concepto (SYS-20)', async () => {
     await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();

@@ -3444,12 +3444,12 @@ export async function huellaDelMaterialDeRevision(
   workspaceId: string,
   anclaId: string,
   loteId?: string,
-): Promise<{ huella: string; material: ConceptoARevisar | null }> {
+): Promise<{ huella: string; material: ConceptoARevisar | null; caducada: string | null }> {
   await tx`select pg_advisory_xact_lock_shared(
     hashtextextended('designio:workspace:' || ${workspaceId}, 42))`;
   const [dueno] = await tx`select reto_id from concepto
     where id = ${anclaId} and workspace_id = ${workspaceId}`;
-  if (!dueno) return { huella: '', material: null };
+  if (!dueno) return { huella: '', material: null, caducada: null };
   const retoId = dueno.reto_id as string;
   await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
   await tx`select 1 from reto where id = ${retoId} and workspace_id = ${workspaceId} for share`;
@@ -3489,14 +3489,32 @@ export async function huellaDelMaterialDeRevision(
                  and ph.llamada_id = ${loteId ?? null}::uuid))) as arquetipos
     from concepto c
     where c.id = ${anclaId} and c.workspace_id = ${workspaceId}`;
-  if (!fila || !(fila.revisable as boolean)) return { huella: '', material: null };
+  if (!fila || !(fila.revisable as boolean)) return { huella: '', material: null, caducada: null };
   const material: ConceptoARevisar = {
     titulo: fila.titulo as string,
     descripcion: fila.descripcion as string,
     umbralTest: fila.umbral_test as string,
     arquetipos: (fila.arquetipos as ArquetipoQueRevisa[] | null) ?? [],
   };
-  return { huella: huellaDelMaterial(materialDeRevision(material).texto), material };
+  /*
+   * Y el derecho que VENCE HOY, sobre la evidencia de las lentes de este lote y no sobre la del
+   * reto entero: la ventana ya recortó los arquetipos, y preguntar por todos bloquearía una
+   * llamada legítima por un permiso que este material ni siquiera enseña.
+   *
+   * La pregunta la contesta la BASE y no esta plantilla, como en C2: el calendario de las
+   * garantías lo fija ella, y preguntarlo desde aquí lo dejaría dependiendo del huso de quien
+   * llama. Hay un censo que lo vigila.
+   */
+  const evidencias = lentesDelLote(material.arquetipos).lentes.flatMap((a) =>
+    a.evidencia.map((e) => e.id),
+  );
+  const [caducada] = await tx`select derecho_que_vence_ya(
+    ${evidencias}::uuid[], ${workspaceId}) as titulo`;
+  return {
+    huella: huellaDelMaterial(materialDeRevision(material).texto),
+    material,
+    caducada: (caducada?.titulo as string | undefined) ?? null,
+  };
 }
 
 export async function huellaDelMaterialDelPostMortem(
@@ -3767,12 +3785,20 @@ const REVALIDAR: Record<
      * etapa 2 y su evidencia crece, y eso es trabajo normal que ocurre mientras alguien pide
      * una revisión en la 4.
      */
-    const { huella, material } = await huellaDelMaterialDeRevision(
+    const { huella, material, caducada } = await huellaDelMaterialDeRevision(
       tx,
       entrada.workspaceId,
       entrada.anclaId,
     );
     if (!material) throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}: no se llamó al proveedor`);
+    // Y otra vez el derecho que vence HOY, aquí y no solo al preparar: entre las dos hay una
+    // reserva y un commit, y el permiso puede haber ganado una fecha en medio. Con su propio
+    // mensaje, porque la salida es renovar el permiso y no volver a pedirlo tal cual.
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: no se llamó al proveedor, porque una revisión que se lee mañana ya no se podría aceptar. Renueva el permiso —o desenlaza ese documento de su arquetipo— y vuelve a pedirla.`,
+      );
+    }
     if (huella !== (huellaMaterial ?? '')) {
       throw new ErrorAI(`${MOTIVO_MATERIAL_REVISION_MOVIDO}: no se llamó al proveedor. Vuelve a pedirlo.`);
     }
@@ -4165,12 +4191,17 @@ const PREPARAR: Record<
     // El MISMO lector que la revalidación, por lo mismo que en C7: el material que se manda y
     // el que se vuelve a mirar antes de despachar salen de la misma lectura, o la huella
     // compara dos textos que nadie compuso igual.
-    const { material } = await huellaDelMaterialDeRevision(
+    const { material, caducada } = await huellaDelMaterialDeRevision(
       tx,
       entrada.workspaceId,
       entrada.anclaId,
     );
     if (!material) throw new ErrorAI(MOTIVO_CONCEPTO_DECIDIDO);
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: no se llamó al proveedor, porque una revisión que se lee mañana ya no se podría aceptar. Renueva el permiso —o desenlaza ese documento de su arquetipo— y vuelve a pedirla.`,
+      );
+    }
     /*
      * Y sin LENTES no hay revisión que pedir. El ancla ya filtra los conceptos cuyo reto tiene
      * arquetipos con evidencia citable, pero entre listar y pedir cabe una revocación de
@@ -4653,12 +4684,17 @@ const COMPROBAR: Record<
     }
   },
   C4: async (tx, entrada, contenidos, huellaMaterial) => {
-    const { huella, material } = await huellaDelMaterialDeRevision(
+    const { huella, material, caducada } = await huellaDelMaterialDeRevision(
       tx,
       entrada.workspaceId,
       entrada.anclaId,
     );
     if (!material) throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}: la propuesta no se guarda`);
+    if (caducada !== null) {
+      throw new ErrorAI(
+        `El derecho de cita de «${caducada}» vence hoy: la propuesta no se guarda, porque sus citas ya no se podrían aceptar al revisarla. Renueva el permiso —o desenlaza ese documento de su arquetipo— y vuelve a pedirla.`,
+      );
+    }
     if (huella !== (huellaMaterial ?? '')) {
       throw new ErrorAI(`${MOTIVO_MATERIAL_REVISION_MOVIDO}: la propuesta no se guarda. Vuelve a pedirla.`);
     }

@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
-import { formatearCosteUsd } from '@/lib/ai/ai.degradacion';
+import { formatearCosteUsd, formatearTasa } from '@/lib/ai/ai.degradacion';
 import { observabilidadDelWorkspace } from '@/lib/ai/ai.functions';
 import { ROLES_OBSERVABILIDAD_AI, type ObservabilidadDeCapacidad } from '@/lib/ai/ai.schemas';
 
@@ -72,7 +72,10 @@ function Tasa({ valor }: { valor: number | null }) {
   if (valor === null) {
     return <span style={{ color: 'var(--text-faint)' }}>sin datos</span>;
   }
-  return <>{(valor * 100).toFixed(0)}%</>;
+  // `formatearTasa` y no un `toFixed` aquí: es la misma regla que el coste —un valor distinto
+  // de cero jamás se presenta como cero— y tenerla en un solo sitio es lo que impide que las
+  // dos pantallas de esta capa redondeen distinto.
+  return <>{formatearTasa(valor)} %</>;
 }
 
 function Ms({ valor }: { valor: number | null }) {
@@ -178,10 +181,23 @@ function PantallaObservabilidad() {
         {!puedeVer || !datos ? (
           <Card style={{ padding: 20 }}>
             <span style={{ font: '400 13px/1.6 var(--font-sans)', color: 'var(--text-muted)' }}>
+              {/*
+                * Los tres mensajes, y el de en medio CAMBIÓ al ganar el servicio su puerta de
+                * rol. Un workspace sin una sola llamada NO devuelve `null`: devuelve el informe
+                * poblado con todas las capacidades en cero, porque el recorrido sale del
+                * registro. Así que llegar aquí con el rol en regla sólo puede significar que el
+                * servicio rechazó la lectura —cuenta desactivada, membresía revocada o rol
+                * retirado después de que el contexto de la ruta se resolviera—, y el contexto
+                * con el que se calculó `puedeVer` ya no dice la verdad.
+                *
+                * Decía «todavía no hay nada que leer», que era el mensaje correcto ANTES de que
+                * el `catch` de la server function existiera y se volvió falso con él: mi propio
+                * arreglo abrió esta puerta al cerrar la otra.
+                */}
               {sinWorkspace
                 ? 'Elige un workspace para ver la operación de su capa AI.'
                 : puedeVer
-                  ? 'Todavía no hay nada que leer de la capa AI en este workspace.'
+                  ? 'Tu acceso a este workspace cambió mientras mirabas: vuelve a entrar. (Un workspace sin gasto no llega aquí; se pinta con todo en cero.)'
                   : 'La operación de la capa AI la consultan quienes llevan el workspace. Tu rol no incluye esta lectura.'}
             </span>
           </Card>

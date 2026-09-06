@@ -6,6 +6,7 @@ import { Card } from '@/components/ui/Card';
 import { Tag } from '@/components/ui/Tag';
 import { Wordmark } from '@/components/ui/Wordmark';
 import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
+import { formatearTasa } from '@/lib/ai/ai.degradacion';
 import {
   correrEvalDeGroundingDelWorkspace,
   informeDeGroundingDelWorkspace,
@@ -109,11 +110,19 @@ const PRESENTACION: Record<
   },
 };
 
+/**
+ * Deletreado, no «%»: el símbolo pegado a una cifra en una tabla de siete columnas se lee como
+ * parte del número de al lado.
+ *
+ * Y la CIFRA la escribe `formatearTasa`, que es la misma regla que el coste: un valor distinto
+ * de cero jamás se presenta como cero. Con `toFixed(1)`, una afirmación sin sostén de cada diez
+ * mil salía «0.0 por ciento» y un 99,96 % salía «100.0», que promete una perfección que no hay.
+ * Medido antes de tocarlo. El mismo hallazgo llegó por el cuadro de operación, y la regla vive
+ * en un solo sitio precisamente para que las dos pantallas de esta capa no redondeen distinto.
+ */
 function porcentaje(t: number | null): string {
   if (t === null) return 'sin datos';
-  // Deletreado, no «%»: el símbolo pegado a una cifra en una tabla de cuatro columnas se lee
-  // como parte del número de al lado.
-  return `${(t * 100).toFixed(1)} por ciento`;
+  return `${formatearTasa(t)} por ciento`;
 }
 
 function PantallaEvalsGrounding() {
@@ -414,6 +423,12 @@ function TablaDeMetrica({
   );
 }
 
+/** Con cuántos decimales se escribe una diferencia en PUNTOS, y el escalón que eso implica.
+ * Los dos salen del mismo sitio para que el umbral que decide el color y el número que se
+ * imprime no puedan discrepar. */
+const DECIMALES_DELTA = 2;
+const RESOLUCION_DELTA = 10 ** -DECIMALES_DELTA / 100;
+
 /** El delta de una tasa contra una referencia, o null si alguna de las dos no existe. */
 function delta(m: MedicionDeGrounding, referencia: MedicionDeGrounding | null): number | null {
   if (m.tasa === null || referencia?.tasa == null) return null;
@@ -438,7 +453,11 @@ function CeldaDelta({
   /** Qué decir cuando no hay contra qué comparar, que no es lo mismo que «no cambió». */
   sinReferencia: string;
 }) {
-  const relevante = d !== null && Math.abs(d) >= 0.0005;
+  // El umbral de relevancia va PEGADO a la resolución que se imprime, y por eso se deriva de
+  // ella: con un umbral más grueso que el formato, un delta se pintaba neutro enseñando una
+  // cifra distinta de cero; con uno más fino, se teñía de rojo un cambio que la propia celda
+  // muestra como «0.00 puntos». Los dos son alarmas que nadie puede rastrear.
+  const relevante = d !== null && Math.abs(d) >= RESOLUCION_DELTA / 2;
   const mejora = relevante && d !== null && d > 0 === subirEsBueno;
   const color = !relevante ? 'var(--text-muted)' : mejora ? 'var(--ok)' : 'var(--danger)';
   return (
@@ -447,7 +466,7 @@ function CeldaDelta({
         ? sinUniverso
           ? ''
           : sinReferencia
-        : `${d > 0 ? '+' : ''}${(d * 100).toFixed(1)} puntos`}
+        : `${d > 0 ? '+' : ''}${(d * 100).toFixed(DECIMALES_DELTA)} puntos`}
     </td>
   );
 }

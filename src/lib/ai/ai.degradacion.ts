@@ -158,6 +158,38 @@ export function formatearCosteUsd(usd: number): string {
   return `$${decimales >= 2 ? recortado : Number(recortado).toFixed(2)}`;
 }
 
+/** Cuántos decimales tiene de verdad una TASA al presentarla. Dos, que es donde una llamada
+ * fallida de cada diez mil deja de ser representable — y ahí se dice, no se redondea. */
+const DECIMALES_TASA = 2;
+
+/**
+ * Una tasa escrita con la precisión que tiene, SIN unidad.
+ *
+ * Es la misma regla que `formatearCosteUsd` y por la misma razón, aplicada al otro número que
+ * esta capa presenta: **un valor distinto de cero jamás se presenta como cero**. Con
+ * `toFixed(0)`, una llamada fallida de cada mil salía como «0 %» —el cuadro de operación
+ * escondiendo un fallo real— y una aceptación del 99,6 % como «100 %», que promete una
+ * perfección que no hay. Las dos mentiras van en la dirección que tranquiliza, que es la peor.
+ *
+ * Devuelve sólo la cifra porque la UNIDAD es de quien pinta: una tabla estrecha deletrea «por
+ * ciento» para que el símbolo no se lea pegado al número de al lado, y un resumen en prosa usa
+ * «%». Lo que no puede variar entre pantallas es la regla, y por eso vive aquí sola.
+ *
+ * Sin ceros de relleno: `0.5` sale «50», no «50.00».
+ */
+export function formatearTasa(tasa: number): string {
+  if (tasa === 0) return '0';
+  const recortado = (tasa * 100)
+    .toFixed(DECIMALES_TASA)
+    .replace(/0+$/, '')
+    .replace(/\.$/, '');
+  // Por debajo de lo representable y por encima del techo: se DICE, en vez de redondear a un
+  // extremo que afirma más de lo que se sabe.
+  if (Number(recortado) === 0) return `< ${10 ** -DECIMALES_TASA}`;
+  if (Number(recortado) === 100 && tasa !== 1) return `> ${(100 - 10 ** -DECIMALES_TASA).toFixed(DECIMALES_TASA)}`;
+  return recortado;
+}
+
 /** El proveedor no puede colgar una pantalla: pasado este techo la llamada se aborta y
  * la capacidad se reporta como no disponible en esta operación. */
 export const TIMEOUT_PROVEEDOR_MS = 25_000;

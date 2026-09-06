@@ -528,18 +528,35 @@ create policy pregunta_de_test_insert on pregunta_de_test
 -- humana de una propuesta AI antes de aceptarla, solo que después: el contenido original de la
 -- propuesta es inmutable por SYS-17 y el objeto aceptado es lo que alguien aprobó, así que
 -- editarlo por debajo dejaría a los dos contando historias distintas.
+--
+-- Y por eso el BORRADO pide lo mismo que la escritura: concepto CANDIDATO. Si borrar siguiera
+-- abierto después del veredicto, «borrar y escribir la buena» se quedaría a medias —el insert
+-- de vuelta lo rechaza la política de arriba— y la corrección sería una pérdida. Las dos
+-- mitades de una operación no pueden tener puertas distintas.
+--
+-- Es además la regla de la casa medida en sus dos precedentes: la entrada de KPI de C6 solo se
+-- borra mientras su registry es `borrador`, y las citas de un insight de C2 no tienen política
+-- de DELETE en absoluto. Lo aceptado se corrige mientras su contenedor sigue abierto; después
+-- es lo que alguien aprobó. Un derecho de cita que se retira más tarde no se arregla mutando el
+-- objeto: `evidencia_usable` gobierna quién puede volver a citarlo, y la disposición del
+-- workspace es lo que se lo lleva.
 create policy revision_simulada_delete on revision_simulada
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and exists (select 1 from concepto c
       where c.id = revision_simulada.concepto_id
         and c.workspace_id = revision_simulada.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
--- Y las hojas por separado, para poder quitar una cita cuyos derechos se retiraron sin tirar la
--- revisión entera. El guard diferido de arriba es el que decide si lo que queda se sostiene:
--- quitar la última cita de un hallazgo afirmativo falla en el commit, y con su motivo.
+-- Y las hojas por separado —con la MISMA puerta del estado—, para poder quitar una cita cuyos
+-- derechos se retiraron sin tirar la revisión entera mientras el concepto sigue siendo
+-- candidato. El guard diferido de arriba es el que decide si lo que queda se sostiene: quitar
+-- la última cita de un hallazgo afirmativo falla en el commit, y con su motivo.
+--
+-- Sin el estado, un borrado de hoja sería la vía para MUTAR una revisión después del veredicto
+-- sin tocar la puerta que lo impide: quitar hallazgos de uno en uno hasta dejar otra cosa.
 create policy hallazgo_simulado_delete on hallazgo_simulado
   for delete using (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -547,6 +564,7 @@ create policy hallazgo_simulado_delete on hallazgo_simulado
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = hallazgo_simulado.revision_id
         and r.workspace_id = hallazgo_simulado.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -558,6 +576,7 @@ create policy hallazgo_simulado_evidencia_delete on hallazgo_simulado_evidencia
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where h.id = hallazgo_simulado_evidencia.hallazgo_id
         and h.workspace_id = hallazgo_simulado_evidencia.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -568,6 +587,7 @@ create policy pregunta_de_test_delete on pregunta_de_test
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = pregunta_de_test.revision_id
         and r.workspace_id = pregunta_de_test.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 

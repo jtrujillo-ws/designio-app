@@ -7646,6 +7646,31 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`update concepto set estado = 'pasa',
         decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
       await expect(hallazgo(1)).rejects.toThrow(/row-level security|violates row-level/i);
+
+      /*
+       * Y BORRAR pide lo mismo que escribir, en las cuatro tablas.
+       *
+       * «Corregir una revisión es borrarla y escribir la buena» — así que si borrar siguiera
+       * abierto después del veredicto, la corrección se quedaría a medias: el borrado pasa, el
+       * insert de vuelta lo rechaza la política, y lo que había se perdió. Las dos mitades de
+       * una operación no pueden tener puertas distintas.
+       *
+       * Y sin el estado en las HOJAS, borrarlas de una en una sería la vía para mutar una
+       * revisión después del veredicto sin tocar la puerta que lo impide.
+       *
+       * Un DELETE que la política no deja pasar no lanza: no encuentra filas. Así que lo que se
+       * mide es que NO BORRÓ NADA y que lo de antes sigue ahí.
+       */
+      await conUsuario(curadorId, (tx) => tx`delete from hallazgo_simulado
+        where revision_id = ${rev!.id as string} and workspace_id = ${wsC}`);
+      await conUsuario(curadorId, (tx) => tx`delete from revision_simulada
+        where id = ${rev!.id as string} and workspace_id = ${wsC}`);
+      const [quedan] = await admin`select
+          (select count(*)::int from revision_simulada where id = ${rev!.id as string}) as revision,
+          (select count(*)::int from hallazgo_simulado
+             where revision_id = ${rev!.id as string}) as hallazgos`;
+      expect(quedan!.revision, 'la revisión se borró con el concepto ya decidido').toBe(1);
+      expect(quedan!.hallazgos, 'un hallazgo se borró con el concepto ya decidido').toBe(1);
     });
   });
 

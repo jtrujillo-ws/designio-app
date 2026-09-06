@@ -2110,7 +2110,15 @@ function columnaDelAncla(f: Record<string, unknown>): AnclaCapacidad['columna'] 
  * Lo que NO se retira: el `evidenciaId` ni nada más de la cita. La IDENTIDAD del documento es
  * visible para todo miembro —SYS-14 exige poder explicar el bloqueo— y borrar la cita entera
  * diría que la propuesta no citó nada, que es falso y es peor.
+ *
+ * Y se sustituye por un TEXTO, no por `null`. Poner nulo era correcto en el dato y falso en la
+ * pantalla: el contrato declara los dos campos `string`, y las fichas los interpolan, así que
+ * el hueco salía impreso como «null» —«"null" · null» en la tarjeta de C4—. Un marcador dice
+ * lo que pasa allá donde caiga, incluidas las pantallas que no enumeré: la lista compartida de
+ * citas lo pinta igual sin que nadie tenga que acordarse de venir aquí.
  */
+export const PASAJE_RETIRADO =
+  '[pasaje retirado: este documento ya no se puede citar al cliente]';
 function sinPasajesVetados<T>(valor: T, vetados: Set<string>): T {
   if (Array.isArray(valor)) return valor.map((x) => sinPasajesVetados(x, vetados)) as T;
   if (valor === null || typeof valor !== 'object') return valor;
@@ -2120,7 +2128,9 @@ function sinPasajesVetados<T>(valor: T, vetados: Set<string>): T {
   return Object.fromEntries(
     Object.entries(o).map(([k, v]) => [
       k,
-      vetada && (k === 'fragmento' || k === 'localizacion') ? null : sinPasajesVetados(v, vetados),
+      vetada && (k === 'fragmento' || k === 'localizacion')
+        ? PASAJE_RETIRADO
+        : sinPasajesVetados(v, vetados),
     ]),
   ) as T;
 }
@@ -2326,12 +2336,28 @@ export async function panelPropuestas(
      * documento a cualquier profundidad— y no por una lista de rutas por capacidad: las de C2
      * viven dentro de cada afirmación y las de C4 dentro de cada hallazgo, y una lista escrita a
      * mano dejaría fuera a la capacidad que llegue mañana sin decirlo.
+     *
+     * SIN CASTEAR el escalar, que es lo que hacía la primera versión y era peor que el hueco
+     * que cerraba: la única forma que la base le exige a `contenido` es ser un objeto JSON, y
+     * los guards de C4 no miran los ids de dentro de cada cita. Un solo `evidenciaId` que no sea
+     * un uuid —una fila escrita por la superficie SQL concedida— tumbaba `panelPropuestas`
+     * ENTERO, para todos los miembros del workspace y sin dejar siquiera rechazar esa fila desde
+     * la pantalla. Medido: «invalid input syntax for type uuid: "no-es-un-uuid"».
+     *
+     * Se resuelve contra `evidencia` comparando el id de la COLUMNA en texto —un cast que no
+     * puede fallar— y lo que no resuelve se veta. Falla CERRADO: un id que no nombra ningún
+     * documento de este workspace no puede autorizar el pasaje que lleva al lado.
      */
     const columnas = tx`p.id, p.capacidad, p.destino, p.estado, p.es_simulacion, p.confianza,
              p.contenido, p.contenido_original, ${proyeccion.columnas},
-             (select coalesce(array_agg(distinct (x #>> '{}')), '{}')
-                from jsonb_path_query(p.contenido, '$.**.evidenciaId') x
-               where not material_evidencia_visible((x #>> '{}')::uuid, p.workspace_id))
+             (select coalesce(array_agg(distinct citado.id), '{}')
+                from (select x #>> '{}' as id
+                        from jsonb_path_query(p.contenido, '$.**.evidenciaId') x) citado
+               where not exists (
+                 select 1 from evidencia e
+                  where e.workspace_id = p.workspace_id
+                    and e.id::text = lower(citado.id)
+                    and material_evidencia_visible(e.id, e.workspace_id)))
                as material_vetado,
              p.modelo, p.prompt_version, p.origen_key, p.alcance_resumen, p.huella_material,
              l.latencia_ms, l.costo_usd, p.creado_en, p.revisada_en,

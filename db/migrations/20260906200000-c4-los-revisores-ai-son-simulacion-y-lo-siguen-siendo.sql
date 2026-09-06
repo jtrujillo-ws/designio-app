@@ -77,7 +77,7 @@ language sql immutable as $fn$
   -- léxico de números en las dos capas, y a medias sería peor que la ausencia declarada.
   select p_texto !~ '\m\d+([.,]\d+)?\s*%'
      and p_texto !~* '\m\d+\s+de\s+cada\s+\d+\M'
-     and p_texto !~* '\m\d+([.,]\d+)?\s*por\s?ciento\M'
+     and p_texto !~* '\m\d+([.,]\d+)?\s*por\s*ciento\M'
      and not exists (
        select 1
        from regexp_matches(p_texto,

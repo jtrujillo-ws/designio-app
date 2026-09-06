@@ -55,6 +55,7 @@ import {
   huellaDelMaterialDeRevision,
   generarPropuestas,
   panelPropuestas,
+  PASAJE_RETIRADO,
   proyeccionDelPanel,
   rechazarPropuesta,
   registrarConsentimiento,
@@ -8212,6 +8213,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // lo mismo, y las dos capas las dejaban abiertas igual.
       '70 por ciento de los desconfiados abandonaría',
       '70 porciento de acuerdo',
+      /*
+       * Y el mismo porcentaje deletreado con el espacio ESTIRADO. `\s?` admitía un solo
+       * carácter, así que «70 por  ciento» pasaba las dos capas —la del contrato y la del
+       * suelo, que comparten la expresión— y eso es lo que hace que dos validaciones no sean
+       * dos: fallan en el mismo sitio. Un tabulador es el mismo caso con otro carácter, y ya
+       * ha entrado por aquí antes: `btrim` no lo recorta, y esa lección costó una ronda.
+       */
+      '70 por  ciento de los desconfiados abandonaría',
+      '70 por\tciento de acuerdo',
+      '70 por \t ciento, con los dos',
       '6/10 abandonan aquí',
       'una proporción de 1/3 en la muestra',
       // Y NO mediciones: identificadores y códigos con un número pegado. Las dos las aceptan.
@@ -8265,13 +8276,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     );
     expect(enElContrato).toEqual(enLaBase);
     /*
-     * Y que la sonda mida algo, en los DOS sentidos y en el orden en que están escritos: diez
+     * Y que la sonda mida algo, en los DOS sentidos y en el orden en que están escritos: TRECE
      * mediciones que las dos capas rechazan y ocho textos legítimos que las dos aceptan. El
      * vector escrito a mano es a propósito: si una de las dos capas se relaja, la igualdad de
-     * arriba sigue pasando —las dos dirían lo mismo— y sólo esto lo nota.
+     * arriba sigue pasando —las dos dirían lo mismo— y sólo esto lo nota. Es exactamente lo que
+     * pasó con el espacio estirado: las dos lo aceptaban, así que la igualdad estaba en verde.
      */
     expect(enLaBase).toEqual([
-      false, false, false, false, false, false, false, false, false, false,
+      false, false, false, false, false, false, false, false, false, false, false, false, false,
       true, true, true, true, true, true, true, true,
     ]);
   });
@@ -10252,14 +10264,95 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         despues.hay,
         'la propuesta desapareció entera: la pantalla declara que quien no cura puede ver qué se propuso',
       ).toBe(true);
+      // Y se sustituye por un TEXTO, no por null: el contrato declara los dos campos `string` y
+      // las fichas los interpolan, así que un nulo salía impreso como «null» en la tarjeta.
       expect(
         despues.cita!.fragmento,
         'el pasaje literal de la propuesta se sigue entregando sin permiso sobre el material que copia',
-      ).toBeNull();
-      expect(despues.cita!.localizacion).toBeNull();
+      ).toBe(PASAJE_RETIRADO);
+      expect(despues.cita!.localizacion).toBe(PASAJE_RETIRADO);
       // Y la IDENTIDAD del documento no se toca: sin ella no se puede explicar el bloqueo, y
       // borrar la cita entera diría que la propuesta no citó nada.
       expect(despues.cita!.evidenciaId).toBe(evA);
+    });
+  });
+
+  /**
+   * Y UNA FILA CON UN ID QUE NO ES UN UUID NO TUMBA EL PANEL DE TODO EL WORKSPACE.
+   *
+   * El recorte de arriba busca los documentos citados por la FORMA del contenido, y su primera
+   * versión casteaba el escalar a `uuid` sin más. La única forma que la base le exige a
+   * `contenido` es ser un objeto JSON —los guards de C4 no miran los ids de dentro de cada
+   * cita—, así que una fila escrita por la superficie SQL concedida con un `evidenciaId` torcido
+   * hacía saltar «invalid input syntax for type uuid» en la consulta del panel. Y eso no
+   * degradaba una fila: tiraba `panelPropuestas` ENTERO, para todos los miembros, sin dejar
+   * siquiera rechazar la fila culpable desde la pantalla.
+   *
+   * Ahora se resuelve contra `evidencia` comparando el id de la COLUMNA en texto —un cast que
+   * no puede fallar— y lo que no resuelve se VETA. Falla cerrado, que es la respuesta correcta:
+   * un id que no nombra ningún documento de este workspace no puede autorizar el pasaje que
+   * lleva al lado.
+   */
+  it('C4: una cita con un id que no es uuid no tumba el panel entero', async () => {
+    await enWorkspaceLimpio('c4-id-torcido', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura de este perfil.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Por fuera del servicio, que es la superficie de la que habla el hallazgo: el contrato
+      // canoniza al parsear, así que un id torcido sólo puede llegar a la fila por aquí.
+      await admin`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{hallazgos,0,citas,0,evidenciaId}',
+                                    to_jsonb('no-es-un-uuid'::text)),
+              contenido_original = jsonb_set(contenido_original,
+                                             '{hallazgos,0,citas,0,evidenciaId}',
+                                             to_jsonb('no-es-un-uuid'::text))
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const rota = panel.pendientes.find((x) => x.id === propuestaId);
+      expect(rota, 'el panel entero se cayó por una sola fila con un id torcido').toBeTruthy();
+      // Y la fila torcida se recorta: un id que no nombra ningún documento no autoriza nada.
+      const c = rota!.contenido as ContenidoRevisionSimulada;
+      expect(c.hallazgos[0]!.citas[0]!.fragmento).toBe(PASAJE_RETIRADO);
+      // Lo que importa de verdad: se puede DECIDIR, que es lo que la avería impedía.
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      expect(
+        (await panelPropuestas(curadorId, wsC)).pendientes.some((x) => x.id === propuestaId),
+      ).toBe(false);
     });
   });
 

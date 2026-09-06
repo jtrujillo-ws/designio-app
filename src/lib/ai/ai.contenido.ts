@@ -662,7 +662,7 @@ export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
  * mismo sitio no son dos validaciones.
  */
 const AGREGADO_SINTETICO =
-  /\b\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b|\b\d+([.,]\d+)?\s*por\s?ciento\b/i;
+  /\b\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b|\b\d+([.,]\d+)?\s*por\s*ciento\b/i;
 /*
  * Y la proporción escrita con BARRA, que es «N de cada M» por otra puerta.
  *

@@ -4,6 +4,7 @@ import {
   ETIQUETA_MATERIAL,
   agruparLateral,
   claveDeGobierno,
+  notaDeGobierno,
 } from '@/lib/loop/lateral';
 
 /**
@@ -19,7 +20,11 @@ describe('agrupación del lateral (4a)', () => {
   ];
 
   it('con ambos contadores, «Te espera» lleva exactamente esos dos, aprobaciones primero', () => {
-    const l = agruparLateral({ rol: 'lead-boutique', pendientesDelRol: 1, bandejaSinCurar: 2 });
+    const l = agruparLateral({
+      rol: 'lead-boutique',
+      pendientesDelRol: 1,
+      importacionPendientes: 2,
+    });
     expect(l.teEspera.map((d) => d.to)).toEqual(['/aprobaciones', '/importacion']);
     expect(l.teEspera[0]?.contador).toEqual({
       n: 1,
@@ -37,7 +42,11 @@ describe('agrupación del lateral (4a)', () => {
   });
 
   it('a cero, el bloque no existe y las filas vuelven a «Material y razonamiento»', () => {
-    const l = agruparLateral({ rol: 'lead-boutique', pendientesDelRol: 0, bandejaSinCurar: 0 });
+    const l = agruparLateral({
+      rol: 'lead-boutique',
+      pendientesDelRol: 0,
+      importacionPendientes: 0,
+    });
     expect(l.teEspera).toEqual([]);
     expect(l.estantes[0]?.etiqueta).toBe(ETIQUETA_MATERIAL);
     expect(l.estantes[0]?.destinos.map((d) => d.to)).toEqual([
@@ -53,14 +62,32 @@ describe('agrupación del lateral (4a)', () => {
   });
 
   it('con solo uno > 0, el bloque se pinta con una fila y la otra vuelve a su estante', () => {
-    const l = agruparLateral({ rol: 'sponsor', pendientesDelRol: 3, bandejaSinCurar: 0 });
+    const l = agruparLateral({ rol: 'sponsor', pendientesDelRol: 3, importacionPendientes: 0 });
     expect(l.teEspera.map((d) => d.to)).toEqual(['/aprobaciones']);
     expect(l.teEspera[0]?.contador?.titulo).toBe('3 pendientes de tu rol');
     expect(l.estantes[0]?.destinos[0]?.to).toBe('/importacion');
   });
 
+  it('la bandeja solo cuenta para quien la cura: a un sponsor no se le promueve', () => {
+    const sponsor = agruparLateral({
+      rol: 'sponsor',
+      pendientesDelRol: 0,
+      importacionPendientes: 2,
+    });
+    expect(sponsor.teEspera).toEqual([]);
+    expect(sponsor.estantes[0]?.destinos.find((d) => d.to === '/importacion')?.contador).toBe(
+      undefined,
+    );
+    const curador = agruparLateral({
+      rol: 'disenador',
+      pendientesDelRol: 0,
+      importacionPendientes: 2,
+    });
+    expect(curador.teEspera.map((d) => d.to)).toEqual(['/importacion']);
+  });
+
   it('«Diseño y entrega» recuerda que la AI propone', () => {
-    const l = agruparLateral({ rol: 'disenador', pendientesDelRol: 0, bandejaSinCurar: 0 });
+    const l = agruparLateral({ rol: 'disenador', pendientesDelRol: 0, importacionPendientes: 0 });
     expect(l.estantes[1]?.etiqueta).toBe(ETIQUETA_DISENO);
     expect(l.estantes[1]?.destinos.map((d) => d.to)).toEqual([
       '/journeys',
@@ -72,7 +99,11 @@ describe('agrupación del lateral (4a)', () => {
   });
 
   it('el gobierno se filtra por rol igual que antes: auditoría solo para quien rinde cuentas', () => {
-    const lead = agruparLateral({ rol: 'lead-boutique', pendientesDelRol: 0, bandejaSinCurar: 0 });
+    const lead = agruparLateral({
+      rol: 'lead-boutique',
+      pendientesDelRol: 0,
+      importacionPendientes: 0,
+    });
     expect(lead.gobierno.map((d) => d.to)).toEqual([
       '/personas',
       '/auditoria',
@@ -81,7 +112,11 @@ describe('agrupación del lateral (4a)', () => {
     ]);
     expect(lead.gobierno.at(-1)?.etiqueta).toBe('Disposición del workspace');
 
-    const sponsor = agruparLateral({ rol: 'sponsor', pendientesDelRol: 0, bandejaSinCurar: 0 });
+    const sponsor = agruparLateral({
+      rol: 'sponsor',
+      pendientesDelRol: 0,
+      importacionPendientes: 0,
+    });
     expect(sponsor.gobierno.map((d) => d.to)).toEqual([
       '/personas',
       '/exportacion',
@@ -99,14 +134,33 @@ describe('agrupación del lateral (4a)', () => {
         [0, 2],
         [1, 2],
       ] as const) {
-        const rutas = todos(agruparLateral({ rol, pendientesDelRol: p, bandejaSinCurar: b })).map(
-          (d) => d.to,
-        );
+        const rutas = todos(
+          agruparLateral({ rol, pendientesDelRol: p, importacionPendientes: b }),
+        ).map((d) => d.to);
         expect(new Set(rutas).size).toBe(rutas.length);
         const esperadas = 14 - (rutas.includes('/auditoria') ? 0 : 1);
         expect(rutas).toHaveLength(esperadas);
       }
     }
+  });
+
+  it('la nota de gobierno nombra solo lo que el rol ve', () => {
+    const lead = agruparLateral({
+      rol: 'lead-boutique',
+      pendientesDelRol: 0,
+      importacionPendientes: 0,
+    });
+    expect(notaDeGobierno(lead.gobierno)).toBe(
+      'Personas, auditoría, exportación y disposición: se abren cuando se buscan, no cada día.',
+    );
+    const sponsor = agruparLateral({
+      rol: 'sponsor',
+      pendientesDelRol: 0,
+      importacionPendientes: 0,
+    });
+    expect(notaDeGobierno(sponsor.gobierno)).toBe(
+      'Personas, exportación y disposición: se abren cuando se buscan, no cada día.',
+    );
   });
 
   it('la preferencia de gobierno se guarda por usuario y workspace, como la expansión', () => {

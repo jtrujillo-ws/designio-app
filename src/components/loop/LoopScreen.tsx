@@ -38,9 +38,9 @@ import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import {
   ETIQUETA_GOBIERNO,
   ETIQUETA_TE_ESPERA,
-  NOTA_GOBIERNO,
   agruparLateral,
   claveDeGobierno,
+  notaDeGobierno,
   type DestinoDelLateral,
 } from '@/lib/loop/lateral';
 
@@ -462,12 +462,10 @@ function Lateral({
   // nombre), y además los derechos, insights y design versions que su rol resuelve. El
   // conteo lo trae el resumen; las filas, la pantalla de aprobaciones con la misma fuente.
   const pendientesDelRol = resumen?.pendientesDelRol.total ?? 0;
-  const esBoutique = (ROLES_CURADORES as readonly string[]).includes(rol);
   const lateral = agruparLateral({
     rol,
     pendientesDelRol,
-    // La bandeja la curan la boutique (RF-03.4): para los demás no es tarea y no cuenta.
-    bandejaSinCurar: esCurador ? (resumen?.importacionPendientes ?? 0) : 0,
+    importacionPendientes: resumen?.importacionPendientes ?? 0,
   });
 
   // «Gobierno del workspace» nace plegado y recuerda si quien mira lo abrió, con la misma
@@ -632,13 +630,14 @@ function Lateral({
               key={destino.to}
               destino={destino}
               // La primera fila es la que decide quien mira (aprobaciones va siempre delante
-              // de la bandeja): lleva fondo y blanco pleno; la segunda, texto al 82%.
+              // de la bandeja): lleva fondo y blanco pleno; la segunda, texto al 82%. El fondo
+              // lo pone la clase, no la línea, para que el hover siga respondiendo.
+              clase={i === 0 ? 'loop-fila-destacada' : undefined}
               estilo={{
                 padding: 8,
                 borderRadius: 8,
                 font: '600 13px var(--font-sans)',
                 color: i === 0 ? '#fff' : claro(0.82),
-                background: i === 0 ? claro(0.07) : undefined,
               }}
             />
           ))}
@@ -721,7 +720,7 @@ function Lateral({
       <div className="loop-estante" style={{ marginTop: 16 }}>
         <button
           type="button"
-          className="loop-fila"
+          className="loop-fila loop-fila-gobierno"
           aria-expanded={gobiernoAbierto}
           aria-controls={idGobierno}
           aria-label={`${ETIQUETA_GOBIERNO} · ${lateral.gobierno.length} destinos`}
@@ -732,7 +731,6 @@ function Lateral({
           style={{
             ...filaLateral,
             padding: 10,
-            background: claro(0.05),
             color: claro(0.7),
             font: '600 12.5px var(--font-sans)',
           }}
@@ -776,7 +774,7 @@ function Lateral({
               padding: '6px 10px 0',
             }}
           >
-            {NOTA_GOBIERNO}
+            {notaDeGobierno(lateral.gobierno)}
           </span>
         )}
       </div>
@@ -816,7 +814,7 @@ function Lateral({
           </span>
           <span style={{ font: '400 11px var(--font-sans)', color: claro(0.55), ...truncado }}>
             {membresia
-              ? `${ETIQUETA_ROL[membresia.rol] ?? membresia.rol} · ${esBoutique ? 'autorizada' : 'propietaria'}`
+              ? `${ETIQUETA_ROL[membresia.rol] ?? membresia.rol} · ${esCurador ? 'autorizada' : 'propietaria'}`
               : 'Sin workspace'}
           </span>
         </div>
@@ -899,15 +897,18 @@ function Contador({
 function DestinoDelWorkspace({
   destino,
   estilo,
+  clase,
 }: {
   destino: DestinoDelLateral;
   /** Lo que la fila cambia respecto a `filaLateral` (las de «Te espera», la sangría de gobierno). */
   estilo?: CSSProperties;
+  /** Clase extra para el fondo (que va en la hoja, no en línea, para no anular el hover). */
+  clase?: string;
 }) {
   const { to, etiqueta, abrev, contador, sufijo } = destino;
   return (
     <Link
-      className="loop-fila"
+      className={clase ? `loop-fila ${clase}` : 'loop-fila'}
       to={to}
       title={etiqueta}
       aria-label={etiqueta}

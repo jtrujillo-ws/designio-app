@@ -1,4 +1,5 @@
 import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
@@ -69,20 +70,46 @@ export const ETIQUETA_TE_ESPERA = 'Te espera';
 export const ETIQUETA_MATERIAL = 'Material y razonamiento';
 export const ETIQUETA_DISENO = 'Diseño y entrega';
 export const ETIQUETA_GOBIERNO = 'Gobierno del workspace';
-export const NOTA_GOBIERNO =
-  'Personas, auditoría, exportación y disposición: se abren cuando se buscan, no cada día.';
+
+/** Cómo nombra la nota al pie a cada destino de gobierno, en minúscula y sin apellidos. */
+const NOMBRE_CORTO_DE_GOBIERNO: Partial<Record<RutaDelWorkspace, string>> = {
+  '/personas': 'personas',
+  '/auditoria': 'auditoría',
+  '/exportacion': 'exportación',
+  '/disposicion': 'disposición',
+};
+
+/**
+ * La nota bajo «Gobierno del workspace» plegado. Se compone de lo que el rol VE, no de una
+ * lista fija: a un sponsor no se le promete una auditoría que el grupo no contiene.
+ */
+export function notaDeGobierno(gobierno: readonly DestinoDelLateral[]): string {
+  const nombres = gobierno.map((d) => NOMBRE_CORTO_DE_GOBIERNO[d.to] ?? d.etiqueta.toLowerCase());
+  const lista =
+    nombres.length <= 1
+      ? (nombres[0] ?? '')
+      : `${nombres.slice(0, -1).join(', ')} y ${nombres[nombres.length - 1]}`;
+  const conMayuscula = lista.charAt(0).toUpperCase() + lista.slice(1);
+  return `${conMayuscula}: se abren cuando se buscan, no cada día.`;
+}
 
 export function agruparLateral({
   rol,
   pendientesDelRol,
-  bandejaSinCurar,
+  importacionPendientes,
 }: {
   rol: string;
   /** Lo que el rol de quien mira puede decidir ahora (`resumen.pendientesDelRol.total`). */
   pendientesDelRol: number;
-  /** Ítems sin curar de la bandeja, ya a 0 para quien no cura (`resumen.importacionPendientes`). */
-  bandejaSinCurar: number;
+  /** Ítems sin curar de la bandeja (`resumen.importacionPendientes`), para cualquier rol. */
+  importacionPendientes: number;
 }): LateralAgrupado {
+  // La bandeja la curan la boutique (RF-03.4): para los demás no es tarea, así que su
+  // contador no existe y la fila no sube a «Te espera». La puerta vive aquí, con el resto
+  // de reglas por rol, y no en quien llama.
+  const bandejaSinCurar = (ROLES_CURADORES as readonly string[]).includes(rol)
+    ? importacionPendientes
+    : 0;
   const aprobaciones: DestinoDelLateral = {
     to: '/aprobaciones',
     etiqueta: 'Aprobaciones',

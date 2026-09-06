@@ -675,6 +675,26 @@ alter table llamada_ai add constraint llamada_ai_concepto_fk
 alter table propuesta_ai add constraint propuesta_ai_concepto_fk
   foreign key (concepto_id, workspace_id) references concepto (id, workspace_id);
 
+-- Y EL ÍNDICE QUE IMPIDE DOS TRABAJOS A LA VEZ SOBRE EL MISMO CONCEPTO.
+--
+-- El suelo de «no se paga dos veces por el mismo objeto» son los índices únicos parciales de
+-- «reserva_ai», uno por ancla. La columna nueva llegó con su clave ajena y su CHECK y SIN el
+-- índice: por la superficie concedida, dos reservas vivas de C4 sobre el mismo concepto
+-- commitean las dos, doblan el presupuesto apartado y dejan pagar dos veces el mismo lote. El
+-- candado del presupuesto que toma «prepararAlcance» lo evita mientras se pase por ahí; esto
+-- es lo que queda cuando no.
+--
+-- Y NO ES SÓLO EL DE C4: el barrido del catálogo dice que «outcome_review_id» —el ancla de C7,
+-- que ya está en «agents»— tampoco lo tiene. Es la CUARTA vez en este fichero que una lista
+-- escrita a mano se queda corta al añadir un ancla, así que van los dos, y debajo va el censo
+-- que exige el índice para toda columna de ancla: lo que faltaba no era el índice, era la
+-- prueba que nota su ausencia. La que había sólo miraba los índices que EXISTEN —que ninguno
+-- excluyera por ancla sin distinguir la capacidad—, y un índice que falta no aparece ahí.
+create unique index reserva_ai_concepto_idx
+  on reserva_ai (workspace_id, capacidad, concepto_id) where concepto_id is not null;
+create unique index reserva_ai_outcome_review_idx
+  on reserva_ai (workspace_id, capacidad, outcome_review_id) where outcome_review_id is not null;
+
 -- El nombre lo elige el CENSO, no el gusto: la suite recorre las restricciones cuyo nombre
 -- termina en el nombre de la columna de ancla para comprobar que toda ancla declarada en
 -- `ai.schemas.ts` tiene su check en la base. `..._ancla_c4` habría pasado desapercibida.

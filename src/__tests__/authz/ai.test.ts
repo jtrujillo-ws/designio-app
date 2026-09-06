@@ -11591,6 +11591,65 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y AL REVÉS: toda columna de ancla TIENE su índice único parcial en `reserva_ai`.
+   *
+   * El censo de arriba mira los índices que EXISTEN y exige que ninguno excluya por ancla sin
+   * distinguir la capacidad. Eso no ve el modo de fallo contrario, que es el que ha pasado:
+   * un ancla nueva llega con su clave ajena y su CHECK y SIN índice, y un índice que falta no
+   * aparece en ningún barrido de índices. Medido en esta rama: faltaba el de `concepto_id`
+   * (C4) y también el de `outcome_review_id` (C7, ya en `agents`), o sea que la ausencia
+   * sobrevivió a una capacidad entera sin que nada la nombrara.
+   *
+   * Lo que ese índice sostiene no es cosmético: es el suelo de «no se paga dos veces por el
+   * mismo objeto» cuando la escritura no pasa por el candado de presupuesto de
+   * `prepararAlcance`.
+   *
+   * Se deriva de `COLUMNAS_DE_ANCLA`, no de una lista escrita aquí, porque la lista escrita a
+   * mano es exactamente lo que ha fallado cuatro veces en este pipeline.
+   */
+  it('toda columna de ancla tiene su índice único parcial en reserva_ai', async () => {
+    const admin = sqlAdmin();
+    const filas = await admin`
+      select ic.relname as indice,
+             array_agg(a.attname order by k.ord) as columnas,
+             coalesce(pg_get_expr(i.indpred, i.indrelid), '') as predicado
+      from pg_index i
+      join pg_class ic on ic.oid = i.indexrelid
+      join pg_class c on c.oid = i.indrelid
+      join lateral unnest(i.indkey) with ordinality as k(attnum, ord) on true
+      join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+      where i.indisunique and c.relname = 'reserva_ai'
+      group by 1, 3`;
+    const columnasDeReserva = await admin`select column_name from information_schema.columns
+      where table_name = 'reserva_ai'`;
+    const presentes = new Set(columnasDeReserva.map((f) => f.column_name as string));
+    // Solo las anclas que esta tabla lleva: el registro declara alguna que aún no está aquí.
+    const anclas = COLUMNAS_DE_ANCLA.filter((c) => presentes.has(c));
+    expect(anclas.length, 'ninguna columna de ancla en reserva_ai: el censo no mide nada').toBeGreaterThan(1);
+
+    const sinIndice = anclas
+      .filter(
+        (ancla) =>
+          !filas.some((f) => {
+            const columnas = f.columnas as string[];
+            return (
+              columnas.includes(ancla) &&
+              columnas.includes('workspace_id') &&
+              columnas.includes('capacidad') &&
+              (f.predicado as string).includes(ancla)
+            );
+          }),
+      )
+      .sort();
+    expect(
+      sinIndice,
+      'estas anclas no tienen índice único parcial en reserva_ai: dos reservas vivas sobre ' +
+        'el mismo objeto commitean las dos, doblan el presupuesto apartado y dejan pagar dos ' +
+        'veces el mismo trabajo',
+    ).toEqual([]);
+  });
+
+  /**
    * Y el VOCABULARIO DE DESTINOS, por lo mismo y en el otro extremo del pipeline.
    *
    * `propuesta_ai.destino` traía `check (destino in ('evidencia','criterio-exito'))` desde la

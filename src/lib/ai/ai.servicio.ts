@@ -23,6 +23,7 @@ import {
   materialDeUnInsight,
   criteriosQueLlegaronConLasOportunidades,
   insightsQueLlegaronAlModelo,
+  elementosQueLlegaronAlModelo,
   promptOportunidades,
   SISTEMA_OPORTUNIDADES,
   type InsightsDelReto,
@@ -1791,6 +1792,23 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
         else 'disponible'
       end`,
     material: (f) => materialDePostMortem(expedienteDeLaFila(f)).texto,
+    /**
+     * El TÍTULO de cada elemento de la conciliación, para que una desviación diga de qué habla.
+     *
+     * Sin esto la ficha pintaba el uuid crudo —`etiquetas[d.elementoId] ?? d.elementoId` caía
+     * siempre en el `??`— y revisar una desviación exigía cruzar ids a mano contra el tablero
+     * de la etapa 7. Y revisar esas desviaciones ES el acto humano que C7 existe para pedir:
+     * un uuid no se revisa, se acepta o se rechaza a ciegas.
+     *
+     * Sale de la MISMA proyección que compone el material, no de una consulta aparte: el
+     * nombre que ve quien revisa y el que vio el modelo tienen que ser el mismo.
+     */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        expedienteDeLaFila(f).conciliacion.flatMap((b) =>
+          b.elementos.map((e) => [e.elementoId, `${b.designVersionCodigo} · ${e.elementoTitulo}`]),
+        ),
+      ),
     /*
      * Y la huella sobre el EXPEDIENTE, que es la tercera productora de este número —las otras
      * dos, la que prepara la llamada y la que revalida, salen las dos de
@@ -4691,6 +4709,11 @@ const COMPROBAR: Record<
      * revisable, y cuál de las frases se apoyaba en el elemento inventado no lo puede decidir
      * esta función.
      */
+    const admiteDesviacion = new Set(
+      expediente.conciliacion.flatMap((b) =>
+        b.elementos.filter((e) => e.estado !== 'constatado').map((e) => e.elementoId),
+      ),
+    );
     /*
      * Y el conjunto se arma con los elementos QUE ADMITEN LECTURA DE DESVIACIÓN, que no son
      * todos. `filas_de_conciliacion` clasifica cada elemento en seis estados, y uno de ellos
@@ -4708,18 +4731,36 @@ const COMPROBAR: Record<
      * y `desplegado`, `en-release` y `aprobado` son grados de implementación SIN CONSTATAR con
      * el reto cerrándose, que es una lectura legítima y de las que más enseñan.
      */
+    /*
+     * Y el conjunto se cruza con lo que LLEGÓ ENTERO al modelo, que son dos filtros distintos
+     * y ninguno cubre al otro:
+     *
+     *  · el ESTADO —todo menos `constatado`— dice qué elementos admiten lectura de desviación:
+     *    `constatado` significa que alguien lo miró y salió como se aprobó, así que señalarlo
+     *    contradice al tablero en el mismo expediente donde el tablero está impreso;
+     *  · y el RECORTE dice cuáles pudo leer. El cuerpo se corta entero a `MAX_MATERIAL`, así
+     *    que con una conciliación grande la cola se queda fuera: un id del sufijo truncado pasa
+     *    el primer filtro y sin embargo la desviación que lo nombra se escribió sin verlo. Es
+     *    la misma puerta que C3 le pone a sus `insightId` y C2 a su evidencia.
+     */
     const enElMaterial = new Set(
-      expediente.conciliacion.flatMap((b) =>
-        b.elementos.filter((e) => e.estado !== 'constatado').map((e) => e.elementoId),
-      ),
+      elementosQueLlegaronAlModelo(expediente).ids.filter((id) => admiteDesviacion.has(id)),
     );
     for (const contenido of contenidos) {
       const fuera = (contenido as ContenidoPostMortem).desviaciones.filter(
         (d) => !enElMaterial.has(d.elementoId),
       );
       if (fuera.length > 0) {
-        throw new ErrorAI(
-          `Ese borrador señala ${fuera.length} desviación(es) sobre elementos que la conciliación de este reto no admite como tales —o no están en el tablero, o el tablero los da por constatados «como aprobado»—: la propuesta no se guarda, porque contradiría al dato determinista en el mismo expediente donde está impreso. Vuelve a pedirla.`,
+        /*
+         * `ErrorContratoAI` y no `ErrorAI`, que es la diferencia que la instrumentación LEE:
+         * esto es una salida del proveedor fuera de contrato —nombró un elemento que el
+         * material no le daba— y `generarPropuestas` tiene una rama para eso que apunta el
+         * intento como fuera-de-contrato. Con el error genérico, la última llamada quedaba
+         * apuntada como `salida-valida` aunque no naciera ninguna propuesta, y la métrica de
+         * calidad del proveedor decía que había respondido bien.
+         */
+        throw new ErrorContratoAI(
+          `Ese borrador señala ${fuera.length} desviación(es) que no se sostienen en el tablero de este reto: o el elemento no está en él, o el tablero lo da por constatado «como aprobado», o el recorte del material lo dejó fuera y el modelo no llegó a verlo. La propuesta no se guarda, porque contradiría al dato determinista en el mismo expediente donde está impreso. Si el reto tiene muchos elementos conciliados, acorta su descripción y vuelve a pedirla.`,
         );
       }
     }

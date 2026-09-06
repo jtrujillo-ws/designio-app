@@ -8744,6 +8744,125 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * La etiqueta de simulación tampoco depende de que el servicio se acuerde de ponerla.
+   *
+   * `es_simulacion` sale del registro y viaja al insert, pero la columna tiene `default false`
+   * y ningún CHECK la exige: por la superficie concedida, una propuesta de C4 escrita sin ella
+   * nace diciendo que NO es simulación. Y no se queda en la fila: el evento
+   * `PropuestaAIGenerada` —que es append-only— la copia, así que el libro afirma en falso
+   * mientras el panel rotula «simulación AI» encima. SYS-20 pide que la etiqueta sea
+   * imborrable, y una que se puede omitir al nacer no lo es.
+   *
+   * Se mide en los dos sentidos: sin la marca no entra, con ella sí.
+   */
+  it('C4 no admite una propuesta que no se declare simulación', async () => {
+    await enWorkspaceLimpio('c4-sin-etiqueta', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const proponer = (marca: boolean | null) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, ${marca === null ? tx`creado_por` : tx`es_simulacion, creado_por`})
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0,
+                    ${marca === null ? tx`${curadorId}` : tx`${marca}, ${curadorId}`})
+            returning id`;
+          return p!.id as string;
+        });
+
+      // Omitida: el `default false` la deja entrar diciendo que no es simulación.
+      await expect(proponer(null)).rejects.toThrow(/simulaci/i);
+      // Y puesta a mano en falso, que es la misma mentira escrita entera.
+      await expect(proponer(false)).rejects.toThrow(/simulaci/i);
+      // Con la marca puesta, entra: lo que se cierra es la mentira, no la capacidad.
+      await expect(proponer(true)).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * Y una revisión escrita a mano deja rastro en el libro.
+   *
+   * RF-01.6 pide registro append-only de lo que pasa en el workspace, y las cinco tablas de
+   * objeto materializado que ya existían lo escriben DESDE LA BASE —`insight`, `entrada_kpi`,
+   * `oportunidad`, `outcome_review` y `criterio_exito` tienen su trigger— justamente porque la
+   * escritura a mano no pasa por el servicio. `revision_simulada` nació sin él: por el camino
+   * manual, que existe porque SYS-21 lo obliga, la sesión entraba sin que nada lo anotara.
+   *
+   * Las HOJAS no lo llevan, y eso es una respuesta y no un olvido: tampoco lo llevan las de
+   * C2 —`afirmacion` y `cita`—, porque el evento es del OBJETO y sus hijos son su contenido.
+   */
+  it('una revisión escrita a mano queda anotada en el libro', async () => {
+    await enWorkspaceLimpio('c4-libro-a-mano', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const revisionId = await conUsuario(curadorId, (tx) =>
+        revisionAMano(tx, wsC, conceptoId, lenteA, curadorId),
+      );
+      const eventos = await admin`select tipo, payload, actor_id, actor_rol
+        from evento_dominio
+        where workspace_id = ${wsC} and payload->>'revisionSimuladaId' = ${revisionId}`;
+      expect(eventos.length, 'la revisión escrita a mano no dejó rastro en el libro').toBe(1);
+      expect(eventos[0]!.tipo).toBe('RevisionSimuladaCreada');
+      expect((eventos[0]!.payload as Record<string, unknown>).conceptoId).toBe(conceptoId);
+      expect((eventos[0]!.payload as Record<string, unknown>).arquetipoId).toBe(lenteA);
+      expect(eventos[0]!.actor_id).toBe(curadorId);
+      expect(eventos[0]!.actor_rol).toBe('lead-boutique');
+    });
+  });
+
+  /**
+   * Y el evento de la aceptación dice QUÉ objeto se creó, en todos los destinos.
+   *
+   * El payload enumeraba las columnas de destino a mano y se quedó en `oportunidadId`: ni el
+   * post mortem de C7 ni la revisión de C4 aparecían. Importa porque el puntero vivo se puede
+   * soltar —borrar una revisión aceptada suelta `propuesta_ai.revision_simulada_id`, que es la
+   * salida documentada para corregirla— y entonces lo único que queda diciendo qué se creó es
+   * el evento, que es append-only.
+   *
+   * El censo se hace contra el REGISTRO y no contra una lista escrita aquí: es exactamente la
+   * enumeración a mano lo que falló, y ya van dos capacidades.
+   */
+  it('el evento de la aceptación nombra la columna de destino de toda capacidad', async () => {
+    const admin = sqlAdmin();
+    const [f] = await admin`select prosrc from pg_proc
+      where proname = 'propuesta_ai_revision_guard'`;
+    const fuente = f!.prosrc as string;
+    const enCamello = (col: string) =>
+      col.replace(/_id$/, '').replace(/_(.)/g, (_m, c: string) => c.toUpperCase()) + 'Id';
+    const faltan = [...new Set(Object.values(COLUMNA_DE_DESTINO))].filter(
+      (col) => !fuente.includes(`'${enCamello(col)}', new.${col}`),
+    );
+    expect(
+      faltan,
+      'el evento de aceptación no nombra estas columnas de destino: si el puntero vivo se suelta, nada dice ya qué objeto creó esa propuesta',
+    ).toEqual([]);
+  });
+
+  /**
    * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
    *
    * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el

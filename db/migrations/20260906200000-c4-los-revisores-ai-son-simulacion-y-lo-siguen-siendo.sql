@@ -713,6 +713,20 @@ alter table propuesta_ai add constraint propuesta_ai_destino_c4
 alter table propuesta_ai add constraint propuesta_ai_alcance_evidencia_c4
   check (capacidad <> 'C4' or alcance_evidencia is not null);
 
+-- Y LA ETIQUETA, que tampoco puede depender de que el servicio se acuerde de ponerla.
+--
+-- `es_simulacion` sale del registro y viaja al insert, pero la columna tiene `default false` y
+-- nada la exigía: por la superficie concedida, una propuesta de C4 escrita sin ella nace
+-- diciendo que NO es simulación. Y no se queda en la fila — el evento `PropuestaAIGenerada` la
+-- copia, así que el libro append-only afirma en falso mientras el panel rotula «simulación AI»
+-- encima. SYS-20 pide que la etiqueta sea imborrable, y una que se puede omitir al nacer no lo
+-- es: se borra antes de existir.
+--
+-- Solo en un sentido. «C4 es simulación» es verdad hoy y lo seguirá siendo; «solo C4 lo es» no
+-- lo es: la próxima capacidad que simule entraría en conflicto con un CHECK que no la conoce.
+alter table propuesta_ai add constraint propuesta_ai_simulacion_c4
+  check (capacidad <> 'C4' or es_simulacion);
+
 -- Y LA MISMA EXIGENCIA ESCRITA COMO LA LEE EL GUARD, que no es la misma frase.
 --
 -- El de arriba mira `capacidad` y salta lo más pronto posible —al escribir la propuesta—, que
@@ -902,6 +916,47 @@ create constraint trigger revision_simulada_completa
   after delete on pregunta_de_test
   deferrable initially deferred
   for each row execute function revision_simulada_completa_guard();
+
+-- ── EL LIBRO, PARA LA QUE SE ESCRIBE A MANO ──
+--
+-- RF-01.6 pide registro append-only de lo que pasa en el workspace, y las tablas de objeto
+-- materializado que ya existían lo escriben DESDE LA BASE —`entrada_kpi`, `oportunidad` y
+-- `criterio_exito` llevan su `after insert or delete or update`— precisamente porque el camino
+-- manual no pasa por el servicio. `revision_simulada` nació sin él: por la superficie
+-- concedida, que existe porque SYS-21 obliga a que todo flujo siga disponible sin AI, una
+-- sesión entera entraba sin que nada lo anotara. Y borrarla —que es la salida documentada para
+-- corregirla— se llevaba por delante la única atribución que quedaba, la de la propia fila.
+--
+-- LAS HOJAS NO LO LLEVAN, y es una respuesta y no un olvido: tampoco lo llevan las de C2
+-- —`afirmacion` y `cita`— porque el evento es del OBJETO y sus hijos son su contenido. Lo que
+-- el libro tiene que poder contestar es «quién metió esta sesión y cuándo», no cada línea.
+--
+-- El sello viaja dentro: distingue la que nació de una propuesta de la escrita a mano, que es
+-- justo la pregunta que este evento existe para contestar.
+create function revision_simulada_libro_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+declare
+  v_fila record;
+begin
+  v_fila := coalesce(new, old);
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+  values (v_fila.workspace_id,
+    case when tg_op = 'INSERT' then 'RevisionSimuladaCreada' else 'RevisionSimuladaBorrada' end,
+    jsonb_strip_nulls(jsonb_build_object(
+      'revisionSimuladaId', v_fila.id,
+      'conceptoId', v_fila.concepto_id,
+      'arquetipoId', v_fila.arquetipo_id,
+      'propuestaAiId', v_fila.propuesta_ai_id)),
+    app_user_id(), workspace_role(app_user_id(), v_fila.workspace_id));
+  return null;
+end;
+$fn$;
+
+revoke execute on function revision_simulada_libro_guard() from public;
+
+create trigger revision_simulada_libro
+  after insert or delete on revision_simulada
+  for each row execute function revision_simulada_libro_guard();
 
 -- ── Y el linaje inverso, atado como el de sus seis hermanas ──
 --
@@ -2068,5 +2123,350 @@ begin
   end if;
 
   return null;
+end $function$
+;
+
+-- ── Y EL EVENTO DE LA ACEPTACIÓN, QUE NO NOMBRABA NI A C7 NI A C4 ──
+--
+-- ⚠ Se reescribe entera y por eso se VUELCA DE LA VIVA, no se copia de una migración anterior:
+-- es el mismo peligro que los `drop constraint` + `add constraint` de arriba, y este fichero ya
+-- lo pagó una vez con las tres listas que nacieron sin `outcome_review_id`.
+CREATE OR REPLACE FUNCTION public.propuesta_ai_revision_guard()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_reto uuid;
+begin
+  -- Pre-chequeo anti-oráculo: para quien no es miembro del workspace declarado no hay
+  -- nada que auditar ni que serializar — la política rechaza la escritura como siempre.
+  -- (El seed y los backfills corren como owner sin contexto y también lo saltan.)
+  if not is_workspace_member(app_user_id(), new.workspace_id) then
+    return new;
+  end if;
+
+  if tg_op = 'INSERT' then
+    -- RF-09.5: el material de personas no se procesa sin consentimiento registrado
+    -- ANTES. El servicio lo comprueba antes de construir el prompt —ahí es donde se
+    -- evita de verdad la fuga al proveedor— y esto es el suelo: una propuesta derivada
+    -- de material sin consentimiento no puede EXISTIR, venga de donde venga la
+    -- escritura. Y exige que el consentimiento cubra el procesamiento externo: haber
+    -- autorizado la grabación no es haber autorizado mandarla a un tercero.
+    -- Se mira el registro VIGENTE, no «si existe alguno»: un permiso solo para uso interno
+    -- no desbloquea, uno externo posterior sí, y una revocación futura vuelve a bloquear.
+    if new.item_id is not null and exists (
+      select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+        and not consentimiento_externo_vigente(i.id, i.workspace_id)
+    ) then
+      raise exception 'ese material exige consentimiento registrado para procesamiento externo antes de generar propuestas AI (RF-09.5)';
+    end if;
+
+    -- Y no puede haber extracción de un item sin material que extraer: una evidencia
+    -- fechada y citada derivada solo de la ficha (título y referencia) sería inventada por
+    -- construcción, no por casualidad. El servicio lo corta antes de gastar la llamada;
+    -- esto es el suelo para cualquier otra escritura.
+    if new.item_id is not null and exists (
+      select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and not item_tiene_material_extraible(i.contenido)
+    ) then
+      raise exception 'ese item no tiene material que citar (solo referencia): no se pueden generar propuestas de extracción sobre él';
+    end if;
+
+    -- El ANCLA tiene que seguir admitiendo la propuesta en el momento de escribirla. Todo
+    -- lo que el servicio comprobó antes de llamar al proveedor lleva ya una transacción
+    -- commiteada de retraso: entre medias otro curador pudo curar el item a mano o aprobar
+    -- el G0 del reto. Sin esto nacía una propuesta obsoleta — pendiente en el panel y
+    -- rechazada por la materialización— que solo se podía tirar.
+    if new.item_id is not null and not exists (
+      select 1 from item_importacion i
+      where i.id = new.item_id and i.workspace_id = new.workspace_id
+        and i.estado = 'pendiente'
+    ) then
+      raise exception 'ese item de la bandeja ya fue decidido: no admite propuestas nuevas';
+    end if;
+    -- Un reto ARCHIVADO no admite propuestas de NINGUNA clase: ahí el trabajo se cerró.
+    -- Va por delante y por separado de la puerta de los criterios porque es lo único de
+    -- aquella condición que hablaba del RETO y no de los criterios; sin sacarlo aquí, C2 se
+    -- quedaba sin este suelo al salir de ella.
+    --
+    -- Y BAJO CANDADO, que es la quinta vez que hace falta la misma frase en este PR. Un
+    -- archivado EN VUELO no lo ve este snapshot: el `exists` a secas lee la versión activa
+    -- anterior sin esperar, la clave ajena de la propuesta no choca con un UPDATE de
+    -- `estado` —que no es columna de clave—, y la propuesta commitea después del archivo.
+    -- Nace ya «reto-archivado»: visible en el panel, imposible de aceptar, con la llamada
+    -- pagada. `for share` sobre la fila del reto es lo que la ordena detrás o delante, y va
+    -- ANTES de cualquier candado sobre `derecho_uso` — el orden del protocolo, el mismo que
+    -- toman el guard diferido, la revalidación previa al despacho y `bloquearReto`.
+    -- ── EL RETO DE ESTA PROPUESTA, QUE EN C6 VIVE DETRÁS DEL REGISTRY ──
+    -- `propuesta_ai_un_ancla` deja `reto_id` NULO cuando el ancla es el registry, así que
+    -- preguntando por la columna se saltaba el candado entero: ni la clave de aviso del reto, ni
+    -- el `for share` sobre su fila. Y el estado del reto SÍ decide aquí —
+    -- `registry_admite_entradas` lo mira por dentro (`rt.estado <> 'archivado'`)—, de modo que sin
+    -- candado esa lectura es una FOTO. Medido: con un archivado en vuelo, la propuesta de C6 NACE
+    -- —no espera a nadie— y queda en el panel imposible de aceptar, con la llamada ya pagada. Es
+    -- exactamente lo que las sondas de C0 y C2 impiden para el ancla que sí es un reto.
+    --
+    -- Se resuelve por la tabla y no copiando `reto_id` en la propuesta: `metric_registry.reto_id`
+    -- es la relación de verdad, y duplicarla sería un segundo sitio donde puede decir otra cosa.
+    v_reto := new.reto_id;
+    if v_reto is null and new.registry_id is not null then
+      select mr.reto_id into v_reto from metric_registry mr
+       where mr.id = new.registry_id and mr.workspace_id = new.workspace_id;
+    end if;
+    if v_reto is not null then
+      perform 1 from reto r
+       where r.id = v_reto and r.workspace_id = new.workspace_id
+       for share;
+    end if;
+    if v_reto is not null and exists (
+      select 1 from reto r
+      where r.id = v_reto and r.workspace_id = new.workspace_id
+        and r.estado = 'archivado'
+    ) then
+      raise exception 'ese reto está archivado: no admite propuestas AI nuevas';
+    end if;
+    -- Y la puerta de los criterios, por DESTINO y no por ancla. Escrita como «toda
+    -- propuesta que cuelgue de un reto» era exacta mientras solo C0 colgara de ahí; con C2
+    -- colgando del mismo reto pasaba a decir que un G0 aprobado —que congela los CRITERIOS
+    -- (SYS-22)— prohíbe también proponer INSIGHTS, y que un reto `en-medicion` o `cerrado`
+    -- tampoco los admite. Medido sobre un reto en medición: `reto_admite_criterios` da
+    -- false, así que el INSERT de C2 moría ahí, DESPUÉS de pagar la llamada.
+    --
+    -- Es el mismo conjunto de filas para C0 —`propuesta_ai_destino_c0` ata C0 ⇔
+    -- criterio-exito—, así que su comportamiento no cambia; y quien materialice un criterio
+    -- mañana hereda la puerta por materializarlo, no por dónde cuelga. `destino` es
+    -- anulable desde CT y `null = 'criterio-exito'` da null, que no dispara: correcto, una
+    -- capacidad informativa no crea criterios.
+    -- Y el REGISTRY tiene que SEGUIR admitiendo entradas, por lo mismo que el item tiene que
+    -- seguir pendiente y el reto sin archivar: lo que el servicio comprobó antes de llamar
+    -- lleva ya una transacción commiteada de retraso, y entre medias alguien pudo FIRMAR el
+    -- registry —que es su congelado, el G6 del contrato de medición— o cerrar el reto. Sin
+    -- esto nacía una propuesta obsoleta: pendiente en el panel, rechazada por la
+    -- materialización, y con la llamada ya pagada.
+    --
+    -- Y BAJO CANDADO, con el mismo argumento que el reto y en el mismo orden —el `for share`
+    -- del reto va antes, y el del registry detrás—: una firma EN VUELO no la ve este snapshot.
+    -- `for share` sobre la fila del registry choca con el `FOR NO KEY UPDATE` que toma quien
+    -- firma; entre dos generaciones no hay espera, porque las dos piden compartido.
+    if new.registry_id is not null then
+      perform 1 from metric_registry r
+       where r.id = new.registry_id and r.workspace_id = new.workspace_id
+       for share;
+      if not registry_admite_entradas(new.registry_id, new.workspace_id) then
+        raise exception 'ese Metric Registry ya no admite entradas: o está firmado —y firmarlo congela el contrato—, o el trabajo de su reto se cerró';
+      end if;
+    end if;
+    if new.destino = 'criterio-exito' and (
+      reto_criterios_congelados(new.reto_id, new.workspace_id)
+      or not reto_admite_criterios(new.reto_id, new.workspace_id)
+    ) then
+      raise exception 'ese reto ya no admite criterios nuevos: o su G0 los congeló, o su registry de medición está firmado, o el reto avanzó más allá de candidato/activo';
+    end if;
+    -- Y la VENTANA DEL PORTAFOLIO, por DESTINO y por la misma razón que la de los criterios:
+    -- de este reto cuelgan ya tres capacidades, y la puerta es de lo que se materializa, no
+    -- de dónde cuelga. Escrita como «toda propuesta anclada en un reto» diría que un G3
+    -- firmado prohíbe también proponer criterios e insights, que es falso.
+    --
+    -- `reto_admite_portafolio` es la ventana que ya miran las cuatro políticas de
+    -- `oportunidad`: C3 no escribe una segunda redacción de la misma pregunta, porque dos
+    -- redacciones se separan y entonces la pantalla ofrece lo que la base rechaza.
+    --
+    -- Y hace falta AQUÍ y no solo en el servicio: entre que la generación la comprobó y este
+    -- INSERT commitea hay una transacción de por medio, y lo que ocurre en ese hueco es justo
+    -- lo que la cierra —firmar G3, abrir la medición, cerrar el reto—. Sin esto nacía una
+    -- propuesta obsoleta: pendiente en el panel, imposible de aceptar, con la llamada pagada.
+    -- La lectura va bajo el `for share` del reto que se tomó arriba, así que una firma en
+    -- vuelo la ordena en vez de dejarla leer una foto.
+    if new.destino = 'oportunidad'
+       and not reto_admite_portafolio(new.reto_id, new.workspace_id) then
+      raise exception 'el portafolio de ese reto está cerrado: su G3 quedó firmado sobre lo que había y la etapa 3 no está reabierta, o el reto ya no admite trabajo de método';
+    end if;
+
+    -- Y que el ALCANCE que trae sea el del reto AHORA, bajo el `for share` de arriba.
+    --
+    -- El servicio ya lo comprueba tras la llamada, pero esa lectura y este INSERT son dos
+    -- momentos: `validarInsight` toma «designio:insight:<id>» y no la clave del reto, así que
+    -- una validación puede cometearse justo en medio. Lo que se guardaba entonces era una
+    -- propuesta con la llamada PAGADA y un alcance al que ya le falta un insight: nace
+    -- `alcance-incompleto` y no se puede aceptar nunca. Aquí sí se ve, porque este guard tiene
+    -- el candado del reto tomado, y la salida correcta es no guardarla y decir que se repita.
+    --
+    -- Es la misma regla que el guard diferido vuelve a hacer en el commit, en su instante: lo
+    -- que caduca solo hay que preguntarlo cada vez que se escribe algo que dependa de ello.
+    -- Aquí va en una sola comprobación —falta o sobra— porque el destinatario es quien pidió
+    -- el lote y el remedio es el mismo: repetirlo. En el commit van separadas, porque ahí lo
+    -- lee quien revisa y el motivo que se enseña tiene que ser el que ocurrió.
+    if new.destino = 'oportunidad' and new.alcance_insights is not null
+       and (exists (
+             select 1 from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id)
+             where not (v.id = any (new.alcance_insights)))
+            or exists (
+             select 1 from unnest(new.alcance_insights) as a(id)
+             where a.id not in (
+               select v.id from insights_validados_del_reto(new.reto_id, new.workspace_id) as v(id)))) then
+      raise exception 'los insights validados de ese reto cambiaron mientras se preparaba esta propuesta: el alcance que trae no es el que el reto tiene ahora, así que estas preguntas se escribieron sobre otro material y no se guardan. Vuelve a pedirlas';
+    end if;
+
+    -- La llamada referenciada tiene que ser LA QUE PRODUJO esta propuesta, no una
+    -- cualquiera del workspace. La FK sola comprobaba existencia y tenant, así que por SQL
+    -- crudo se podía colgar una extracción de una llamada C0, de otra ancla, de otro modelo
+    -- o —lo peor para el libro— de un intento que terminó en negativa o sin respuesta: el
+    -- panel atribuiría entonces un coste y una latencia que no son los suyos, y el gasto
+    -- por capacidad dejaría de cuadrar. Se exige la coincidencia completa.
+    --
+    -- Y dicho para que nadie lo lea de más: esto empareja METADATOS, no contenido. Que el
+    -- `contenido` sea lo que un modelo devolvió NO es comprobable desde aquí, y no por
+    -- falta de ganas: la base no es parte de la llamada HTTP, así que no tiene ningún hecho
+    -- propio sobre la respuesta. Guardar un digest de la respuesta en `llamada_ai` no lo
+    -- arreglaría — lo escribiría el MISMO rol, en el MISMO acto, con el MISMO grant que
+    -- escribe el contenido, así que un escritor que fabrica el contenido fabrica también su
+    -- huella y las dos afirmaciones se sostienen entre sí sin que ninguna se apoye en nada.
+    -- La diferencia con el linaje de materialización es exacta y vale la pena tenerla clara:
+    -- allí el hecho que ata (`evidencia.propuesta_ai_id`) lo produce el GUARD, que es parte
+    -- de confianza y está fuera de todo grant; aquí el hecho tendría que producirlo el
+    -- proveedor, que no escribe en esta base. Un digest añadiría ceremonia, no garantía.
+    --
+    -- Así que `contenido` pertenece al mismo conjunto declarado que `modelo`,
+    -- `prompt_version`, `tokens_*`, `costo_usd` y `latencia_ms`: lineage y medidas que solo
+    -- existen porque la aplicación las anota. Lo que SÍ se ata queda atado —la llamada
+    -- (arriba), su unicidad para CI (índice parcial), el consentimiento bajo el que salió
+    -- (FK compuesta con la constante dentro) y el objeto materializado (relación + xmin +
+    -- proyección)—, y lo que no se puede atar se dice, en vez de blindarse en falso.
+    if not exists (
+      select 1 from llamada_ai l
+      where l.id = new.llamada_id and l.workspace_id = new.workspace_id
+        and l.capacidad = new.capacidad
+        and l.item_id is not distinct from new.item_id
+        and l.reto_id is not distinct from new.reto_id
+        and l.modelo = new.modelo
+        and l.origen_key = new.origen_key
+        and l.resultado = 'salida-valida'
+    ) then
+      raise exception 'la propuesta debe colgar de la llamada que la produjo: misma capacidad, misma ancla, mismo modelo, misma credencial y con salida válida';
+    end if;
+
+    -- RF-09.9: de qué workspace salió qué material, a qué modelo y con qué credencial.
+    insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+    values (new.workspace_id, 'PropuestaAIGenerada',
+      jsonb_build_object('propuestaId', new.id, 'capacidad', new.capacidad,
+                         'destino', new.destino, 'modelo', new.modelo,
+                         'promptVersion', new.prompt_version, 'origenKey', new.origen_key,
+                         'esSimulacion', new.es_simulacion),
+      app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+    return new;
+  end if;
+
+  if new.estado = old.estado then
+    return new;
+  end if;
+  -- Ciclo de vida de sentido único: de pendiente a una decisión, y ahí termina.
+  if (old.estado, new.estado) not in (
+    ('propuesta', 'aceptada'),
+    ('propuesta', 'corregida'),
+    ('propuesta', 'rechazada')
+  ) then
+    raise exception 'transición de propuesta AI ilegal: % → %', old.estado, new.estado;
+  end if;
+
+  -- El sello temporal lo pone la BASE, no el caller: una revisión no se retro ni
+  -- post-data por SQL directo.
+  new.revisada_en := now();
+
+  -- SYS-17: la propuesta original se conserva SIEMPRE. No hay grant de UPDATE sobre la
+  -- columna, pero el invariante se defiende también aquí (un grant futuro no lo rompe).
+  if new.contenido_original is distinct from old.contenido_original then
+    raise exception 'la propuesta AI original se conserva siempre (SYS-17)';
+  end if;
+  -- Aceptar es aceptar LO PROPUESTO; editar es corregir, y se llama por su nombre para
+  -- que la tasa de corrección humana no se pueda maquillar.
+  if new.estado <> 'corregida' and new.contenido is distinct from old.contenido then
+    raise exception 'aceptar o rechazar no edita la propuesta: usa la corrección';
+  end if;
+  if new.estado = 'corregida' and new.contenido is not distinct from old.contenido then
+    raise exception 'una corrección debe cambiar el contenido propuesto';
+  end if;
+  -- Las CITAS no se corrigen (SYS-17/RF-08.7). Son el testimonio del modelo sobre lo que
+  -- dijo haber leído y la entrada de la medida de grounding: cambiar una cita inventada por
+  -- otra literal deja una propuesta de aspecto impecable y borra la señal que hay que ver.
+  -- El servicio lo rechaza con su mensaje; esto es el suelo, porque una promesa que solo
+  -- vive en un formulario la rompe cualquier cliente que hable con la server function.
+  -- Sin condicionar al destino: desde que C0 también cita —I4 dice «la AI propone Y CITA»—
+  -- la regla es de las citas y no del tipo de propuesta. Atarla a 'evidencia' habría dejado
+  -- las de C0 editables el mismo día que existieron. Y con ellas viaja la confianza que el
+  -- modelo declaró sobre su propia propuesta: es el dato que ORDENA la revisión humana, así
+  -- que dejar que la reescriba quien revisa sería maquillar la medida con la mano que se
+  -- está midiendo.
+  if new.contenido -> 'citas' is distinct from new.contenido_original -> 'citas'
+     or new.contenido -> 'confianzaPropuesta'
+        is distinct from new.contenido_original -> 'confianzaPropuesta' then
+    raise exception 'las citas y la confianza declarada de una propuesta AI no se corrigen: son el rastro de lo que el modelo dijo y con lo que se ordena la revisión';
+  end if;
+  -- Y el CRITERIO al que una entrada KPI responde, que es testimonio por el mismo motivo que
+  -- las citas y no se veía desde aquí: no está DENTRO de `citas`, es un campo de primer nivel.
+  -- El servicio ya lo blinda —`TESTIMONIO_ADICIONAL.C6`— y eso cierra el formulario; el resto
+  -- del suelo no lo veía: el criterio nuevo es del reto del registry, que es lo único que la
+  -- materialización comprueba, y su proyección compara contra `contenido`, que es el ya
+  -- corregido. Por la superficie SQL concedida, entonces, una «corrección» reapuntaba la
+  -- entrada a otro criterio CONSERVANDO las citas — que es quedarse con el sostén de uno para
+  -- afirmar sobre otro, exactamente lo que la regla de las citas existe para impedir.
+  --
+  -- Sin condicionar al destino, como la de arriba y por lo mismo: para un contenido que no
+  -- lleva `criterioId` los dos lados son nulos y esto no dice nada, así que atarla a C6 solo la
+  -- dejaría corta ante la siguiente capacidad que responda a un criterio.
+  if new.contenido -> 'criterioId'
+     is distinct from new.contenido_original -> 'criterioId' then
+    raise exception 'el criterio al que responde una entrada KPI no se corrige: los fragmentos citados se copiaron de ESE criterio, así que reapuntarla a otro conservando las citas es quedarse con el sostén de uno para afirmar sobre otro (SYS-17)';
+  end if;
+
+  -- RF-09.4/09.5 en la ACEPTACIÓN, que es la otra mitad del permiso. Generar ya exigía
+  -- consentimiento vigente, pero entre generar y revisar la persona puede retirarlo: la
+  -- propuesta ya existe legítimamente (nació cuando el permiso valía) y lo que no puede
+  -- ocurrir es que el workspace gane un objeto de dominio NUEVO derivado de un material
+  -- que ya no está autorizado. Rechazarla sigue permitido —es la salida— y la curaduría a
+  -- mano de la bandeja no se toca: eso no manda nada a ningún tercero (SYS-21).
+  if new.estado in ('aceptada', 'corregida') and new.item_id is not null and exists (
+    select 1 from item_importacion i
+    where i.id = new.item_id and i.workspace_id = new.workspace_id
+      and tipo_fuente_exige_consentimiento(i.tipo_fuente)
+      and not consentimiento_externo_vigente(i.id, i.workspace_id)
+  ) then
+    raise exception 'el consentimiento de ese material ya no autoriza el procesamiento externo: la propuesta no puede materializarse (RF-09.5)';
+  end if;
+
+  insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
+  values (new.workspace_id,
+    case new.estado
+      when 'aceptada' then 'PropuestaAIAceptada'
+      when 'corregida' then 'PropuestaAICorregida'
+      else 'PropuestaAIRechazada'
+    end,
+    -- El objeto materializado, POR SU COLUMNA, y ahora las CINCO. `insight_id` faltaba
+    -- cuando llegó C2 y `jsonb_strip_nulls` se llevaba las otras por nulas, así que el evento
+    -- de aquellas aceptaciones no decía QUÉ objeto se creó: un registro append-only que no
+    -- puede nombrar lo que documenta no documenta nada. La lista se quedó corta otra vez con
+    -- `entrada_kpi_id`, que es la misma enumeración a mano y el mismo modo de fallo — con el
+    -- agravante de que aquí el silencio es exactamente igual de silencioso. Con
+    -- `oportunidadId` van cinco, y la lista sigue siendo a mano: quien añada la sexta tiene
+    -- que acordarse, porque nada la obliga y `jsonb_strip_nulls` no protesta por una nula.
+    jsonb_strip_nulls(jsonb_build_object(
+      'propuestaId', new.id, 'capacidad', new.capacidad, 'destino', new.destino,
+      'modelo', new.modelo, 'evidenciaId', new.evidencia_id, 'criterioId', new.criterio_id,
+      'insightId', new.insight_id, 'entradaKpiId', new.entrada_kpi_id,
+      'oportunidadId', new.oportunidad_id,
+      -- Y LAS DOS QUE FALTABAN. Esta lista enumera columnas de destino a mano, así que se
+      -- quedó en la quinta: ni el post mortem de C7 ni la revisión de C4 aparecían. Importa
+      -- porque el puntero VIVO se puede soltar —borrar una revisión aceptada suelta
+      -- 'propuesta_ai.revision_simulada_id', que es la salida documentada para corregirla— y
+      -- entonces lo único que queda diciendo qué objeto nació de esa propuesta es este
+      -- evento, que es append-only. Hay censo que compara esta lista con COLUMNA_DE_DESTINO.
+      'outcomeReviewId', new.outcome_review_id,
+      'revisionSimuladaId', new.revision_simulada_id)),
+    app_user_id(), workspace_role(app_user_id(), new.workspace_id));
+  return new;
 end $function$
 ;

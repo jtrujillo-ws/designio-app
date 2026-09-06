@@ -958,11 +958,35 @@ const CITAS_POR_CAPACIDAD: Record<
  * Va aquí, donde las citas se LEEN del contenido, y no en los cuatro consumidores: es una
  * propiedad de cómo se lee, no de quién lee. Y se deriva del registro en vez de escribirse por
  * capacidad, que es la lección que este fichero lleva cobrada cuatro veces.
+ *
+ * Y AGUANTA UN CONTENIDO MALFORMADO, que es la otra mitad y la que casi cuesta la pantalla.
+ *
+ * Los lectores de arriba dan por buena la forma de su capacidad: `(c as X).citas`, o un
+ * `flatMap` sobre `hallazgos`. La base sólo exige que `contenido` sea un objeto JSON —los
+ * guards de inserción no miran dentro— así que por la superficie SQL concedida entra una fila
+ * sin la clave, y entonces `.flatMap` sobre `undefined` no degradaba una fila: tiraba
+ * `panelPropuestas` ENTERO, para todos los miembros del workspace, y con él el control de
+ * rechazar la fila culpable. Es la misma avería que la del cast a `uuid` en la consulta del
+ * panel, una capa más arriba, y son las NUEVE capacidades: ninguna comprueba su forma.
+ *
+ * Cero citas es la respuesta correcta y no un apaño, y esta pantalla ya lo dice para la
+ * capacidad que no está en el registro: si el contenido no tiene dónde guardarlas, no hay nada
+ * que medir, y decirlo es más honesto que morirse. Aceptar esa propuesta sigue siendo imposible
+ * —el contrato la rechaza al parsear y el guard del sello falla cerrado desde que compara con
+ * `coalesce(..., -1)`—, así que lo único que esto habilita es lo que hay que poder hacer con
+ * ella: verla y rechazarla.
  */
 export const CITAS_DEL_CONTENIDO = Object.fromEntries(
   Object.entries(CITAS_POR_CAPACIDAD).map(([capacidad, leer]) => [
     capacidad,
-    (contenido: ContenidoPropuesta) => leer(contenido).map(conIdsCanonicos),
+    (contenido: ContenidoPropuesta) => {
+      try {
+        const crudas = leer(contenido);
+        return Array.isArray(crudas) ? crudas.map(conIdsCanonicos) : [];
+      } catch {
+        return [];
+      }
+    },
   ]),
 ) as Record<CapacidadActiva, (contenido: ContenidoPropuesta) => CitaDelContenido[]>;
 

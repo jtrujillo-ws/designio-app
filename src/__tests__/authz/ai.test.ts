@@ -10447,6 +10447,85 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  /**
+   * Y UN CONTENIDO SIN LA CLAVE DE SUS CITAS TAMPOCO, que es la misma avería una capa arriba.
+   *
+   * La ronda anterior la cerró en la CONSULTA —un `::uuid` sobre un escalar del contenido— y
+   * quedaba la de TypeScript: los lectores de citas dan por buena la forma de su capacidad
+   * (`(c as X).citas`, o un `flatMap` sobre `hallazgos`), y la base sólo exige que `contenido`
+   * sea un objeto JSON. Un `.flatMap` sobre `undefined` no degradaba una fila: tiraba
+   * `panelPropuestas` entero, para todos los miembros, y con él el control de rechazar la fila
+   * culpable. La avería se cerraba sobre sí misma, igual que la anterior.
+   *
+   * Y no es de C4: las NUEVE capacidades leen así. Por eso el arreglo está en la costura de la
+   * que salen todas y no en el lector que se reportó.
+   *
+   * Lo que se comprueba aquí es lo que la avería impedía: que la propuesta se pueda VER y
+   * RECHAZAR. Aceptarla sigue siendo imposible, y eso también se mide.
+   */
+  it('C4: un contenido sin la clave de sus citas no tumba el panel, y se puede rechazar', async () => {
+    await enWorkspaceLimpio('c4-sin-hallazgos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura de este perfil.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Por fuera del servicio: el contrato exige la clave al parsear, así que una fila sin ella
+      // sólo puede llegar por la superficie SQL concedida, que es de la que habla el hallazgo.
+      await admin`update propuesta_ai
+          set contenido = contenido - 'hallazgos',
+              contenido_original = contenido_original - 'hallazgos'
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const rota = panel.pendientes.find((x) => x.id === propuestaId);
+      expect(rota, 'el panel entero se cayó por una fila a la que le falta una clave').toBeTruthy();
+      // Cero citas es la respuesta honesta: no hay dónde buscarlas.
+      expect(rota!.citas).toEqual([]);
+      // Aceptarla sigue siendo imposible, que es la otra mitad: esto no abre una puerta.
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId }),
+      ).rejects.toThrow();
+      // Y lo que la avería impedía: rechazarla.
+      await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId });
+      expect(
+        (await panelPropuestas(curadorId, wsC)).pendientes.some((x) => x.id === propuestaId),
+      ).toBe(false);
+    });
+  });
+
   it('C4: una cita con un id que no es uuid no tumba el panel entero', async () => {
     await enWorkspaceLimpio('c4-id-torcido', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();

@@ -208,6 +208,26 @@ export const MAX_OPORTUNIDADES_POR_LOTE = 5;
 export const MAX_REVISIONES_POR_LOTE = 6;
 
 /**
+ * Y lo que cabe DENTRO de una revisión: hallazgos, citas por hallazgo y preguntas de test.
+ *
+ * Están aquí y no sólo dentro del esquema de Zod por el mismo motivo que el tope del lote: los
+ * leen los DOS lados de la misma regla. El contrato acota lo que el modelo puede devolver, y el
+ * FORMULARIO A MANO tiene que poder expresar exactamente eso — ni menos, que es lo que pasaba
+ * cuando escribía una sola de cada, ni más, que sería ofrecer lo que la frontera rechaza.
+ *
+ * Y viven en este módulo y no en `ai.contenido` porque aquél es solo-servidor: la pantalla no
+ * puede leer de ahí sin arrastrar los validadores al navegador. Aquí el número se escribe una
+ * vez y lo leen los dos.
+ *
+ * Seis hallazgos y seis preguntas por el mismo argumento que el lote: es más de lo que alguien
+ * contrasta de una sentada. Cuatro citas y no seis porque un hallazgo de revisión es más
+ * estrecho que una afirmación de insight.
+ */
+export const MAX_HALLAZGOS_POR_REVISION = 6;
+export const MAX_CITAS_POR_HALLAZGO = 4;
+export const MAX_PREGUNTAS_POR_REVISION = 6;
+
+/**
  * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
  * señales abiertas admite un journey para poder pedirlo.
  *

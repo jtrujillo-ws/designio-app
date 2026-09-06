@@ -14,6 +14,9 @@ import { TOPE_NARRATIVA } from '@/lib/medicion/medicion.schemas';
 import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import {
   CONFIANZA_PROPUESTA,
+  MAX_CITAS_POR_HALLAZGO,
+  MAX_HALLAZGOS_POR_REVISION,
+  MAX_PREGUNTAS_POR_REVISION,
   MAX_REMEDIACIONES,
   type CapacidadActiva,
 } from './ai.schemas';
@@ -708,7 +711,7 @@ export const ContenidoRevisionSimuladaSchema = z
            */
           citas: z
             .array(CitaDeAfirmacionSchema)
-            .max(4)
+            .max(MAX_CITAS_POR_HALLAZGO)
             .refine(
               (xs) =>
                 new Set(xs.map((c) => `${c.evidenciaId}\u0000${c.fragmento}\u0000${c.localizacion}`))
@@ -718,7 +721,7 @@ export const ContenidoRevisionSimuladaSchema = z
         }),
       )
       .min(1)
-      .max(6)
+      .max(MAX_HALLAZGOS_POR_REVISION)
       /*
        * LA REGLA DEL INVARIANTE, y va como `superRefine` para que el error señale al hallazgo
        * que falla: con seis en el lote, «alguno no se sostiene» obliga a quien revisa a
@@ -771,17 +774,23 @@ export const ContenidoRevisionSimuladaSchema = z
            * filas; la aceptación lo traduce al id que acaba de nacer, y el guard diferido
            * comprueba la traducción.
            */
-          hallazgoIndice: z.number().int().min(0).max(5).optional(),
+          hallazgoIndice: z
+            .number()
+            .int()
+            .min(0)
+            .max(MAX_HALLAZGOS_POR_REVISION - 1)
+            .optional(),
         }),
       )
       .min(1)
-      .max(6),
+      .max(MAX_PREGUNTAS_POR_REVISION),
     confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
   })
   /*
    * Y el índice de cada pregunta apunta DENTRO del lote. Va en el `superRefine` del objeto y no
    * en el del array porque la respuesta está en la OTRA lista: un array no puede mirarse contra
-   * su hermano, y el techo estático del campo (`max(5)`) solo acota la forma, no la relación.
+   * su hermano, y el techo estático del campo —el tope de hallazgos menos uno— solo acota la
+   * forma, no la relación.
    *
    * Fuera de rango no es un matiz: la aceptación dejaría la pregunta colgando de nada y la traza
    * simulación → test real se rompería en silencio, que es justo la que hace legítima a esta

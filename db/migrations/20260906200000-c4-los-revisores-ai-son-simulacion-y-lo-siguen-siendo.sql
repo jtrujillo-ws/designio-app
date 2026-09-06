@@ -211,9 +211,26 @@ create table hallazgo_simulado_evidencia (
    * viene de la AI las demás siguen enteras en el contenido; para lo escrito a mano, el contrato
    * ya prohíbe repetir la misma cita y lo que queda es el primero de dos fragmentos del mismo
    * documento, que es un empobrecimiento acotado y dicho, no una pérdida silenciosa.
+   *
+   * Y OBLIGATORIAS, que es la mitad que nacieron sin. Anulables, la superficie CONCEDIDA
+   * —`grant insert (… fragmento, localizacion)`— podía volver a escribir el enlace pelado que
+   * estas columnas existen para impedir: los guards de sostén sólo preguntan si el hallazgo
+   * observado tiene ALGÚN enlace, así que la fila entraba, cumplía la regla de las dos clases
+   * de RF-08.2, y el lector volvía a enseñar el título del documento y nada más. El contrato lo
+   * exige (`min(1)` en las dos), pero el contrato gobierna un camino y esto es la tabla.
+   *
+   * Es además lo que ya hace la tabla GEMELA: `cita`, la de las afirmaciones de C2, nació con
+   * `not null` y con su comprobación de no-en-blanco, y el contrato dice que estas citas tienen
+   * «la MISMA forma». Aquí el no-en-blanco va por `titulo_normalizado` y no por `btrim`, que es
+   * la corrección que este repo ya midió: `btrim` no recorta tabuladores ni espacios duros, así
+   * que un pasaje de un solo tabulador pasaba por escrito.
+   *
+   * El TOPE de longitud no se copia: 600 y 200 los escribe el contrato, una vez, y duplicar un
+   * número que nadie enfrenta es la avería que este fichero lleva pagando cuatro veces. Lo que
+   * se cierra aquí es la pérdida silenciosa, que es lo que la base sí puede sostener sola.
    */
-  fragmento text,
-  localizacion text,
+  fragmento text not null check (titulo_normalizado(fragmento) <> ''),
+  localizacion text not null check (titulo_normalizado(localizacion) <> ''),
   primary key (hallazgo_id, evidencia_id),
   foreign key (hallazgo_id, workspace_id)
     references hallazgo_simulado (id, workspace_id) on delete cascade,

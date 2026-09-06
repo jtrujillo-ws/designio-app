@@ -65,6 +65,9 @@ import {
   CAPACIDADES_ACTIVAS,
   COLUMNA_DE_DESTINO,
   COLUMNAS_DE_ANCLA,
+  MAX_CITAS_POR_HALLAZGO,
+  MAX_HALLAZGOS_POR_REVISION,
+  MAX_PREGUNTAS_POR_REVISION,
   MAX_REMEDIACIONES,
   MAX_REVISIONES_POR_LOTE,
   type AnclaCapacidad,
@@ -74,6 +77,7 @@ import {
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
 import {
+  EscribirRevisionAManoSchema,
   borrarRevisionAMano,
   escribirRevisionAMano,
   gobernanzaDeProyecto,
@@ -8400,8 +8404,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             values (${wsC}, ${r!.id as string}, 0, 'Prestada', 'Voz ajena', false)
             returning id`;
           await tx`insert into hallazgo_simulado_evidencia
-            (hallazgo_id, evidencia_id, workspace_id)
-            values (${h!.id as string}, ${evB}, ${wsC})`;
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
         }),
       ).rejects.toThrow(/no es de las que sostienen al arquetipo/);
     });
@@ -8473,8 +8477,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                     'No entrega el documento sin motivo.', false)
             returning id`;
           await tx`insert into hallazgo_simulado_evidencia
-            (hallazgo_id, evidencia_id, workspace_id)
-            values (${h!.id as string}, ${evA}, ${wsC})`;
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evA}, ${wsC}, 'No entrego la cédula', 'resumen')`;
           await tx`insert into pregunta_de_test
             (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
             values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
@@ -8558,8 +8562,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                     'Dice que abandona si tarda.', false)
             returning id`;
           await tx`insert into hallazgo_simulado_evidencia
-            (hallazgo_id, evidencia_id, workspace_id)
-            values (${h!.id as string}, ${evB}, ${wsC})`;
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
           await tx`insert into pregunta_de_test
             (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
             values (${wsC}, ${r!.id as string}, null, 0, '¿Cuánto esperarías?', '')`;
@@ -9476,8 +9480,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                     'Sale de su testimonio.', false)
             returning id`;
           await tx`insert into hallazgo_simulado_evidencia
-            (hallazgo_id, evidencia_id, workspace_id)
-            values (${h!.id as string}, ${evB}, ${wsC})`;
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
           await tx`insert into pregunta_de_test
             (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
             values (${wsC}, ${r!.id as string}, null, 0, '¿Y si no?', '')`;
@@ -10030,8 +10034,25 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(revisiones.length, 'la revisión escrita a mano no llega a quien decide').toBe(1);
       expect(revisiones[0]!.preguntas.length).toBe(2);
 
-      // El CONTRATO es el mismo: un hallazgo afirmativo sin cita no entra, lo escriba quien lo
-      // escriba. Es lo que separa «hay ruta manual» de «hay una puerta trasera».
+      /*
+       * Un hallazgo afirmativo sin cita no entra, lo escriba quien lo escriba. Y las DOS capas
+       * dicen que no, que es lo que separa «hay ruta manual» de «hay una puerta trasera»: el
+       * contrato en la frontera —el mismo que gobierna al proveedor— y el guard diferido en el
+       * commit. Se comprueban por separado porque el servicio recibe un valor YA tipado: llamarlo
+       * a pelo mide el suelo, no el contrato, y esta nota decía «el contrato es el mismo» sobre
+       * una sola de las dos.
+       */
+      expect(
+        EscribirRevisionAManoSchema.safeParse({
+          workspaceId: wsC,
+          conceptoId,
+          contenido: {
+            ...contenido,
+            hallazgos: [{ ...contenido.hallazgos[0]!, citas: [] }],
+            preguntas: [{ pregunta: '¿Y esto?', escenario: '' }],
+          },
+        }).success,
+      ).toBe(false);
       await expect(
         escribirRevisionAMano(curadorId, {
           workspaceId: wsC,
@@ -10145,6 +10166,253 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           },
         }),
       ).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * EL PASAJE ES OBLIGATORIO EN LA TABLA, no sólo en el contrato.
+   *
+   * `fragmento` y `localizacion` nacieron anulables, y la superficie CONCEDIDA los incluye
+   * (`grant insert (… fragmento, localizacion)`). Por ahí volvía a entrar exactamente el enlace
+   * pelado que esas columnas existen para impedir: los guards de sostén sólo preguntan si el
+   * hallazgo observado tiene ALGÚN enlace, así que la fila pasaba, cumplía la regla de las dos
+   * clases de RF-08.2, y el lector volvía a enseñar el título del documento y nada más — que es
+   * justo lo NO contrastable, y una cita existe para ser contrastable.
+   *
+   * Que el servicio siempre los escriba no cierra nada: el servicio no es el único camino a la
+   * tabla, y es la misma lección que ya dejaron el arquetipo refutado y la lente ajena.
+   *
+   * Las dos mitades se midieron POR SEPARADO, porque son dos comprobaciones distintas: quitando
+   * sólo el CHECK de no-en-blanco se mueve la línea del pasaje en blanco y NO la del nulo, que
+   * la sostiene el `not null`. Y el no-en-blanco va por `titulo_normalizado` y no por `btrim`:
+   * `btrim` no recorta tabuladores, así que un pasaje de un solo tabulador pasaba por escrito.
+   */
+  it('C4 no materializa una cita sin su pasaje, ni por la superficie concedida', async () => {
+    await enWorkspaceLimpio('c4-cita-sin-pasaje', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const escribir = (fragmento: string | null, localizacion: string | null) =>
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Pide saber para qué',
+                    'No entrega el documento sin motivo.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evA}, ${wsC}, ${fragmento}, ${localizacion})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué harías aquí?', '')`;
+          return r!.id as string;
+        });
+      await expect(
+        escribir(null, 'resumen'),
+        'una cita sin pasaje entró: el enlace queda reducido al título del documento',
+      ).rejects.toThrow();
+      // Un TABULADOR solo, que es lo que `btrim` deja pasar por escrito.
+      await expect(escribir('\t', 'resumen')).rejects.toThrow();
+      await expect(escribir('No entrego la cédula', '   ')).rejects.toThrow();
+      await expect(escribir('No entrego la cédula', null)).rejects.toThrow();
+      await expect(escribir('No entrego la cédula', 'resumen')).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * LA RUTA MANUAL ESCRIBE UNA REVISIÓN ENTERA, no una de cada.
+   *
+   * El formulario mandaba siempre un hallazgo, una cita y una pregunta, y eso no era un recorte
+   * de la pantalla: la clave única `(concepto_id, arquetipo_id)` deja UNA revisión por lente y
+   * no hay ninguna ruta para añadirle hojas después —las políticas de las tres hojas piden el
+   * sello en null, así que la base lo admitiría, pero no existe acción de servidor que lo haga—.
+   * Lo que no cabía en el envío no cabía nunca: una lente que ve tres fricciones sólo podía
+   * registrar una, y la única salida era borrar y reescribir con el mismo formulario de una.
+   *
+   * Peor: con una sola casilla de cita, un hallazgo con dos testimonios detrás empujaba a
+   * MARCARLO COMO HIPÓTESIS para que la segunda no estorbara — mentir sobre su clase por un
+   * límite de la pantalla, que es el mismo modo de fallo que el selector recortado.
+   *
+   * Los topes viven ahora en un solo sitio, `ai.schemas`, y los leen el contrato y el
+   * formulario: el módulo del contrato es solo-servidor, así que la pantalla no puede leerlos de
+   * allí sin arrastrar los validadores al navegador. Esta sonda es la que los enfrenta.
+   */
+  it('C4 a mano llena una revisión hasta el tope del contrato, y ni una más', async () => {
+    await enWorkspaceLimpio('c4-a-mano-llena', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4L', 'Proyecto de la revisión llena', ${curadorId})
+        returning id`;
+      // Un SEGUNDO documento en la misma lente: cuatro citas distintas no caben en uno solo, y
+      // el contrato no admite repetir la misma cita dentro de un hallazgo.
+      const [fte] = await admin`select fuente_id from evidencia where id = ${evA}`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte!.fuente_id as string}, 'Entrevista D-02',
+                'Prefiero que me digan para qué antes de dar nada.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evA2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evA2}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${evA2})`;
+
+      // Cuatro citas DISTINTAS sobre los DOS documentos de la lente, todas literales de su
+      // resumen: el enlace colapsa por documento, así que van a dar a dos filas.
+      const citas = [
+        { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+        { evidenciaId: evA, fragmento: 'sin saber para qué', localizacion: 'resumen' },
+        { evidenciaId: evA2, fragmento: 'Prefiero que me digan', localizacion: 'resumen' },
+        { evidenciaId: evA2, fragmento: 'antes de dar nada', localizacion: 'resumen' },
+      ];
+      expect(citas.length).toBe(MAX_CITAS_POR_HALLAZGO);
+      const LETRA = 'ABCDEF';
+      const hallazgos = Array.from({ length: MAX_HALLAZGOS_POR_REVISION }, (_, i) => ({
+        titulo: `Fricción ${LETRA[i]}`,
+        descripcion: `Lo que esta lente ve en el punto ${LETRA[i]}, distinto de lo anterior.`,
+        esHipotesis: false,
+        // El primero con el tope de citas; los demás con una, que ya los hace observados.
+        citas: i === 0 ? citas : [citas[i % citas.length]!],
+      }));
+      const preguntas = Array.from({ length: MAX_PREGUNTAS_POR_REVISION }, (_, i) => ({
+        pregunta: `¿Qué harías en el caso ${LETRA[i]}?`,
+        escenario: '',
+        // Cada una de la suya, incluida la ÚLTIMA: el índice se traduce al hallazgo que acaba
+        // de nacer, y el tope del campo sale del mismo sitio que el del array de hallazgos.
+        hallazgoIndice: i,
+      }));
+
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: {
+          arquetipoId: lenteA,
+          sintesis: 'Seis lecturas de una sola lente.',
+          hallazgos,
+          preguntas,
+        },
+      });
+
+      const filas = await admin`select id, orden, titulo from hallazgo_simulado
+        where revision_id = ${revisionId} order by orden`;
+      expect(filas.length).toBe(MAX_HALLAZGOS_POR_REVISION);
+      const [nCitas] = await admin`select count(*)::int as n from hallazgo_simulado_evidencia
+        where hallazgo_id = ${filas[0]!.id as string}`;
+      // DOS y no cuatro: la clave primaria del enlace es `(hallazgo_id, evidencia_id)`, así que
+      // las cuatro citas del contenido colapsan a un enlace por documento. Está dicho en la
+      // tabla y medido aquí para que deje de ser una suposición.
+      expect(nCitas!.n).toBe(2);
+
+      // La traza de cada pregunta a SU hallazgo, que es lo que la simulación entrega a la etapa
+      // 4. Con una sola pregunta el índice 0 acertaba por casualidad.
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const rev = gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones[0]!;
+      expect(rev.hallazgos.length).toBe(MAX_HALLAZGOS_POR_REVISION);
+      expect(rev.preguntas.length).toBe(MAX_PREGUNTAS_POR_REVISION);
+      expect(rev.preguntas.map((q) => q.hallazgoId)).toEqual(filas.map((f) => f.id as string));
+
+      /*
+       * Y NI UNA MÁS. El tope lo pone el CONTRATO, y el contrato lo aplica el validador de
+       * entrada de la acción de servidor — no el servicio, que recibe un valor ya tipado: la
+       * primera versión de esta sonda pedía siete hallazgos a `escribirRevisionAMano` y entraban
+       * los siete, porque ahí no hay quien los cuente. Se mide entonces donde de verdad se
+       * decide, que es exactamente la frontera que cruza el formulario.
+       */
+      const cabe = (contenido: unknown) =>
+        EscribirRevisionAManoSchema.safeParse({ workspaceId: wsC, conceptoId, contenido }).success;
+      const base = { arquetipoId: lenteA, sintesis: 'Uno más de la cuenta.', hallazgos, preguntas };
+      expect(cabe(base), 'el contrato no admite lo que el formulario ofrece escribir').toBe(true);
+      expect(
+        cabe({ ...base, hallazgos: [...hallazgos, { ...hallazgos[0]!, titulo: 'La séptima' }] }),
+        'entró un hallazgo por encima del tope que el formulario ofrece',
+      ).toBe(false);
+      expect(
+        cabe({
+          ...base,
+          preguntas: [...preguntas, { ...preguntas[0]!, pregunta: '¿Y la séptima?' }],
+        }),
+      ).toBe(false);
+      expect(
+        cabe({
+          ...base,
+          hallazgos: [
+            {
+              ...hallazgos[0]!,
+              citas: [
+                ...citas,
+                { evidenciaId: evA, fragmento: 'la cédula', localizacion: 'resumen' },
+              ],
+            },
+            ...hallazgos.slice(1),
+          ],
+        }),
+      ).toBe(false);
+    });
+  });
+
+  /**
+   * Y NI LA ESCRIBE NI LA BORRA QUIEN NO ES CURADOR.
+   *
+   * `revision_simulada_insert` y `_delete` piden `workspace_role(...) in ('lead-boutique',
+   * 'disenador')` — que es exactamente el `esCurador` de la pantalla. El bloque de lectura se
+   * sacó del formulario del pasa/muere a propósito, para que las preguntas de test lleguen a
+   * TODO el equipo antes del test y no sólo a quien firma; pero al meterle después los controles
+   * de escribir y borrar se los ofrecía también a un stakeholder, que sólo podía descubrir por
+   * un error de permisos que no eran suyos. Leer no es decidir, y escribir tampoco es leer.
+   *
+   * Lo que la pantalla esconde lo exige la base, y esto es esa exigencia medida: la puerta de la
+   * UI es no ofrecer lo que va a fallar, no la puerta.
+   */
+  it('C4 a mano no la escribe ni la borra quien no es curador', async () => {
+    await enWorkspaceLimpio('c4-a-mano-rol', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      const email = `${marca}-c4-rol-stakeholder@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${email}, 'Quien mira', 'activo') returning id`;
+      const ajenoId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${ajenoId}, 'Quien mira', ${email}, 'stakeholder')`;
+
+      await expect(
+        escribirRevisionAMano(ajenoId, { workspaceId: wsC, conceptoId, contenido }),
+        'un stakeholder escribió una revisión simulada',
+      ).rejects.toThrow();
+
+      // Y tampoco borra la que escribió un curador.
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido,
+      });
+      await expect(
+        borrarRevisionAMano(ajenoId, { workspaceId: wsC, revisionId }),
+        'un stakeholder borró una revisión simulada ajena',
+      ).rejects.toThrow();
+      const [quedan] = await admin`select count(*)::int as n from revision_simulada
+        where id = ${revisionId}`;
+      expect(quedan!.n).toBe(1);
     });
   });
 
@@ -10373,8 +10641,8 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   'Dice que abandona si tarda.', false)
           returning id`;
         await tx`insert into hallazgo_simulado_evidencia
-          (hallazgo_id, evidencia_id, workspace_id)
-          values (${h!.id as string}, ${evB}, ${wsC})`;
+          (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+          values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
         await tx`insert into pregunta_de_test
           (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
           values (${wsC}, ${r!.id as string}, ${h!.id as string}, 0, '¿Cuánto esperarías?', '')`;
@@ -10623,8 +10891,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               returning id`;
             for (const cita of h!.citas) {
               await tx`insert into hallazgo_simulado_evidencia
-                (hallazgo_id, evidencia_id, workspace_id)
-                values (${fila!.id as string}, ${cita.evidenciaId}, ${wsC})`;
+                (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+                values (${fila!.id as string}, ${cita.evidenciaId}, ${wsC}, ${cita.fragmento},
+                        ${cita.localizacion})`;
             }
           }
           await tx`insert into pregunta_de_test

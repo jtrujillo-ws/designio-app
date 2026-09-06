@@ -1292,7 +1292,7 @@ Dos ámbitos con dos reglas distintas, ambas correctas:
 | Ámbito | Qué lleva | Para qué |
 |---|---|---|
 | **archivo** | **Todo** el catálogo de objetos del workspace (tablas del dominio, auditoría, adjuntos), verificado contra un manifiesto. Los adjuntos viajan embebidos hasta un presupuesto de **25 MiB por paquete**; los que no caben quedan listados con sus metadatos, su `sha256` y el motivo de omisión, y se descargan aparte desde la bandeja | La copia del propietario (SYS-04, RF-01.8) |
-| **entregable** | **Solo evidencia**: la que tiene **derechos vigentes** para ámbito cliente, con su fuente, los segmentos del workspace, sus registros de derecho de uso, la propuesta AI de la que nació y los adjuntos originales de su ítem (`CATALOGO_EXPORT`: modos `porEvidencia`, `porFuente`, `porItem` y `todo`). **No lleva** el razonamiento ni lo derivado: insights, decisiones, arquetipos, oportunidades, conceptos, journeys, design versions, releases, medición, hilos y auditoría van `fuera` en el catálogo, tabla por tabla y con justificación. La evidencia excluida por derechos sale **listada con el motivo** | El paquete que se entrega al cliente (RF-03.10) |
+| **entregable** | **Solo evidencia**: la que tiene **derechos vigentes** para ámbito cliente, con su fuente, su mapeo a segmentos y los segmentos del workspace, sus registros de derecho de uso y los adjuntos originales de su ítem (`CATALOGO_EXPORT`: `evidencia`, `evidencia_segmento` y `derecho_uso` en modo `porEvidencia`, `fuente` en `porFuente`, `archivo_importado` en `porItem`, `segmento` en `todo`). La **propuesta AI** de la que nació una evidencia **no viaja**: `propuesta_ai` va `fuera` y la entrada de `evidencia` la declara como padre ausente («el entregable lleva la evidencia curada, no el artefacto interno que la produjo»), así que el `propuesta_ai_id` de la fila queda sin destino en el paquete. **No lleva** el razonamiento ni lo derivado: insights, decisiones, arquetipos, oportunidades, conceptos, journeys, design versions, releases, medición, hilos y auditoría van `fuera` en el catálogo, tabla por tabla y con justificación. La evidencia excluida por derechos sale **listada con el motivo** | El paquete que se entrega al cliente (RF-03.10) |
 
 - Exportar es una acción explícita (POST) que **deja auditoría**; la base registra permiso y evento
   en `registrar_exportacion` y **confirma** la entrega en `exportacion_registro`, que la disposición
@@ -1491,7 +1491,7 @@ alcanzado del catálogo de Postgres.
 
 | Objeto | Estados |
 |---|---|
-| Reto | `candidato` → `activo` → `en-medicion` → `cerrado` (con veredicto) · `archivado` |
+| Reto | `candidato` → `activo` → `en-medicion` (exige registry firmado, G7 aprobado y portafolio sin HMW destrazadas) → `cerrado` (exige veredicto del outcome review); archivar solo desde los extremos: `candidato` → `archivado` y `cerrado` → `archivado` (`reto_estado_transicion_guard`) |
 | Proyecto | `activo` → `en-implementacion` (al aprobar G6); `activo` ↔ `pausado` y `en-implementacion` ↔ `pausado` (pausar y retomar antes de medir); `pausado` → `en-medicion`; `en-implementacion` → `en-medicion` (al abrir la medición, que exige G7); `en-medicion` → `cerrado` (al completar el outcome review) |
 | Design version | `borrador` → `aprobada` → `superada` |
 | Release | `planificado` → `desplegado` → `verificado` |
@@ -1882,7 +1882,7 @@ base.
 | **Degradación segura** | Sin AI disponible, todo flujo sigue operable a mano y la pantalla dice por qué; excepción vigente: los criterios de éxito de un reto nuevo, que solo entran desde la interfaz por C0 hasta que exista la pantalla de J2 |
 | **Portal** | Los hilos de comentarios y aprobaciones dentro del workspace, auditados |
 | **Evento de dominio** | Fila append-only de auditoría con tipo, payload, actor y rol |
-| **Exportación** | Paquete JSON del workspace en ámbito archivo (todo el catálogo) o entregable (solo la evidencia con derechos vigentes, con su fuente, derechos, segmentos y originales; sin razonamiento ni objetos derivados) |
+| **Exportación** | Paquete JSON del workspace en ámbito archivo (todo el catálogo) o entregable (solo la evidencia con derechos vigentes, con su fuente, derechos, segmentos y originales; sin razonamiento, sin objetos derivados y sin la propuesta AI de origen) |
 | **Disposición acordada** | Archivo o borrado del workspace tras el engagement, con acuerdo versionado, doble firma para borrar y constancia sellada |
 | **Lápida** | La fila `workspace` que sobrevive al borrado como ancla de la constancia |
 | **Biblioteca del cliente** | Proyección de la memoria del workspace: arquetipos por segmento, insights validados, decisiones vigentes, retos cerrados |

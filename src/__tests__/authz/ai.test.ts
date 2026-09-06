@@ -8746,8 +8746,22 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * La carrera se monta a propósito, no se espera a que ocurra: la otra transacción toma el
    * candado ANTES y suelta el veredicto dentro, así que el orden está fijado y la sonda no es
    * intermitente.
+   *
+   * DOS COSAS QUE LA CI ENSEÑÓ, y ninguna es el orden de la carrera:
+   *
+   * 1. El presupuesto de la espera era el mismo que el de la prueba —200 × 25 ms = 5 s, y
+   *    `testTimeout` son 5 s—, así que en una máquina cargada la prueba se moría DENTRO del
+   *    bucle en vez de llegar a su afirmación. Un fallo así no dice nada: no distingue «la
+   *    escritura no llegó a esperar el candado» de «esto tardó». El bucle se acorta y la
+   *    prueba recibe su propio plazo, holgado: lo que se mide sigue siendo idéntico, y lo que
+   *    cambia es que un fallo de verdad ahora sale por el `expect` que lo nombra.
+   * 2. Y `soltar()` sólo corría si todo iba bien. Al morir antes, la otra transacción se
+   *    quedaba abierta con el candado del reto en la mano, y lo siguiente que se bloqueaba era
+   *    la LIMPIEZA del workspace: un fallo aquí se llevaba por delante el resto del fichero
+   *    («Hook timed out»). Va en `finally`, que es donde va lo que hay que soltar pase lo que
+   *    pase.
    */
-  it('C4 no deja entrar una revisión cuyo veredicto llegó mientras esperaba el candado', async () => {
+  it('C4 no deja entrar una revisión cuyo veredicto llegó mientras esperaba el candado', { timeout: 30_000 }, async () => {
     await enWorkspaceLimpio('c4-veredicto-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();
       const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
@@ -8778,20 +8792,27 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
           values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó tarde', ${curadorId})`,
       );
-      // Hasta que de verdad esté bloqueada en el candado: se lee de `pg_locks`, no de un
-      // tiempo de espera, que es lo que haría intermitente a esta prueba.
-      for (let i = 0; i < 200; i++) {
-        const [espera] = await admin`select count(*)::int as n from pg_locks
+      try {
+        // Hasta que de verdad esté bloqueada en el candado: se lee de `pg_locks`, no de un
+        // tiempo de espera, que es lo que haría intermitente a esta prueba.
+        for (let i = 0; i < 100; i++) {
+          const [espera] = await admin`select count(*)::int as n from pg_locks
+            where locktype = 'advisory' and not granted`;
+          if ((espera!.n as number) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        const [bloqueada] = await admin`select count(*)::int as n from pg_locks
           where locktype = 'advisory' and not granted`;
-        if ((espera!.n as number) > 0) break;
-        await new Promise((r) => setTimeout(r, 25));
+        expect(
+          bloqueada!.n,
+          'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
+        ).toBe(1);
+      } finally {
+        // Pase lo que pase: si esto no corre, la otra transacción se queda abierta con el
+        // candado del reto y la limpieza del workspace se bloquea detrás de ella.
+        soltar();
+        await elOtro;
       }
-      const [bloqueada] = await admin`select count(*)::int as n from pg_locks
-        where locktype = 'advisory' and not granted`;
-      expect(bloqueada!.n, 'la escritura no llegó a esperar el candado: la sonda no mide la carrera').toBe(1);
-
-      soltar();
-      await elOtro;
       await expect(escritura).rejects.toThrow(/ya no es candidato|veredicto/i);
     });
   });

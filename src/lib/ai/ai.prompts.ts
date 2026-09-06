@@ -514,7 +514,16 @@ function cuerpoDeRevision(c: ConceptoARevisar): {
     for (const e of a.evidencia) {
       const linea = `  [${e.id}] ${e.titulo}\n  ${e.resumen}`;
       const inicio = largo + 1; // el '\n' que la une a lo anterior
-      tramos.set(e.id, [inicio, inicio + linea.length]);
+      /*
+       * La PRIMERA aparición y no la última: un documento puede estar enlazado a varios
+       * arquetipos, y entonces se dibuja una vez debajo de cada uno. Sobrescribir dejaba
+       * guardada la del final, así que si esa caía tras el corte —y la de arriba no—, el
+       * documento pasaba por «no llegó»: se rechazaba una cita legítima de la primera lente, y
+       * el panel medía su presencia contra un tramo vacío. El texto de las dos apariciones es
+       * el mismo, y el orden es lineal, así que la primera es siempre la que más adentro del
+       * recorte queda: quedarse con ella contesta bien las dos preguntas.
+       */
+      if (!tramos.has(e.id)) tramos.set(e.id, [inicio, inicio + linea.length]);
       partes.push(linea);
       largo = inicio + linea.length;
     }

@@ -414,13 +414,24 @@ create policy revision_simulada_insert on revision_simulada
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
     and creado_por = app_user_id()
+    -- El arquetipo, DEL RETO DEL CONCEPTO. Las dos claves ajenas de la tabla solo dicen que
+    -- concepto y arquetipo son del mismo WORKSPACE, que es mucho menos: sin este predicado un
+    -- curador puede colgar la lente del reto B de un concepto del reto A, y a partir de ahí
+    -- todos los guards de evidencia le dan la razón —comprueban contra la evidencia de SU
+    -- arquetipo, que es la de B—. Sale una revisión bien formada y sin sentido.
     and exists (select 1 from concepto c
+      join arquetipo a on a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
       where c.id = revision_simulada.concepto_id
         and c.workspace_id = revision_simulada.workspace_id
+        and a.id = revision_simulada.arquetipo_id
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
+-- Y las hojas, con la MISMA puerta del estado que su padre. Sin ella, una revisión creada
+-- mientras el concepto era candidato sigue admitiendo hallazgos, citas y preguntas DESPUÉS del
+-- pasa/muere: contenido nuevo dentro de un objeto viejo, que en el expediente se lee como si
+-- hubiera informado el veredicto. Que el padre esté cerrado no cierra a los hijos.
 create policy hallazgo_simulado_insert on hallazgo_simulado
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -428,6 +439,7 @@ create policy hallazgo_simulado_insert on hallazgo_simulado
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = hallazgo_simulado.revision_id
         and r.workspace_id = hallazgo_simulado.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -439,6 +451,7 @@ create policy hallazgo_simulado_evidencia_insert on hallazgo_simulado_evidencia
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where h.id = hallazgo_simulado_evidencia.hallazgo_id
         and h.workspace_id = hallazgo_simulado_evidencia.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -449,6 +462,7 @@ create policy pregunta_de_test_insert on pregunta_de_test
       join concepto c on c.id = r.concepto_id and c.workspace_id = r.workspace_id
       where r.id = pregunta_de_test.revision_id
         and r.workspace_id = pregunta_de_test.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 

@@ -7341,6 +7341,279 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  /**
+   * La ventana de lentes AVANZA, y el material del lote en curso NO se mueve al aceptarlo.
+   *
+   * Son las dos mitades de una misma decisión y hacen falta las dos:
+   *
+   *  · Sin la primera, con más arquetipos que `MAX_REVISIONES_POR_LOTE` el lote pedía siempre
+   *    los mismos seis. Aceptados, la siguiente generación los volvía a pedir, aceptarlos
+   *    chocaba contra `unique (concepto_id, arquetipo_id)`, y del séptimo en adelante no se
+   *    revisaba ninguno NUNCA.
+   *
+   *  · Sin la segunda —el corte por `creado_en` en la proyección del panel—, aceptar la
+   *    primera sesión de un lote de seis cambiaría el material de las otras cinco: las cinco
+   *    quedarían marcadas «material movido» y su presencia literal sin poder medirse, que es
+   *    la única señal contrastable que tiene quien revisa.
+   */
+  it('la ventana de lentes avanza al aceptar, y el lote en curso sigue midiéndose', async () => {
+    await enWorkspaceLimpio('c4-ventana', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const sesion = (arquetipoId: string, evidenciaId: string, fragmento: string) => ({
+        arquetipoId,
+        sintesis: 'Este perfil llega con la guardia alta.',
+        hallazgos: [
+          {
+            titulo: 'Pide confianza antes de darla',
+            descripcion: 'Entrega el documento cuando entiende para qué.',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento, localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              sesion(lenteA, evA, 'No entrego la cédula sin saber para qué.'),
+              sesion(lenteB, evB, 'Si tarda más de un café, lo dejo.'),
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      const deC4 = antes.pendientes.filter((x) => x.capacidad === 'C4');
+      expect(deC4).toHaveLength(2);
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: deC4[0]!.id });
+
+      // LA SEGUNDA MITAD: la hermana del lote sigue viva y su cita se sigue midiendo.
+      const despues = await panelPropuestas(curadorId, wsC);
+      const hermana = despues.pendientes.find((x) => x.id === deC4[1]!.id);
+      expect(hermana, 'la hermana del lote desapareció del panel').toBeDefined();
+      expect(hermana!.anclaEstado).toBe('disponible');
+      expect(hermana!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      // LA PRIMERA: con las dos lentes ya revisadas, el concepto deja de ofrecerse y pedir otro
+      // lote no encuentra nada que revisar. Que la ventana avanza se ve aquí llegando a cero.
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: deC4[1]!.id });
+      const [cuantas] = await admin`select count(*)::int as n from revision_simulada
+        where concepto_id = ${conceptoId}`;
+      expect(cuantas!.n).toBe(2);
+      await expect(
+        conProveedor(
+          { ok: true, datos: { revisiones: [] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/ningún arquetipo con evidencia citable/);
+    });
+  });
+
+  /**
+   * Un documento enlazado a DOS arquetipos se dibuja una vez debajo de cada uno, y de las dos
+   * apariciones se guarda la PRIMERA.
+   *
+   * Sobrescribir dejaba la del final: si esa caía tras el corte —y la de arriba no—, el
+   * documento pasaba por «no llegó» y se rechazaba una cita legítima de la primera lente, con
+   * el mensaje de que el recorte no la dejó llegar cuando sí la dejó.
+   */
+  it('C4 mide un documento compartido por su primera aparición, no por la última', async () => {
+    await enWorkspaceLimpio('c4-compartida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // El MISMO documento colgando también de la segunda lente.
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteB}, ${evA})`;
+      // Y el corte justo dentro de las lentes, buscado por bisección como en la sonda hermana.
+      const enterasCon = async (relleno: number) =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          const primera = material!.arquetipos[0]!;
+          await admin`update evidencia set resumen = ${primera.evidencia[0]!.resumen.split('·')[0]! + '·'.repeat(relleno)}
+            where id = ${primera.evidencia[0]!.id}`;
+          const { material: m2 } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return arquetiposQueLlegaronEnteros(m2!).ids;
+        });
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await enterasCon(medio)).length === 2) cabe = medio;
+        else noCabe = medio;
+      }
+      const enteras = await enterasCon(noCabe);
+      expect(enteras.length).toBe(1);
+      // La lente que SÍ llegó entera cita el documento compartido. Su tramo tiene que ser el de
+      // arriba —el que cupo—, no el de abajo, que quedó cortado.
+      const primeraLente = enteras[0] === lenteA ? lenteA : lenteB;
+      const [ev] = await admin`select resumen from evidencia where id = ${evA}`;
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: primeraLente,
+                sintesis: 'Una lectura sostenida en el documento que sí llegó.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide confianza antes de darla',
+                    descripcion: 'Entrega el documento cuando entiende para qué.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: (ev!.resumen as string).slice(0, 30),
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Y aquí qué harías?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C4');
+      expect(p, 'la propuesta se descartó: la cita legítima se leyó como no llegada').toBeDefined();
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+    });
+  });
+
+  /**
+   * Un lote con la MISMA lente dos veces no se guarda.
+   *
+   * Cada sesión se comprueba por separado, así que las dos pasaban y nacían las dos: aceptar la
+   * primera crea la revisión que `unique (concepto_id, arquetipo_id)` protege, y la segunda ya
+   * no se puede aceptar nunca. Una propuesta pagada que solo se puede rechazar, y el motivo
+   * llegando como violación de clave única.
+   */
+  it('C4 no guarda un lote con dos sesiones de la misma lente', async () => {
+    await enWorkspaceLimpio('c4-repetida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const sesion = (titulo: string) => ({
+        arquetipoId: lenteA,
+        sintesis: 'Este perfil llega con la guardia alta.',
+        hallazgos: [
+          {
+            titulo,
+            descripcion: 'Entrega el documento cuando entiende para qué.',
+            esHipotesis: false,
+            citas: [
+              {
+                evidenciaId: evA,
+                fragmento: 'No entrego la cédula sin saber para qué.',
+                localizacion: 'resumen',
+              },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: { revisiones: [sesion('Primera lectura'), sesion('Segunda lectura')] },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/dos sesiones del mismo arquetipo/);
+      const [n] = await admin`select count(*)::int as n from propuesta_ai
+        where concepto_id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(n!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Y las dos puertas que faltaban en la superficie concedida, las dos medidas por ella.
+   *
+   *  · La lente tiene que ser del RETO DEL CONCEPTO. Las dos claves ajenas de la tabla solo
+   *    dicen que concepto y arquetipo son del mismo workspace, que es mucho menos: sin el
+   *    predicado, una lente del reto B cuelga de un concepto del reto A y todos los guards de
+   *    evidencia le dan la razón, porque comprueban contra la evidencia de SU arquetipo.
+   *
+   *  · Y las HOJAS se cierran con el concepto, igual que su padre. Que el padre esté cerrado no
+   *    cierra a los hijos: una revisión creada mientras el concepto era candidato seguía
+   *    admitiendo hallazgos y preguntas después del veredicto.
+   */
+  it('la revisión no cruza retos, y sus hojas se cierran con el concepto', async () => {
+    await enWorkspaceLimpio('c4-cruce', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO reto en el mismo workspace, con su propia lente.
+      const [svc] = await admin`select servicio_ancla_id from reto where id = ${retoC}`;
+      const [otro] = await admin`insert into reto
+        (workspace_id, servicio_ancla_id, codigo, titulo, estado, origen, creado_por)
+        values (${wsC}, ${svc!.servicio_ancla_id as string}, 'R-OTRO', 'Otro reto', 'candidato',
+                'peticion-cliente', ${curadorId}) returning id`;
+      const [ajena] = await admin`insert into arquetipo
+        (workspace_id, reto_id, nombre, definicion, creado_por)
+        values (${wsC}, ${otro!.id as string}, 'Lente de otro reto', 'D', ${curadorId})
+        returning id`;
+      await expect(
+        conUsuario(curadorId, (tx) => tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${ajena!.id as string}, 'Una lectura', ${curadorId})`),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+
+      // Y las hojas: con la revisión ya creada, decidir el concepto cierra también sus hijos.
+      const [rev] = await conUsuario(curadorId, (tx) => tx`insert into revision_simulada
+        (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+        values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId}) returning id`);
+      // `orden` distinto en cada intento: con el mismo, el segundo choca contra la clave única
+      // de `(revision_id, orden)` y la sonda mediría ESA y no la puerta del estado. Lo dijo la
+      // neutralización al fallar con «duplicate key» en vez de con la política.
+      const hallazgo = (orden: number) =>
+        conUsuario(curadorId, (tx) => tx`insert into hallazgo_simulado
+          (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+          values (${wsC}, ${rev!.id as string}, ${orden}, 'Un hallazgo',
+                  'Se sigue del perfil.', true)`);
+      // Con el concepto candidato, entra: la puerta la cierra el estado y no otra cosa.
+      await hallazgo(0);
+      await admin`update concepto set estado = 'pasa',
+        decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+      await expect(hallazgo(1)).rejects.toThrow(/row-level security|violates row-level/i);
+    });
+  });
+
   it('C4 no admite dos sesiones del mismo arquetipo sobre el mismo concepto (SYS-20)', async () => {
     await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();

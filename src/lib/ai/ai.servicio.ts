@@ -754,7 +754,21 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
                     and evidencia_usable(e.id, e.workspace_id, 'cliente')))
                 order by a.nombre, a.id), '[]'::json)
        from arquetipo a
-       where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id) as concepto_arquetipos`,
+       where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id
+         /*
+          * La MISMA ventana que usó la generación, congelada al instante de ESTA propuesta.
+          *
+          * «creado_en <» y no un «not exists» a secas, que es lo que hace que las dos lecturas
+          * coincidan: al generar no había ninguna revisión de estas lentes, así que la del
+          * lote —creada al aceptar, después— NO puede descontarse aquí. Sin el corte temporal,
+          * aceptar la primera sesión de un lote de seis cambiaría el material de las otras
+          * cinco y las dejaría a todas marcadas «material movido», con su presencia literal
+          * sin poder medirse, que es la única señal contrastable que tiene quien revisa.
+          */
+         and not exists (select 1 from revision_simulada rs
+           where rs.concepto_id = cpt.id and rs.arquetipo_id = a.id
+             and rs.workspace_id = cpt.workspace_id
+             and rs.creado_en < p.creado_en)) as concepto_arquetipos`,
   },
   outcome_review_id: {
     // DOS joins, como el registry: el post mortem y su RETO. El reto no es adorno — el
@@ -1737,7 +1751,15 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
             join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
             join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
             where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id
-              and evidencia_usable(e.id, e.workspace_id, 'cliente'))
+              and evidencia_usable(e.id, e.workspace_id, 'cliente')
+              /*
+               * Y con alguna lente SIN REVISAR todavía: con todas revisadas, la ventana del
+               * lector está vacía y PREPARAR fallaría con «no hay lentes». Ofrecerlo sería
+               * ofrecer un callejón.
+               */
+              and not exists (select 1 from revision_simulada rs
+                where rs.concepto_id = cpt.id and rs.arquetipo_id = a.id
+                  and rs.workspace_id = cpt.workspace_id))
           and not exists (select 1 from propuesta_ai p
             where p.concepto_id = cpt.id and p.workspace_id = cpt.workspace_id
               and p.capacidad = 'C4' and p.estado = 'propuesta')
@@ -2164,7 +2186,7 @@ function filaDePanel(f: Record<string, unknown>): PropuestaEnPanel {
  * Pendientes y decididas se consultan por SEPARADO, cada una con su corte. Con un único
  * límite antes de partir por estado, 150 decisiones nuevas dejaban fuera una propuesta
  * pendiente antigua: invisible en el panel y, como la generación excluye su item por el
- * `not exists`, imposible de revisar o rechazar por ningún camino. Y las pendientes van
+ * «not exists», imposible de revisar o rechazar por ningún camino. Y las pendientes van
  * de la MÁS ANTIGUA a la más nueva: una cola de revisión se drena por el frente, así que
  * el recorte cae siempre sobre lo recién llegado, que se ve en la siguiente pasada.
  */
@@ -3342,10 +3364,25 @@ export const MOTIVO_MATERIAL_REVISION_MOVIDO =
  * sobre lo que se les enseñó, y lo que se les enseñó ES el texto recortado. Que un arquetipo
  * más allá del corte cambie no invalida la sesión de los que sí se vieron.
  */
+/**
+ * El material de C4, y CON ÉL LA VENTANA DE LENTES: los arquetipos del reto que todavía no
+ * tienen revisión de este concepto.
+ *
+ * `revisadasHasta` es lo que hace que las tres lecturas de este material —preparar, comprobar y
+ * ACEPTAR— digan lo mismo cuando el lote se acepta sesión a sesión. Al generar no se pasa: no
+ * hay propuesta todavía, así que descuentan TODAS las revisiones que existan. Al aceptar se
+ * pasa el instante en que nació la propuesta, y entonces las revisiones del propio lote —que
+ * nacen después, una por cada aceptación— NO descuentan.
+ *
+ * Sin eso, aceptar la primera sesión de un lote de seis cambia el material de las otras cinco y
+ * las cinco quedan «solo puede rechazarse». Lo dijo una sonda al fallar, después de que yo
+ * escribiera el corte solo en la proyección del panel: la aceptación relee por aquí.
+ */
 export async function huellaDelMaterialDeRevision(
   tx: TransactionSql,
   workspaceId: string,
   anclaId: string,
+  revisadasHasta?: Date,
 ): Promise<{ huella: string; material: ConceptoARevisar | null }> {
   await tx`select pg_advisory_xact_lock_shared(
     hashtextextended('designio:workspace:' || ${workspaceId}, 42))`;
@@ -3372,7 +3409,19 @@ export async function huellaDelMaterialDeRevision(
                     and evidencia_usable(e.id, e.workspace_id, 'cliente')))
                 order by a.nombre, a.id), '[]'::json)
        from arquetipo a
-       where a.reto_id = c.reto_id and a.workspace_id = c.workspace_id) as arquetipos
+       where a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
+         /*
+          * Y sin las lentes YA REVISADAS de este concepto, que es lo que hace que la ventana
+          * AVANCE. «unique (concepto_id, arquetipo_id)» sale de SYS-20 y no se toca; lo que
+          * no puede pasar es que con siete arquetipos el lote pida siempre los seis primeros
+          * y del séptimo en adelante no se revise ninguno nunca. Con esto, aceptar un lote
+          * mueve la ventana y el siguiente recoge lo que falta.
+          */
+         and not exists (select 1 from revision_simulada rs
+           where rs.concepto_id = c.id and rs.arquetipo_id = a.id
+             and rs.workspace_id = c.workspace_id
+             and (${revisadasHasta ?? null}::timestamptz is null
+                  or rs.creado_en < ${revisadasHasta ?? null}::timestamptz))) as arquetipos
     from concepto c
     where c.id = ${anclaId} and c.workspace_id = ${workspaceId}`;
   if (!fila || !(fila.revisable as boolean)) return { huella: '', material: null };
@@ -4580,6 +4629,19 @@ const COMPROBAR: Record<
         .filter((a) => enteras.has(a.id))
         .map((a) => [a.id, new Set(a.evidencia.map((e) => e.id))]),
     );
+    /*
+     * Y ninguna lente DOS VECES en el mismo lote. Cada sesión se comprueba por separado, así
+     * que dos con el mismo `arquetipoId` pasaban las dos y nacían las dos como propuestas:
+     * aceptar la primera crea la revisión que `unique (concepto_id, arquetipo_id)` protege, y
+     * la segunda ya no se puede aceptar nunca. Una propuesta pagada que solo se puede rechazar,
+     * y el motivo llega como violación de clave única.
+     */
+    const arquetipos = (contenidos as ContenidoRevisionSimulada[]).map((c) => c.arquetipoId);
+    if (new Set(arquetipos).size !== arquetipos.length) {
+      throw new ErrorContratoAI(
+        'El lote trae dos sesiones del mismo arquetipo, y de un arquetipo solo hay una lectura por concepto (SYS-20: no hay simulaciones masivas): se descarta el lote. Vuelve a pedirlo.',
+      );
+    }
     for (const contenido of contenidos) {
       const c = contenido as ContenidoRevisionSimulada;
       const suyas = porArquetipo.get(c.arquetipoId);
@@ -5329,6 +5391,9 @@ type PropuestaEnRevision = {
    * mueve sin que nadie haya tocado el material.
    */
   huellaMaterial: string | null;
+  /** Cuándo NACIÓ la propuesta. Lo usa C4 para releer el material con la ventana de lentes tal
+   * como estaba entonces: las revisiones que su propio lote va creando no pueden moverlo. */
+  creadoEn: Date;
 };
 
 async function leerParaRevisar(
@@ -5342,7 +5407,7 @@ async function leerParaRevisar(
     (a, b) => tx`${a}, ${b}`,
   );
   const [p] = await tx`select capacidad, destino, ${columnasDeAncla}, contenido,
-      contenido_original, modelo, prompt_version, huella_material, estado
+      contenido_original, modelo, prompt_version, huella_material, estado, creado_en
     from propuesta_ai where id = ${propuestaId} and workspace_id = ${workspaceId}`;
   if (!p) throw new ErrorAI('La propuesta no existe en este workspace');
   if ((p.estado as string) !== 'propuesta') {
@@ -5369,6 +5434,7 @@ async function leerParaRevisar(
     modelo: p.modelo as string,
     promptVersion: p.prompt_version as string,
     huellaMaterial: (p.huella_material ?? null) as string | null,
+    creadoEn: p.creado_en as Date,
   };
 }
 
@@ -5970,7 +6036,12 @@ async function materializarRevision(
    * del candado del reto relee la ventana con la clave en la mano. Esto es para que el motivo
    * llegue con nombre a quien revisa, en vez de un 42501 o un 23514.
    */
-  const { huella, material } = await huellaDelMaterialDeRevision(tx, workspaceId, p.anclaId);
+  const { huella, material } = await huellaDelMaterialDeRevision(
+    tx,
+    workspaceId,
+    p.anclaId,
+    p.creadoEn,
+  );
   if (!material) {
     throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}. Esta propuesta solo puede rechazarse`);
   }

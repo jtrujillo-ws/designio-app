@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   costoDeUso,
   formatearCosteUsd,
+  formatearTasa,
   evaluarCapacidadAI,
   INTENTOS_POR_GENERACION,
   LIMITE_LLAMADAS_DIA,
@@ -241,6 +242,42 @@ describe('coste de la llamada (RF-09.14: se mide, no se estima)', () => {
 
   it('un modelo sin tarifa registrada NO inventa un coste', () => {
     expect(costoDeUso('modelo-que-no-existe', { entrada: 10, salida: 10 })).toBeNull();
+  });
+
+  /**
+   * Y LA MISMA REGLA PARA LAS TASAS, que es donde no estaba.
+   *
+   * La doctrina llevaba escrita desde el coste —«un valor distinto de cero JAMÁS se presenta
+   * como cero»— y el cuadro de operación pintaba sus tasas con `toFixed(0)`: una llamada
+   * fallida de cada mil salía como «0 %». La mentira va en la dirección que tranquiliza, que es
+   * la que un cuadro de operación no se puede permitir; y en el otro extremo, una aceptación
+   * del 99,6 % salía «100 %», prometiendo una perfección que no hay.
+   *
+   * Vive junto a `formatearCosteUsd` y no en cada pantalla, porque son dos las que presentan
+   * tasas de esta capa y dos redondeos distintos son dos verdades distintas del mismo número.
+   */
+  it('y una tasa distinta de cero tampoco se escribe como cero, ni una imperfecta como perfecta', () => {
+    // Los dos extremos, que son el hallazgo.
+    expect(formatearTasa(0.001)).toBe('0.1');
+    expect(formatearTasa(0.0001)).toBe('0.01');
+    expect(formatearTasa(0.00001)).toBe('< 0.01');
+    expect(formatearTasa(0.996)).toBe('99.6');
+    expect(formatearTasa(0.99999)).toBe('> 99.99');
+    // Y los valores exactos siguen siendo exactos: sólo el cero se escribe cero y sólo el uno
+    // se escribe cien. Sin esto, el arreglo podría estar diciendo «< 0.01» sobre un cero real.
+    expect(formatearTasa(0)).toBe('0');
+    expect(formatearTasa(1)).toBe('100');
+    // Una tasa normal se lee de un vistazo, sin ceros de relleno.
+    expect(formatearTasa(0.5)).toBe('50');
+    expect(formatearTasa(1 / 3)).toBe('33.33');
+
+    // La propiedad, sobre el rango entero: nada estrictamente entre 0 y 1 se presenta como
+    // ninguno de los dos extremos.
+    for (const t of [1e-6, 1e-4, 0.004, 0.5, 0.996, 1 - 1e-6]) {
+      const escrito = formatearTasa(t);
+      expect(escrito, `${t} se colapsó a un extremo`).not.toBe('0');
+      expect(escrito, `${t} se colapsó a un extremo`).not.toBe('100');
+    }
   });
 
   it('y al escribirlo NUNCA se colapsa a cero un coste que no es cero', () => {

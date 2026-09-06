@@ -1474,7 +1474,10 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
    aplica RLS y guards (capa 1). Las **proyecciones de solo lectura** que consultan varias tablas y
    deben devolver una foto coherente (exportación, panel de disposición, auditoría, árbol, resumen
    del loop, aprobaciones, memoria, segmentos, evidencia con derechos, panel de propuestas AI,
-   lectura de medición, membresías) abren la transacción en `repeatable read`; las **escrituras** de dominio
+   membresías y el diagnóstico de «qué falta para el post mortem» al abrir el outcome review)
+   abren la transacción en `repeatable read`; una proyección que cabe en **una sola sentencia**
+   (por ejemplo, el seguimiento de impacto de la medición) ya obtiene su foto coherente del
+   snapshot de esa sentencia y corre en `read committed`; las **escrituras** de dominio
    van en `read committed`, y la base **rechaza** escribir fuera de ese nivel en las tablas cuyos
    guards serializan con candado y releen (`IS001`). La **exportación** es la excepción
    deliberada: escribe su permiso y su auditoría (`registrar_exportacion`,
@@ -1498,8 +1501,11 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
 `ai`, `aprobaciones`, `arbol`, `auth`, `biblioteca`, `busqueda`, `disposicion`, `entrega`,
 `evidencia`, `exportacion`, `insight`, `journey`, `loop`, `medicion`, `memoria`, `metodo`, `portal`,
 `segmento`, `servicio`, `workspace`, más `db.ts`, `destinos.ts` (destinos navegables tipados),
-`fecha-calendario.ts`, `timing-safe.ts`, `configuracion.server.ts`. Cada módulo tiene `*.schemas.ts`
-(compartido, puro), `*.functions.ts` (frontera) y `*.servicio.ts` o `*.queries.ts` (servidor).
+`fecha-calendario.ts`, `timing-safe.ts`, `configuracion.server.ts`. Cada módulo con comportamiento
+tiene `*.schemas.ts` (compartido, puro), `*.functions.ts` (frontera) y `*.servicio.ts` o
+`*.queries.ts` (servidor); dos son **solo esquemas**, sin frontera ni servidor: `biblioteca`
+(vocabulario del CTX-07, diseñado) y `workspace` (esquemas compartidos del workspace, cuyo
+comportamiento vive en `auth`, `arbol` y `segmento`).
 
 ## Componentes (`src/components/`)
 
@@ -1549,7 +1555,7 @@ alcanzado del catálogo de Postgres.
 | Escritura con transición exigida | `WITH CHECK` en cada política de UPDATE; una política permisiva por operación (dos se unirían por OR) |
 | Efectos dentro del guard que decide | Los triggers de transición emiten `evento_dominio` con `app_user_id()` y rol, así que para esas operaciones el SQL crudo produce la misma acta; los eventos de alta los escribe el servicio (ver `12` y el DoD abajo) |
 | Inmutabilidad por sucesión | Índice único parcial «una DV aprobada vigente por servicio»; `design_version_sucesion_uniq`; snapshot con `xmin` de la misma transición |
-| Append-only | `evento_dominio`, `snapshot`, `acuerdo_disposicion`, `consentimiento_item`, `exportacion_registro` |
+| Append-only | `evento_dominio`, `snapshot`, `acuerdo_disposicion`, `consentimiento_item`. `exportacion_registro` se escribe en **dos fases** dentro de funciones definer y sin grant de UPDATE para la app: `registrar_exportacion` inserta la fila al empezar y `confirmar_exportacion` la sella al terminar con `completado_en`, la versión del acuerdo vista y el inventario; sellada, ya no cambia |
 | Códigos de serie | `asignar_codigo_de_serie` para DV-n, RL-n, ES-n |
 | Derechos en toda cita | Trigger `evidencia_citable` sobre cada superficie que referencia evidencia; predicado único `derechos_vigentes` / `evidencia_usable` |
 | Un protocolo de razonamiento | `razonamiento_usable_guard` (candados → relectura), `razonamiento_sin_respaldo` (predicado), `razonamiento_sin_respaldo_visible` (envoltorio con puerta de membresía y grant) |

@@ -2985,3 +2985,98 @@ begin
   return new;
 end $function$
 ;
+
+-- ── Y EL PASAJE TAMBIÉN VIVE EN LA PROPUESTA, que es la otra copia del mismo texto ──
+--
+-- Cerrar `hallazgo_simulado_evidencia` dejaba la mitad abierta: `propuesta_ai.contenido` guarda
+-- el `fragmento` LITERAL de cada cita —de C4 y de C2, que cita igual—, y `propuesta_select`
+-- autorizaba por membresía a secas. Quien perdía el derecho de uso seguía leyendo el pasaje
+-- directamente de la propuesta, que además es inmutable por SYS-17 y por tanto no se puede
+-- limpiar después.
+--
+-- No se puede recortar una COLUMNA con RLS, así que la propuesta se cierra por fila a quien
+-- trabaja con ella. Y se puede: el único lector de `propuesta_ai` fuera del panel de propuestas
+-- —que es la mesa de trabajo de quien cura— es la proyección de gobernanza, y esa pasa ahora
+-- por las dos funciones de abajo. No se esconde nada que alguien tuviera que ver.
+--
+-- Los tres roles son los mismos de `material_evidencia_visible`, y por la misma razón que allí:
+-- la boutique cura, y `admin-cliente` administra los datos y exporta el archivo completo
+-- (SYS-04). Se escribe con la función y no repitiendo la lista, para que el día que ese
+-- conjunto cambie, cambie en un sitio.
+drop policy propuesta_select on propuesta_ai;
+create policy propuesta_select on propuesta_ai
+  for select using (
+    is_workspace_member(app_user_id(), workspace_id)
+    and workspace_role(app_user_id(), workspace_id)
+          in ('lead-boutique', 'disenador', 'admin-cliente')
+  );
+
+-- ── Las dos lecturas de una cita para quien no trabaja con propuestas ──
+--
+-- La proyección de gobernanza SÍ la lee un stakeholder: es donde se firma un pasa/muere, y
+-- quien lo firma tiene que ver que un hallazgo se apoyaba en un documento hoy bloqueado. Por
+-- eso el recorte de esa pantalla quita el TEXTO y deja la cita, con su título y su `citable`
+-- en falso. Esconder la cita entera diría otra cosa: que el hallazgo nunca tuvo sostén.
+--
+-- Con las dos tablas cerradas —el enlace por el material, la propuesta por el rol—, esa
+-- proyección se quedaba sin sus dos fuentes, así que la lectura recortada se hace aquí, una
+-- vez, en SECURITY DEFINER. Que es además donde tiene que estar: recortar es una regla, y
+-- escrita en la consulta se copiaría en la siguiente pantalla que enseñe una cita.
+--
+-- Y la membresía se vuelve a exigir a mano en las dos, porque SECURITY DEFINER se salta la RLS
+-- que la garantizaba: el aislamiento (SYS-01/02) es la condición previa, no una alternativa.
+create function citas_materializadas_del_hallazgo(p_hallazgo uuid, p_ws uuid)
+returns table (evidencia_id uuid, evidencia_titulo text, fragmento text, localizacion text,
+               citable boolean)
+language sql stable security definer set search_path = public, pg_temp as
+$$
+  select he.evidencia_id, e.titulo,
+         case when evidencia_usable(he.evidencia_id, he.workspace_id, 'cliente')
+                then he.fragmento end,
+         case when evidencia_usable(he.evidencia_id, he.workspace_id, 'cliente')
+                then he.localizacion end,
+         evidencia_usable(he.evidencia_id, he.workspace_id, 'cliente')
+    from hallazgo_simulado_evidencia he
+    join evidencia e on e.id = he.evidencia_id and e.workspace_id = he.workspace_id
+   where he.hallazgo_id = p_hallazgo and he.workspace_id = p_ws
+     and is_workspace_member(app_user_id(), p_ws)
+   order by e.titulo
+$$;
+comment on function citas_materializadas_del_hallazgo(uuid, uuid) is
+  'RF-03.10 + RF-08.2: las citas ENLAZADAS de un hallazgo simulado, con el pasaje recortado si su documento ya no se puede citar al cliente. Única lectura de esos pasajes fuera de la tabla, que está cerrada por «material_evidencia_visible».';
+
+-- Y la del CONTENIDO de la propuesta, que es de donde sale el testimonio de una revisión que
+-- nació de AI. No es redundante con la de arriba: la clave del enlace es
+-- «(hallazgo_id, evidencia_id)», así que dos citas del MISMO documento dentro de un hallazgo
+-- colapsan en una fila, y el contenido conserva las dos. El enlace dice cuáles siguen vivas
+-- —quitar una cita de una revisión aceptada no toca el contenido, que es inmutable— y por eso
+-- el cruce con él se mantiene: sin ese cruce, el pasaje retirado se seguiría enseñando como
+-- sostén actual delante de quien firma.
+create function citas_de_hallazgo_en_propuesta(p_propuesta uuid, p_ws uuid, p_orden int)
+returns table (evidencia_id uuid, evidencia_titulo text, fragmento text, localizacion text,
+               citable boolean, ord bigint)
+language sql stable security definer set search_path = public, pg_temp as
+$$
+  select (x ->> 'evidenciaId')::uuid, e.titulo,
+         case when evidencia_usable((x ->> 'evidenciaId')::uuid, p.workspace_id, 'cliente')
+                then x ->> 'fragmento' end,
+         case when evidencia_usable((x ->> 'evidenciaId')::uuid, p.workspace_id, 'cliente')
+                then x ->> 'localizacion' end,
+         evidencia_usable((x ->> 'evidenciaId')::uuid, p.workspace_id, 'cliente'),
+         t.ord
+    from propuesta_ai p
+    cross join lateral jsonb_array_elements(
+      coalesce(p.contenido -> 'hallazgos' -> p_orden -> 'citas', '[]'::jsonb))
+      with ordinality as t(x, ord)
+    left join evidencia e on e.id = (x ->> 'evidenciaId')::uuid and e.workspace_id = p.workspace_id
+   where p.id = p_propuesta and p.workspace_id = p_ws
+     and is_workspace_member(app_user_id(), p_ws)
+   order by t.ord
+$$;
+comment on function citas_de_hallazgo_en_propuesta(uuid, uuid, int) is
+  'RF-03.10 + SYS-17: las citas que el testimonio inmutable de una propuesta declara para el hallazgo N, con el pasaje recortado si su documento ya no se puede citar al cliente. La propuesta está cerrada por rol porque su contenido guarda pasajes literales.';
+
+revoke execute on function citas_materializadas_del_hallazgo(uuid, uuid),
+  citas_de_hallazgo_en_propuesta(uuid, uuid, int) from public;
+grant execute on function citas_materializadas_del_hallazgo(uuid, uuid),
+  citas_de_hallazgo_en_propuesta(uuid, uuid, int) to designio_app;

@@ -596,43 +596,38 @@ export async function gobernanzaDeProyecto(
                                          -- La tarjeta de la propuesta pendiente enseña «cita»
                                          -- entera; al aceptar solo quedaba «se apoya en <doc>»,
                                          -- y con eso quien firma el pasa/muere no puede ver qué
-                                         -- pasaje sostiene el hallazgo. El enlace materializado
-                                         -- no lo guarda —«hallazgo_simulado_evidencia» son tres
-                                         -- uuid— y encima colapsa dos citas del mismo documento
-                                         -- por su clave primaria: el testimonio vive en el
-                                         -- «contenido» de la propuesta, inmutable por SYS-17,
-                                         -- así que es de ahí de donde se lee.
+                                         -- pasaje sostiene el hallazgo.
+                                         --
+                                         -- El testimonio vive en el «contenido» de la propuesta,
+                                         -- inmutable por SYS-17, y de ahí se lee: el enlace
+                                         -- materializado guarda el pasaje pero su clave es
+                                         -- «(hallazgo_id, evidencia_id)», así que dos citas del
+                                         -- MISMO documento dentro de un hallazgo colapsan en una
+                                         -- fila y el contenido conserva las dos.
                                          --
                                          -- «orden» ES el índice del hallazgo en ese contenido
                                          -- (lo escribe la materialización), que es lo que
                                          -- permite bajar al array de citas del hallazgo justo.
+                                         --
+                                         -- Y SE LEE POR FUNCIÓN, no de la tabla. Las dos que
+                                         -- guardan pasajes están cerradas —el enlace por
+                                         -- «material_evidencia_visible», la propuesta por rol,
+                                         -- porque su contenido guarda el texto literal y una
+                                         -- columna no se puede recortar con RLS— y esta
+                                         -- pantalla la lee quien firma el pasa/muere, que puede
+                                         -- no tener ninguno de los dos permisos. La función
+                                         -- recorta el TEXTO y deja la cita: sin ella la cita
+                                         -- desaparecía entera, que dice algo distinto y falso
+                                         -- —que el hallazgo nunca tuvo sostén—.
                                          'citas', coalesce(
                                            (select jsonb_agg(jsonb_build_object(
-                                                     'evidenciaTitulo', e2.titulo,
-                                                     -- El pasaje SÓLO si el documento sigue
-                                                     -- pudiendo citarse. Ver «citable».
-                                                     'fragmento', case when evidencia_usable(
-                                                         (x ->> 'evidenciaId')::uuid,
-                                                         p2.workspace_id, 'cliente')
-                                                       then x ->> 'fragmento' end,
-                                                     'localizacion', case when evidencia_usable(
-                                                         (x ->> 'evidenciaId')::uuid,
-                                                         p2.workspace_id, 'cliente')
-                                                       then x ->> 'localizacion' end,
-                                                     'citable', evidencia_usable(
-                                                       (x ->> 'evidenciaId')::uuid,
-                                                       p2.workspace_id, 'cliente'))
-                                                   order by ord)
-                                              from propuesta_ai p2
-                                              cross join lateral jsonb_array_elements(
-                                                coalesce(p2.contenido -> 'hallazgos' -> h.orden
-                                                           -> 'citas', '[]'::jsonb))
-                                                with ordinality as t(x, ord)
-                                              left join evidencia e2
-                                                on e2.id = (x ->> 'evidenciaId')::uuid
-                                               and e2.workspace_id = p2.workspace_id
-                                             where p2.id = r.propuesta_ai_id
-                                               and p2.workspace_id = r.workspace_id
+                                                     'evidenciaTitulo', cp.evidencia_titulo,
+                                                     'fragmento', cp.fragmento,
+                                                     'localizacion', cp.localizacion,
+                                                     'citable', cp.citable)
+                                                   order by cp.ord)
+                                              from citas_de_hallazgo_en_propuesta(
+                                                     r.propuesta_ai_id, r.workspace_id, h.orden) cp
                                                -- Y SOLO LAS QUE SIGUEN ENLAZADAS. El contenido
                                                -- es inmutable (SYS-17) y por eso guarda el
                                                -- pasaje, pero no es la lista viva: quitar una
@@ -642,12 +637,10 @@ export async function gobernanzaDeProyecto(
                                                -- este cruce, el pasaje retirado se seguía
                                                -- enseñando como sostén actual delante de quien
                                                -- firma el pasa/muere.
-                                               and exists (
-                                                 select 1 from hallazgo_simulado_evidencia hv
-                                                  where hv.hallazgo_id = h.id
-                                                    and hv.workspace_id = h.workspace_id
-                                                    and hv.evidencia_id
-                                                          = (x ->> 'evidenciaId')::uuid)),
+                                             where exists (
+                                               select 1 from citas_materializadas_del_hallazgo(
+                                                             h.id, h.workspace_id) hv
+                                                where hv.evidencia_id = cp.evidencia_id)),
                                            -- Y la escrita a mano (SYS-21), que no tiene
                                            -- propuesta detrás: el enlace es todo lo que hay, y
                                            -- por eso el enlace GUARDA el pasaje. Antes esta
@@ -656,26 +649,18 @@ export async function gobernanzaDeProyecto(
                                            -- cuanto se refrescaba: lo contrastable, que es para
                                            -- lo que existe una cita, se borraba solo.
                                            --
-                                           -- Con la misma puerta que la otra rama: el pasaje
-                                           -- sólo si el documento sigue pudiendo citarse.
+                                           -- Por la MISMA función que el cruce de arriba, que
+                                           -- es la que recorta: dos ramas y una sola redacción
+                                           -- de «el pasaje sólo si el documento sigue pudiendo
+                                           -- citarse».
                                            (select jsonb_agg(jsonb_build_object(
-                                                     'evidenciaTitulo', e.titulo,
-                                                     'fragmento', case when evidencia_usable(
-                                                         he.evidencia_id, he.workspace_id,
-                                                         'cliente')
-                                                       then he.fragmento end,
-                                                     'localizacion', case when evidencia_usable(
-                                                         he.evidencia_id, he.workspace_id,
-                                                         'cliente')
-                                                       then he.localizacion end,
-                                                     'citable', evidencia_usable(
-                                                       he.evidencia_id, he.workspace_id, 'cliente'))
-                                                   order by e.titulo)
-                                              from hallazgo_simulado_evidencia he
-                                              join evidencia e on e.id = he.evidencia_id
-                                               and e.workspace_id = he.workspace_id
-                                             where he.hallazgo_id = h.id
-                                               and he.workspace_id = h.workspace_id),
+                                                     'evidenciaTitulo', hm.evidencia_titulo,
+                                                     'fragmento', hm.fragmento,
+                                                     'localizacion', hm.localizacion,
+                                                     'citable', hm.citable)
+                                                   order by hm.evidencia_titulo)
+                                              from citas_materializadas_del_hallazgo(
+                                                     h.id, h.workspace_id) hm),
                                            '[]'::jsonb))
                                        order by h.orden)
                                 from hallazgo_simulado h

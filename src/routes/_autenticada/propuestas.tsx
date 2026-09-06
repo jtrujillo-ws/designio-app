@@ -1097,11 +1097,37 @@ function FormularioConsentimiento({
  * COLUMNA de ancla lo que variaba por capacidad. Lo que se presenta es el CONTENIDO, y el
  * contenido lo declara la capacidad.
  */
+/**
+ * Cómo se busca la etiqueta de un id que sale del CONTENIDO, y por qué no es un mapa.
+ *
+ * Las claves del mapa salen de la base, en minúscula. Los ids del contenido no tienen por qué
+ * estarlo: el contrato canoniza al PARSEAR, pero por la superficie concedida entra un uuid en
+ * mayúscula y los guards lo admiten desde que comparan con «lower()». Con la clave cruda la
+ * búsqueda falla en silencio y la ficha dice «ya no está en el reto» de un objeto que sí está
+ * — delante de quien decide si acepta la propuesta.
+ *
+ * Era un `Record` y se indexaba en OCHO sitios: la evidencia de una cita (dos veces), el nodo
+ * del grafo, el criterio de C6, el arquetipo de C4, la evidencia de una cita de C4, el elemento
+ * de C7 y el insight de C3. Arreglar el que se reportó habría dejado siete escrituras de la
+ * misma regla y la octava para la ficha que llegue mañana. Pasa a ser una LECTURA: el
+ * compilador ya no deja indexar, así que la canonización no se puede saltar.
+ *
+ * Es la quinta ronda de esta misma familia en este PR —el id de la lente en cuatro guards, la
+ * corrección de una lente guardada en mayúscula, el id de evidencia en el lector del panel, y
+ * ahora las etiquetas—, y todas dicen lo mismo: un IDENTIFICADOR se compara canónicamente, y
+ * quien lo compare tiene que ser uno.
+ */
+type LeerEtiqueta = (id: string) => string | undefined;
+const leerEtiqueta =
+  (etiquetas: Record<string, string>): LeerEtiqueta =>
+  (id) =>
+    etiquetas[id.toLowerCase()];
+
 const PRESENTACION_POR_CAPACIDAD: Record<
   CapacidadActiva,
   {
     rotulo: string;
-    ficha: (contenido: ContenidoPropuesta, etiquetas: Record<string, string>) => ReactNode;
+    ficha: (contenido: ContenidoPropuesta, etiquetas: LeerEtiqueta) => ReactNode;
     /**
      * Qué se le dice a quien lee un informe que NO materializa nada, y por qué está aquí y no
      * escrito una vez junto al botón que falta.
@@ -1482,7 +1508,7 @@ function TarjetaPropuesta({
         Alcance: {propuesta.anclaTitulo}
       </span>
 
-      {presentacion.ficha(propuesta.contenido, propuesta.etiquetas)}
+      {presentacion.ficha(propuesta.contenido, leerEtiqueta(propuesta.etiquetas))}
 
       {propuesta.citas.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -1652,7 +1678,7 @@ function FichaInsight({
   etiquetas,
 }: {
   contenido: ContenidoInsight;
-  etiquetas: Record<string, string>;
+  etiquetas: LeerEtiqueta;
 }) {
   return (
     <div
@@ -1687,7 +1713,7 @@ function FichaInsight({
               key={String(j)}
               rotulo="Cita"
               valor={`«${c.fragmento}» · ${c.localizacion} · ${
-                etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+                etiquetas(c.evidenciaId) ?? `evidencia ${c.evidenciaId} (ya no está)`
               }`}
             />
           ))}
@@ -1700,7 +1726,7 @@ function FichaInsight({
               key={String(i)}
               rotulo={`Contradicción ${i + 1}`}
               valor={`${c.descripcion} · ${
-                etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+                etiquetas(c.evidenciaId) ?? `evidencia ${c.evidenciaId} (ya no está)`
               }`}
             />
           ))}
@@ -1970,7 +1996,7 @@ function FichaRemediacionJourney({
   etiquetas,
 }: {
   contenido: ContenidoRemediacionJourney;
-  etiquetas: Record<string, string>;
+  etiquetas: LeerEtiqueta;
 }) {
   return (
     <div
@@ -2008,7 +2034,7 @@ function FichaRemediacionJourney({
             */}
             <Dato
               rotulo={`Señal ${i + 1} · ${r.codigo}`}
-              valor={etiquetas[r.nodoId] ?? `nodo ${r.nodoId} (ya no está en el grafo)`}
+              valor={etiquetas(r.nodoId) ?? `nodo ${r.nodoId} (ya no está en el grafo)`}
             />
             <Dato rotulo="Cómo cerrarla" valor={r.comoCerrarlo} />
           </div>
@@ -2175,7 +2201,7 @@ function FichaEntradaKpi({
   etiquetas,
 }: {
   contenido: ContenidoEntradaKpi;
-  etiquetas: Record<string, string>;
+  etiquetas: LeerEtiqueta;
 }) {
   return (
     <div
@@ -2194,7 +2220,7 @@ function FichaEntradaKpi({
         // El KPI del criterio, no su uuid: quien revisa tiene que poder decir si este
         // indicador mide ESA promesa, y para eso hay que leer la promesa.
         valor={
-          etiquetas[contenido.criterioId] ??
+          etiquetas(contenido.criterioId) ??
           `criterio ${contenido.criterioId} (ya no está)`
         }
       />
@@ -2281,7 +2307,7 @@ function FichaRevision({
   etiquetas,
 }: {
   contenido: ContenidoRevisionSimulada;
-  etiquetas: Record<string, string>;
+  etiquetas: LeerEtiqueta;
 }) {
   return (
     <div
@@ -2307,7 +2333,7 @@ function FichaRevision({
       <Dato
         rotulo="Arquetipo que revisa"
         valor={
-          etiquetas[contenido.arquetipoId] ??
+          etiquetas(contenido.arquetipoId) ??
           `arquetipo ${contenido.arquetipoId} (ya no está en el reto)`
         }
       />
@@ -2332,7 +2358,7 @@ function FichaRevision({
                 key={String(j)}
                 rotulo="Cita"
                 valor={`«${c.fragmento}» · ${c.localizacion} · ${
-                  etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+                  etiquetas(c.evidenciaId) ?? `evidencia ${c.evidenciaId} (ya no está)`
                 }`}
               />
             ))}
@@ -2364,7 +2390,7 @@ function FichaPostMortem({
   etiquetas,
 }: {
   contenido: ContenidoPostMortem;
-  etiquetas: Record<string, string>;
+  etiquetas: LeerEtiqueta;
 }) {
   return (
     <div
@@ -2403,7 +2429,7 @@ function FichaPostMortem({
               key={d.elementoId}
               /* El nombre del elemento si el panel lo trae; su id si no. Un uuid a secas no le
                * dice nada a quien revisa, y esa traducción la hace `etiquetasDelContenido`. */
-              rotulo={etiquetas[d.elementoId] ?? d.elementoId}
+              rotulo={etiquetas(d.elementoId) ?? d.elementoId}
               valor={d.lectura}
             />
           ))}
@@ -2422,7 +2448,7 @@ function FichaOportunidad({
   etiquetas,
 }: {
   contenido: ContenidoOportunidad;
-  etiquetas: Record<string, string>;
+  etiquetas: LeerEtiqueta;
 }) {
   return (
     <div
@@ -2454,7 +2480,7 @@ function FichaOportunidad({
             // se copia, no parte de lo copiado. Y si ya no está, se dice con su id — que es lo
             // único que queda.
             rotulo="Se apoya en"
-            valor={etiquetas[g.insightId] ?? `insight ${g.insightId} (ya no está)`}
+            valor={etiquetas(g.insightId) ?? `insight ${g.insightId} (ya no está)`}
           />
           {g.citas.map((c, j) => (
             <Dato key={String(j)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />

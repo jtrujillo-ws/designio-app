@@ -10121,6 +10121,129 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         await conUsuario(stakeId, (tx) => tx`select titulo from hallazgo_simulado
           where revision_id = ${revisionId}`),
       ).toHaveLength(1);
+
+      /*
+       * Y LA PROCEDENCIA SOBREVIVE AL RECORTE, que es la otra mitad de la misma regla y por
+       * poco se pierde con el arreglo de arriba.
+       *
+       * La proyección de gobernanza ya recortaba el pasaje —«fragmento» nulo y «citable»
+       * false— y entregaba la cita IGUAL, porque quien firma un pasa/muere tiene que poder ver
+       * que ese hallazgo se apoyaba en un documento que hoy está bloqueado. Esconder la cita
+       * ENTERA dice otra cosa: que el hallazgo nunca tuvo sostén.
+       *
+       * Con la política nueva, el `exists` contra la tabla de pasajes se evalúa bajo la RLS de
+       * quien lee, así que para el mismo lector devolvía falso y la cita desaparecía. El
+       * recorte tiene que quitar el TEXTO, no la existencia del enlace.
+       */
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4RLS', 'Proyecto de la revisión', ${curadorId})
+        returning id`;
+      for (const [quien, etiqueta] of [
+        [curadorId, 'la boutique'],
+        [stakeId, 'quien perdió el derecho'],
+      ] as const) {
+        const g = await gobernanzaDeProyecto(quien, wsC, proy!.id as string);
+        const cita = g!.conceptos
+          .flatMap((c) => c.revisiones)
+          .find((r) => r.id === revisionId)?.hallazgos[0]?.citas[0];
+        expect(
+          cita,
+          `${etiqueta} ya no ve que el hallazgo se apoyaba en un documento: la cita desapareció en vez de recortarse`,
+        ).toBeTruthy();
+        expect(cita!.citable, `${etiqueta} recibe la cita sin marcarla bloqueada`).toBe(false);
+        expect(cita!.fragmento, `${etiqueta} sigue recibiendo el pasaje recortado`).toBeNull();
+        // Y el TÍTULO del documento sigue llegando: es su identidad, no su material.
+        expect(cita!.evidenciaTitulo).toBeTruthy();
+      }
+    });
+  });
+
+  /**
+   * Y EL PASAJE VIVE TAMBIÉN EN LA PROPUESTA, que es la otra copia del mismo texto.
+   *
+   * Cerrar el enlace dejaba la mitad abierta: `propuesta_ai.contenido` guarda el `fragmento`
+   * LITERAL de cada cita, y su política autorizaba por membresía a secas. Quien perdía el
+   * derecho de uso seguía leyendo el pasaje directamente de la propuesta —que además es
+   * inmutable por SYS-17, así que no se puede limpiar después—.
+   *
+   * No se puede recortar una COLUMNA con RLS, así que la propuesta se cierra por FILA a quien
+   * trabaja con ella. Y se puede porque su único lector fuera del panel es la proyección de
+   * gobernanza, que pasa por las dos funciones recortadoras: no se esconde nada que alguien
+   * tuviera que ver, y eso es lo que mide la sonda de arriba.
+   *
+   * La regla no es de C4: el `fragmento` de C2 vive igual en su contenido. Por eso se afirma
+   * además que la política no nombra ninguna capacidad — una puerta escrita para una capacidad
+   * es exactamente lo que este fichero lleva pagando cuatro veces.
+   */
+  it('C4: el contenido de una propuesta no se lee sin permiso sobre el material', async () => {
+    await enWorkspaceLimpio('c4-propuesta-por-rol', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const correo = `${marca}-c4-propuesta-stake@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${correo}, 'Sponsor del cliente', 'activo') returning id`;
+      const stakeId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${stakeId}, 'Sponsor del cliente', ${correo}, 'stakeholder')`;
+
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura de este perfil.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const pasajeEnPropuesta = (quien: string) =>
+        conUsuario(quien, (tx) => tx`select contenido #>> '{hallazgos,0,citas,0,fragmento}' as f
+          from propuesta_ai where workspace_id = ${wsC} and capacidad = 'C4'`);
+
+      // Quien cura lo ve: es su mesa de trabajo, y sin esto el panel entero se quedaría vacío.
+      expect((await pasajeEnPropuesta(curadorId)).map((r) => r.f)).toEqual(['No entrego la cédula']);
+      // Y quien no trabaja con propuestas no las lee, tenga o no el derecho sobre el documento:
+      // el pasaje literal está dentro, y una columna no se recorta con RLS.
+      expect(
+        await pasajeEnPropuesta(stakeId),
+        'el pasaje literal de la propuesta se lee sin permiso sobre el material que copia',
+      ).toHaveLength(0);
+
+      // Y la puerta no está escrita para una capacidad: el `fragmento` de C2 vive igual en su
+      // contenido, y una regla escrita para C4 dejaría a las demás fuera sin decirlo.
+      const [pol] = await admin`select pg_get_expr(polqual, polrelid) as expr from pg_policy
+        where polrelid = 'propuesta_ai'::regclass and polname = 'propuesta_select'`;
+      expect(
+        pol!.expr as string,
+        'la política de lectura de propuestas nombra una capacidad: las demás quedan fuera de la regla',
+      ).not.toMatch(/capacidad/i);
     });
   });
 

@@ -26,6 +26,7 @@ import {
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoOportunidad,
+  type ContenidoPostMortem,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
@@ -33,11 +34,13 @@ import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   criteriosQueLlegaronConLasOportunidades,
   evidenciaQueLlegoAlModelo,
+  materialDePostMortem,
   MAX_MATERIAL,
 } from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
+  huellaDelMaterialDelPostMortem,
   huellaDelMaterialDelRegistry,
   generarPropuestas,
   panelPropuestas,
@@ -236,6 +239,25 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     } satisfies ContenidoRemediacionJourney,
     /* Igual que CT y C2: se resuelve tarde porque el criterio se crea en el `beforeAll`, y su
      * id tiene que ser REAL — el guard exige que el criterio sea del reto del registry. */
+    /*
+     * C7 sin desviaciones por omisión, y eso es una respuesta y no un hueco: cada desviación
+     * tiene que señalar un elemento que estaba en la conciliación de SU reto —el servicio lo
+     * comprueba antes de guardar—, así que un fixture con un id inventado haría fallar toda
+     * propuesta de C7 que no lo pisara. Quien necesite desviaciones las compone con los ids
+     * del tablero de su reto.
+     *
+     * La lista vacía es además un caso legítimo del dominio: un reto cuyos elementos quedaron
+     * todos «como aprobado» no tiene desviaciones que contar.
+     */
+    C7: {
+      contribucion: 'La verificación diferida coincide con la caída del abandono en la ventana.',
+      factoresExternos: '',
+      hipotesisAbiertas: '',
+      aprendizajes: 'Lo aprobado sin release asignado no llega, por bueno que sea el diseño.',
+      desviaciones: [],
+      citas: [{ fragmento: 'LECTURA DE CADA CRITERIO', localizacion: 'cabecera del expediente' }],
+      confianzaPropuesta: 'media',
+    } satisfies ContenidoPostMortem,
     get C6() {
       return CONTENIDO_C6(criterioDelRegistryId);
     },
@@ -726,6 +748,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // un `miembro_usuario_id_fkey` al final, que no dice nada de dónde está.
       await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      /* Y el post mortem, que es el quinto objeto sellado — y el único cuyo sello apunta a una
+       * propuesta que NO lo creó, porque la fila ya existía. La FK es la misma. */
+      await admin`update outcome_review set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -736,12 +761,45 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from entrada_kpi where workspace_id = ${wsL}`;
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from derecho_uso where workspace_id = ${wsL}`;
+      /* El post mortem y sus lecturas cuelgan de los criterios, así que van delante. */
+      await admin`delete from resultado_criterio where workspace_id = ${wsL}`;
+      await admin`delete from outcome_review where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
       // Y la oportunidad con su traza, que es el QUINTO destino y llega con C3. Va aquí y no
       // más abajo porque apunta a los dos lados: su traza cuelga de `insight` —que se borra
       // justo debajo— y ella misma del `reto`, que se borra al final.
       await admin`delete from oportunidad_insight where workspace_id = ${wsL}`;
       await admin`delete from oportunidad where workspace_id = ${wsL}`;
+      /*
+       * El expediente del post mortem, de dentro afuera: las constataciones cuelgan del
+       * effective state y del elemento, el effective state del release, y el review del reto,
+       * que se borra al final. Sin esto, el reto no se puede borrar y el workspace se queda
+       * colgado — que es exactamente lo que dijo la primera vuelta de las sondas de C7.
+       */
+      await admin`delete from constatacion where workspace_id = ${wsL}`;
+      await admin`delete from effective_state where workspace_id = ${wsL}`;
+
+      /*
+       * Los elementos y su design version, en LA MISMA transacción. Aprobar los congela
+       * («la design version se aprobó mientras se editaban sus elementos», SYS-05) y ese guard
+       * corre también para el propietario; desaprobar no es salida, porque la transición
+       * aprobada → borrador es ilegal.
+       *
+       * La salida es que ese guard es un constraint trigger DIFERIDO: lee el estado de la
+       * design version AL COMMIT. Borrando las dos cosas juntas, cuando mira ya no hay
+       * versión que consultar y se aparta —que es la respuesta correcta, porque lo que
+       * protege es un congelado que a esas alturas no existe—.
+       *
+       * Y el plan de releases va dentro por lo mismo, con su propia versión del argumento: «ese
+       * release ya salió: su alcance es fijo» protege el alcance de un release desplegado, y en
+       * la misma transacción el release tampoco queda.
+       */
+      await admin.begin(async (tx) => {
+        await tx`delete from release_elemento where workspace_id = ${wsL}`;
+        await tx`delete from release where workspace_id = ${wsL}`;
+        await tx`delete from elemento_cambio where workspace_id = ${wsL}`;
+        await tx`delete from design_version where workspace_id = ${wsL}`;
+      });
       await admin`delete from cita where workspace_id = ${wsL}`;
       await admin`delete from contradiccion where workspace_id = ${wsL}`;
       await admin`delete from afirmacion where workspace_id = ${wsL}`;
@@ -5441,14 +5499,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      // C1 y C7 hacen aquí el papel que hacían C3 y C4 antes de activarse: una capacidad del
-      // catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra —y
-      // el día que no quede ninguna inactiva, este caso se retira en vez de fingirse.
+      // C1 y C4 hacen aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad
+      // del catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra
+      // —y el día que no quede ninguna inactiva, este caso se retira en vez de fingirse. C7
+      // salió de aquí al activarse, y su relevo fue C4, que es como esta rotación se hace.
       expect(await motivoDe('C1', { reto_id: retoId })).toBeNull();
       expect(await motivoDe('C1', { item_id: item })).toBeNull();
       expect(await motivoDe('C4', {})).toBeNull();
       // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
-      expect(await motivoDe('C7', { gate_id: gateId })).toBeNull();
+      expect(await motivoDe('C4', { gate_id: gateId })).toBeNull();
 
       // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
       // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
@@ -5465,6 +5524,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
       expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
       expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
+      // C7 responde solo con los suyos. Sin ancla, la rama no encuentra post mortem y contesta
+      // «cerrado», que es la respuesta correcta para una fila que no señala ninguno.
+      const DE_C7 = ['disponible', 'post-mortem-cerrado'];
+      expect(DE_C7).toContain(await motivoDe('C7', {}));
       // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
       expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', { item_id: item }));
       // Ni el de CT uno de los otros dos: el ancla nueva entró por el mismo sitio por donde
@@ -6421,6 +6484,593 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * escriba lo que el guard exige. Las sondas miden el SUELO —que por SQL crudo no se pueda
    * mentir—; ésta mide que el camino de producción no se caiga contra su propio suelo.
    */
+  /**
+   * Un post mortem con EXPEDIENTE: el tablero de conciliación de una design version y la
+   * lectura de un criterio. Es lo mínimo que C7 necesita para tener algo que leer.
+   *
+   * Se monta con el propietario y no por el camino del producto a propósito: llegar hasta aquí
+   * por la app son siete gates, un registry firmado y una ventana de medición cerrada, y eso ya
+   * lo prueban los casos de CTX-05 y CTX-06. Lo que estos casos miden es C7 sobre un expediente
+   * REAL —filas de verdad, leídas por las mismas funciones que lee el tablero de G7—, no cómo
+   * se llega a tenerlo.
+   */
+  async function postMortemConExpediente(
+    wsC: string,
+    retoC: string,
+    servicioC: string,
+    actorId: string,
+    opciones: { desviado?: boolean } = {},
+  ): Promise<{ reviewId: string; elementoId: string; criterioId: string }> {
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${wsC}, ${retoC}, 'P-C7', 'Proyecto del post mortem', 'activo', 'rapido', ${actorId})
+      returning id`;
+    const proyectoId = p!.id as string;
+    /*
+     * Aprobar es INSEPARABLE de congelar: el CHECK de la tabla no admite `aprobada` sin
+     * snapshot, aprobador y fecha (RF-06.3). Así que la versión nace borrador y se aprueba
+     * después con su snapshot, que es también el orden real.
+     */
+    const [jr] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, descripcion, creado_por)
+      values (${wsC}, ${servicioC}, 'to-be', 'Journey del post mortem',
+              'El recorrido que la design version cambia', ${actorId}) returning id`;
+    const [dv] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, titulo, resumen, creado_por)
+      values (${wsC}, ${proyectoId}, ${servicioC}, ${jr!.id as string}, 'Verificación asistida',
+              'Resuelve la verificación dentro de la app', ${actorId}) returning id`;
+    const dvId = dv!.id as string;
+    const [el] = await admin`insert into elemento_cambio
+      (workspace_id, design_version_id, tipo, operacion, titulo, detalle, orden, creado_por)
+      values (${wsC}, ${dvId}, 'touchpoint', 'agrega', 'Verificación en video',
+              'Sustituye la carga del documento', 0, ${actorId}) returning id`;
+    const elementoId = el!.id as string;
+    /*
+     * Y ahora sí la aprobación, con dos condiciones que el guard impone y que valen la pena
+     * decir porque las dos costaron una vuelta: una design version no se aprueba SIN
+     * ELEMENTOS —de ahí que esto vaya detrás del elemento— y «aprobar congela el to-be de
+     * AHORA», así que el snapshot tiene que tomarse en la MISMA transición. De ahí el CTE: en
+     * dos sentencias son dos transacciones y el guard lo ve.
+     */
+    await admin`
+      with s as (
+        insert into journey_snapshot
+          (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${wsC}, ${jr!.id as string}, 'Aprobación de la DV del post mortem',
+                jsonb_build_object('nodos', '[]'::jsonb, 'aristas', '[]'::jsonb), ${actorId})
+        returning id
+      )
+      update design_version
+      set estado = 'aprobada', snapshot_id = (select id from s), aprobada_por = ${actorId},
+          aprobada_en = now()
+      where id = ${dvId}`;
+    /*
+     * El release nace PLANIFICADO y se despliega después, que es el orden real y el único que
+     * la base admite: «ese release ya salió: su alcance es fijo» (SYS-06) impide asignarle
+     * elementos una vez desplegado. Crearlo ya verificado era mi atajo, y el guard lo dijo.
+     */
+    const [rl] = await admin`insert into release
+      (workspace_id, design_version_id, titulo, responsable, fecha_objetivo, creado_por)
+      values (${wsC}, ${dvId}, 'Verificación en la app', 'Equipo de canales', '2026-08-10',
+              ${actorId}) returning id`;
+    const releaseId = rl!.id as string;
+    await admin`insert into release_elemento (elemento_id, release_id, workspace_id, creado_por)
+      values (${elementoId}, ${releaseId}, ${wsC}, ${actorId})`;
+    await admin`update release set estado = 'desplegado', desplegado_en = '2026-08-10'
+      where id = ${releaseId}`;
+    /*
+     * Y la constatación ANTES de verificar: «verificar exige constatar TODOS los elementos del
+     * release» (RF-06.6). El orden del método es desplegar → constatar → verificar, y la base
+     * no admite otro — que es justo lo que hace fiable al tablero que C7 lee.
+     */
+    const [es] = await admin`insert into effective_state
+      (workspace_id, servicio_id, release_id, resumen, constatado_por, constatado_en)
+      values (${wsC}, ${servicioC}, ${releaseId}, 'Opera desde el 10 de agosto',
+              ${actorId}, '2026-08-20') returning id`;
+    const desviado = opciones.desviado ?? true;
+    await admin`insert into constatacion
+      (workspace_id, effective_state_id, elemento_id, resultado, que_quedo_distinto, razon,
+       creado_por)
+      values (${wsC}, ${es!.id as string}, ${elementoId},
+              ${desviado ? 'desviado' : 'como-aprobado'},
+              ${desviado ? 'Salió sin el aviso previo' : ''},
+              ${desviado ? 'El proveedor de video no lo soportaba a tiempo' : ''},
+              ${actorId})`;
+    await admin`update release set estado = 'verificado' where id = ${releaseId}`;
+    const criterioId = await criterioDelReto(wsC, retoC, actorId);
+    const [rev] = await admin`insert into outcome_review
+      (workspace_id, reto_id, estado, creado_por)
+      values (${wsC}, ${retoC}, 'borrador', ${actorId}) returning id`;
+    const reviewId = rev!.id as string;
+    await admin`insert into resultado_criterio
+      (workspace_id, review_id, criterio_id, sin_datos_motivo)
+      values (${wsC}, ${reviewId}, ${criterioId},
+              'La serie del proveedor se cortó en agosto y no hay lectura final')`;
+    return { reviewId, elementoId, criterioId };
+  }
+
+  /**
+   * C7 por el camino real: el material sale de las MISMAS funciones que dibujan el tablero de
+   * G7, y aceptar escribe los cuatro campos narrativos del post mortem que ya existía.
+   *
+   * Lo que este caso sujeta y no sujetaba ninguna otra capacidad: que el ancla y el objeto sean
+   * la misma fila. No nace nada al aceptar — se EDITA—, así que se comprueba por el otro lado:
+   * los cuatro campos dicen lo que decía la propuesta, el sello de procedencia queda puesto, y
+   * lo que C7 no propone —el veredicto y la casilla del diseño experimental— sigue intacto.
+   */
+  it('C7 redacta el post mortem sobre el tablero, y aceptar escribe SOLO su narrativa', async () => {
+    await enWorkspaceLimpio('c7-camino-real', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId, elementoId } = await postMortemConExpediente(
+        wsC,
+        retoC,
+        servicioId,
+        curadorId,
+      );
+      // El post mortem trae ya un veredicto puesto a mano: C7 no lo toca, y esa es la mitad
+      // que hay que medir — el dictamen lo firma quien cierra (RF-07.8).
+      await sqlAdmin()`update outcome_review
+        set veredicto = 'parcialmente-logrado', diseno_experimental_suficiente = true,
+            diseno_experimental_justificacion = 'Hubo grupo de control en dos sucursales'
+        where id = ${reviewId}`;
+
+      const propuesta = {
+        contribucion:
+          'La verificación en video salió en agosto; la serie del criterio se cortó ese mismo mes.',
+        factoresExternos: 'El proveedor de video no soportaba el aviso previo a tiempo.',
+        hipotesisAbiertas: 'Queda sin saber si el aviso previo habría movido la lectura.',
+        aprendizajes: 'Lo que depende de un tercero se planifica con su calendario, no con el nuestro.',
+        desviaciones: [
+          {
+            elementoId,
+            lectura: 'Salió sin el aviso previo, que era la mitad de lo que el elemento prometía.',
+          },
+        ],
+        citas: [
+          { fragmento: 'Salió sin el aviso previo', localizacion: 'conciliación del elemento' },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+      await conProveedor(
+        {
+          ok: true,
+          datos: propuesta as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C7',
+            anclaId: reviewId,
+          }),
+      );
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C7');
+      expect(p, 'la propuesta de C7 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('outcome-review');
+      expect(p!.anclaEstado).toBe('disponible');
+      // La cita se copió del tablero, así que se mide presente contra el material real.
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      // El rastro ANTES de aceptar: el expediente se montó escribiendo en el review —el
+      // veredicto a mano, más arriba—, así que contar desde cero mediría la sonda y no la
+      // aceptación. Lo que se mide es el DELTA.
+      const [antesDeAceptar] = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'OutcomeReviewEditado'`);
+      const edicionesAntes = antesDeAceptar!.n as number;
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+      // El objeto ES el ancla: no nació ninguna fila.
+      expect(objetoId).toBe(reviewId);
+
+      const [rev] = await conUsuario(curadorId, (tx) => tx`
+        select contribucion, factores_externos, hipotesis_abiertas, aprendizajes, veredicto,
+               diseno_experimental_suficiente, diseno_experimental_justificacion, propuesta_ai_id
+        from outcome_review where id = ${reviewId}`);
+      expect(rev!.contribucion).toBe(propuesta.contribucion);
+      expect(rev!.factores_externos).toBe(propuesta.factoresExternos);
+      expect(rev!.hipotesis_abiertas).toBe(propuesta.hipotesisAbiertas);
+      expect(rev!.aprendizajes).toBe(propuesta.aprendizajes);
+      // Y lo que C7 NO propone sigue como estaba: el veredicto y la casilla causal son de quien
+      // firma, y aceptar un borrador no los toca ni para ponerlos ni para borrarlos.
+      expect(rev!.veredicto).toBe('parcialmente-logrado');
+      expect(rev!.diseno_experimental_suficiente).toBe(true);
+      expect(rev!.diseno_experimental_justificacion).toBe('Hubo grupo de control en dos sucursales');
+      // El sello lo escribe el guard: la columna está fuera del grant de la aplicación.
+      expect(rev!.propuesta_ai_id).toBe(p!.id);
+
+      /*
+       * Y el RASTRO cuenta UNA escritura, no dos.
+       *
+       * La aceptación escribe la narrativa —`OutcomeReviewEditado`, correcto— y después el
+       * guard diferido le escribe su `propuesta_ai_id`, que no es un campo de la narrativa.
+       * Ese segundo UPDATE dejaba otro `OutcomeReviewEditado` con el «antes» idéntico al
+       * «después»: una edición que nadie hizo, apuntada en el rastro de la pieza de la que sale
+       * el veredicto de un reto. Es el mismo caso que C6 ya había curado en la rama de al lado.
+       */
+      const eventos = await conUsuario(curadorId, (tx) => tx`
+        select payload from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'OutcomeReviewEditado'
+        order by creado_en`);
+      expect(
+        eventos.length - edicionesAntes,
+        'la aceptación de C7 dejó más de una edición en el rastro',
+      ).toBe(1);
+      expect(eventos.at(-1)!.payload).toMatchObject({ contribucion: propuesta.contribucion });
+    });
+  });
+
+  /**
+   * Los ELEMENTOS que señala una desviación no se corrigen; su lectura sí.
+   *
+   * La distinción no es de estilo. La `lectura` es lo que el modelo dice, y revisarla es
+   * exactamente para lo que está quien revisa. El `elementoId` no dice nada: APUNTA a una fila
+   * del tablero determinista, y esa correspondencia se comprobó una sola vez, al generar,
+   * contra el material de entonces. La corrección llega después y por otra puerta —la frontera
+   * solo exige que cada id sea un uuid—, así que un cliente que no fuera el formulario de la
+   * casa podía reapuntar la desviación a cualquier elemento y sellarlo como contenido aceptado.
+   *
+   * Se mide en los dos sentidos, que es lo que distingue «los ids están blindados» de «C7 no
+   * admite correcciones»: cambiar el TEXTO de la lectura pasa.
+   */
+  it('C7 no deja reapuntar una desviación al corregir, y sí reescribir su lectura', async () => {
+    await enWorkspaceLimpio(
+      'c7-desviacion-testimonio',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        const original = {
+          contribucion: 'El servicio movió la aguja a medias.',
+          factoresExternos: '',
+          hipotesisAbiertas: '',
+          aprendizajes: 'Conviene constatar antes de verificar.',
+          desviaciones: [{ elementoId, lectura: 'Salió sin el aviso previo.' }],
+          citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+          confianzaPropuesta: 'media' as const,
+        };
+        const pedir = async () => {
+          await conProveedor(
+            { ok: true, datos: original, intentos: [intento({ uso: null })] },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          );
+          const panel = await panelPropuestas(curadorId, wsC);
+          return panel.pendientes.find((x) => x.capacidad === 'C7')!.id;
+        };
+
+        const primera = await pedir();
+        await expect(
+          aceptarPropuesta(curadorId, {
+            workspaceId: wsC,
+            propuestaId: primera,
+            correccion: {
+              ...original,
+              // Un uuid con forma buena que NO es el elemento del tablero.
+              desviaciones: [
+                { elementoId: '00000000-0000-4000-8000-0000000c4c4c', lectura: 'Lo mismo.' },
+              ],
+            },
+          }),
+        ).rejects.toThrow(/no se corrigen/i);
+
+        // Y el otro sentido: la LECTURA sí se reescribe, que es para lo que está la revisión.
+        const { objetoId } = await aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId: primera,
+          correccion: {
+            ...original,
+            desviaciones: [
+              { elementoId, lectura: 'Salió sin el aviso previo, y eso costó dos semanas.' },
+            ],
+          },
+        });
+        expect(objetoId).toBe(reviewId);
+      },
+    );
+  });
+
+  /**
+   * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
+   *
+   * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el
+   * contenido— así que si no lo comprueba el servicio no lo comprueba nadie. Y lo que se evita
+   * es de las averías caras: mandar a alguien a revisar un release que estaba bien, con la
+   * firma de un post mortem detrás.
+   */
+  it('C7 no guarda un borrador que señale un elemento fuera de la conciliación', async () => {
+    await enWorkspaceLimpio('c7-elemento-ajeno', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              contribucion: 'Algo se movió.',
+              factoresExternos: '',
+              hipotesisAbiertas: '',
+              aprendizajes: 'Algo se aprendió.',
+              desviaciones: [
+                {
+                  /* Un uuid con forma buena que el tablero no nombra. */
+                  elementoId: '00000000-0000-4000-8000-00000000c7c7',
+                  lectura: 'Este elemento no existe en la conciliación de este reto.',
+                },
+              ],
+              citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+              confianzaPropuesta: 'baja',
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: reviewId,
+            }),
+        ),
+      ).rejects.toThrow(/no está[n]? en el tablero|no admite como tales/i);
+    });
+  });
+
+  /**
+   * Y dos desviaciones sobre el MISMO elemento tumban la respuesta igual, aunque el elemento
+   * exista.
+   *
+   * Es el hueco que deja la sonda de arriba: la pertenencia al tablero se comprueba elemento a
+   * elemento, así que un id repetido la pasa dos veces. Lo que queda entonces es un borrador
+   * con dos lecturas del mismo hecho y nada que diga cuál vale —quien revisa no puede elegir, y
+   * el panel las pinta como dos filas con el mismo rótulo—.
+   *
+   * Se corta en el CONTRATO y no en el servicio, y ahí está la diferencia con el elemento
+   * ajeno: aquello necesita el material delante para saberse; esto se ve en la forma de la
+   * respuesta, sin consultar nada. Por eso lo rechaza el parseo, con el motivo genérico de una
+   * respuesta fuera de forma —el detalle va al diagnóstico, no a quien revisa—.
+   */
+  it('C7 no guarda un borrador que lea dos veces el mismo elemento', async () => {
+    await enWorkspaceLimpio('c7-elemento-repetido', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId, elementoId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              contribucion: 'Algo se movió.',
+              factoresExternos: '',
+              hipotesisAbiertas: '',
+              aprendizajes: 'Algo se aprendió.',
+              /* El MISMO elemento, y con dos lecturas distintas: si sólo se comparara la
+               * desviación entera, este par pasaría. La unidad es la fila del tablero. */
+              desviaciones: [
+                { elementoId, lectura: 'Quedó distinto y eso explica el resultado.' },
+                { elementoId, lectura: 'Quedó distinto y eso no explica nada.' },
+              ],
+              citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+              confianzaPropuesta: 'baja',
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: reviewId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+    });
+  });
+
+  /**
+   * Un DISEÑADOR no puede pedir C7, y el «no» llega antes de gastar.
+   *
+   * `outcome_review` es la única tabla de destino cuya política de escritura pide
+   * `lead-boutique` —las otras cinco admiten `disenador`—, así que la puerta uniforme de
+   * `rolCurador` dejaba a un diseñador apartar presupuesto, pagar la llamada y llegar a una
+   * propuesta que RLS no le dejaba aceptar nunca. El gasto ya hecho, y un 42501 por toda
+   * explicación.
+   *
+   * Se mide en los dos sentidos, que es lo que separa «C7 está acotada» de «este usuario no
+   * cura»: el mismo diseñador SÍ pasa la puerta de C2, y falla por otro sitio.
+   */
+  it('C7 la piden solo los lead: un diseñador no gasta en algo que no podría aceptar', async () => {
+    await enWorkspaceLimpio('c7-rol', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${`${marca}-c7-disenador@test.demo`}, 'Diseñador', 'activo') returning id`;
+      const disenadorId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${disenadorId}, 'Diseñador',
+                ${`${marca}-c7-disenador@test.demo`}, 'disenador')`;
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        generarPropuestas(disenadorId, { workspaceId: wsC, capacidad: 'C7', anclaId: reviewId }),
+      ).rejects.toThrow(/la pide y la acepta lead-boutique/i);
+      // Y el otro sentido: el mismo diseñador pasa la puerta del rol en C2. Sin esta mitad, un
+      // usuario mal montado —sin rol de curador— daría el mismo verde a la sonda de arriba.
+      await expect(
+        generarPropuestas(disenadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      ).rejects.not.toThrow(/la pide y la acepta/i);
+    });
+  });
+
+  /**
+   * La huella del material de C7 se toma sobre el EXPEDIENTE, no sobre su render recortado.
+   *
+   * Las otras capacidades huellan lo que se le manda al modelo, que ya viene cortado a
+   * `MAX_MATERIAL`, y para ellas responde a la pregunta buena. Aquí no: una narrativa de post
+   * mortem se firma CONTRA UN TABLERO, y el tablero es el objeto entero. Con la huella del
+   * texto, un criterio más allá del corte podía cambiar entre generar y aceptar sin disparar
+   * `conciliacion-cambiada`.
+   *
+   * La sonda empuja el corte a propósito: una descripción de reto más larga que `MAX_MATERIAL`
+   * se lleva por delante TODO lo que el render pone detrás —las lecturas y la conciliación—,
+   * así que mover una lectura no cambia ni un carácter del texto recortado. Si la huella
+   * saliera de ahí, esta comparación daría igual a igual.
+   */
+  it('la huella de C7 ve lo que el recorte del prompt deja fuera', async () => {
+    await enWorkspaceLimpio(
+      'c7-huella-recorte',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const { reviewId, criterioId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        await admin`update reto set descripcion = ${'x'.repeat(MAX_MATERIAL + 1000)}
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        const antes = await conUsuario(curadorId, (tx) =>
+          huellaDelMaterialDelPostMortem(tx, wsC, reviewId),
+        );
+        // El render, para dejar constancia de que el corte ocurre de verdad: si esto dejara de
+        // ser cierto la sonda seguiría pasando sin medir nada.
+        expect(materialDePostMortem(antes.expediente!).truncado).toBe(true);
+        const textoAntes = materialDePostMortem(antes.expediente!).texto;
+        await admin`update resultado_criterio
+          set sin_datos_motivo = 'La serie se recuperó y la lectura final llegó en septiembre'
+          where review_id = ${reviewId} and criterio_id = ${criterioId}`;
+        const despues = await conUsuario(curadorId, (tx) =>
+          huellaDelMaterialDelPostMortem(tx, wsC, reviewId),
+        );
+        // El texto NO se movió —lo que cambió cae detrás del corte— y la huella SÍ.
+        expect(materialDePostMortem(despues.expediente!).texto).toBe(textoAntes);
+        expect(despues.huella).not.toBe(antes.huella);
+      },
+    );
+  });
+
+  /**
+   * Un elemento que el tablero da por CONSTATADO no admite lectura de desviación.
+   *
+   * `constatado` significa que alguien lo miró y salió exactamente como se aprobó: el dato
+   * determinista ya dijo que ahí no hubo discrepancia. Señalarlo como desviación contradice al
+   * tablero en el mismo expediente donde el tablero está impreso, que es la tesis de C7 al
+   * revés — el post mortem se redacta SOBRE lo constatado, no contra ello.
+   *
+   * La sonda usa el MISMO elemento que la conciliación nombra, así que no la puede pasar por
+   * «no está en el material»: lo que la mueve es el estado, y solo el estado.
+   */
+  it('C7 no guarda un borrador que llame desviación a un elemento constatado', async () => {
+    await enWorkspaceLimpio(
+      'c7-constatado',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+          { desviado: false },
+        );
+        await expect(
+          conProveedor(
+            {
+              ok: true,
+              datos: {
+                contribucion: 'Algo se movió.',
+                factoresExternos: '',
+                hipotesisAbiertas: '',
+                aprendizajes: 'Algo se aprendió.',
+                desviaciones: [
+                  { elementoId, lectura: 'Esto quedó distinto y explica el resultado.' },
+                ],
+                citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+                confianzaPropuesta: 'baja',
+              },
+              intentos: [intento({ uso: null })],
+            },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          ),
+        ).rejects.toThrow(/da por constatados|no admite como tales/i);
+      },
+    );
+  });
+
+  /**
+   * Un post mortem sin nada que leer no se ofrece, y uno completado deja de ofrecerse.
+   *
+   * La primera mitad es la regla de «datos deterministas» aplicada al revés: sin lecturas ni
+   * elementos conciliados, la única salida posible es prosa inventada con aspecto de post
+   * mortem —cara, y peor que no tener ninguna porque parece trabajo hecho—.
+   */
+  it('C7 no se ofrece sobre un post mortem vacío, y uno completado cierra la puerta', async () => {
+    await enWorkspaceLimpio('c7-sin-expediente', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [vacio] = await admin`insert into outcome_review
+        (workspace_id, reto_id, estado, creado_por)
+        values (${wsC}, ${retoC}, 'borrador', ${curadorId}) returning id`;
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: CONTENIDO_POR_CAPACIDAD.C7 as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: vacio!.id as string,
+            }),
+        ),
+      ).rejects.toThrow(/no tiene todavía nada que leer/);
+
+      // Y con expediente: nace, y se cierra la puerta al completarse el post mortem. El vacío
+      // se retira primero porque `outcome_review` es único por reto — un reto tiene UN post
+      // mortem, que es lo correcto y lo que obliga a montar los dos casos en secuencia.
+      await admin`delete from outcome_review where id = ${vacio!.id as string}`;
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: CONTENIDO_POR_CAPACIDAD.C7 as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C7',
+            anclaId: reviewId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      expect(antes.pendientes.find((x) => x.capacidad === 'C7')!.anclaEstado).toBe('disponible');
+
+      /* Completar exige el dictamen firmado Y la narrativa escrita: un post mortem cerrado en
+       * blanco no es un post mortem. Se rellena a mano porque lo que este caso mide es la
+       * PUERTA, no cómo se llegó a la narrativa. */
+      await admin`update outcome_review
+        set estado = 'completado', veredicto = 'no-concluyente', completado_por = ${curadorId},
+            completado_en = now(), contribucion = 'Escrita a mano para cerrar',
+            aprendizajes = 'Escritos a mano para cerrar'
+        where id = ${reviewId}`;
+      const despues = await panelPropuestas(curadorId, wsC);
+      const p = despues.pendientes.find((x) => x.capacidad === 'C7');
+      expect(p!.anclaEstado).toBe('post-mortem-cerrado');
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p!.id }),
+      ).rejects.toThrow(/ya se completó/);
+    });
+  });
+
   it('C3 propone HMW por el camino real y aceptar materializa la oportunidad con su traza', async () => {
     await enWorkspaceLimpio('c3-camino-real', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const evId = await evidenciaDelReto(wsC, retoC, curadorId, {

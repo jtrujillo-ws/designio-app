@@ -46,9 +46,13 @@ import {
   type ChecklistDelGate,
   materialDeUnaEvidencia,
   criteriosQueLlegaronAlModelo,
+  materialDePostMortem,
+  promptPostMortem,
+  type ExpedienteDePostMortem,
   materialDeRegistry,
   materialDeUnCriterio,
   promptRegistry,
+  SISTEMA_POST_MORTEM,
   SISTEMA_REGISTRY,
   type CriteriosDelReto,
   type GrafoDelJourney,
@@ -88,6 +92,7 @@ import {
   parsearContenido,
   TESTIMONIO_ADICIONAL,
   type CitaDelContenido,
+  type ContenidoPostMortem,
 } from './ai.contenido';
 import {
   credencialesAI,
@@ -149,6 +154,43 @@ async function rolCurador(tx: TransactionSql, actorId: string, workspaceId: stri
   const rol = (fila?.rol ?? null) as string | null;
   if (!rol || !(ROLES_CURADORES as readonly string[]).includes(rol)) {
     throw new ErrorAI('Solo lead-boutique o diseñador pueden pedir y revisar propuestas AI');
+  }
+}
+
+/**
+ * Y la puerta POR CAPACIDAD, que es la de arriba más lo que cada una añada.
+ *
+ * Existe porque «quién cura» y «quién puede escribir el objeto que esta capacidad materializa»
+ * no son la misma pregunta, y durante seis capacidades lo parecieron. C7 las separa: su
+ * destino es `outcome_review`, cuya política de escritura pide `lead-boutique` mientras las
+ * otras cinco tablas de destino admiten `disenador`. Con la puerta uniforme, un diseñador
+ * apartaba presupuesto, pagaba la llamada y llegaba a una propuesta que RLS no le dejaba
+ * aceptar — el gasto ya hecho, y un 42501 por toda explicación.
+ *
+ * Se comprueba en los TRES sitios donde importa —al preparar el alcance, antes de despachar y
+ * al aceptar— y no en rechazar: descartar una propuesta no escribe en el objeto, y dejar la
+ * bandeja sin quien la limpie sería cambiar un problema por otro.
+ */
+async function rolParaCapacidad(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  capacidad: CapacidadActiva,
+): Promise<void> {
+  const [fila] = await tx`select workspace_role(${actorId}, ${workspaceId}) as rol`;
+  const rol = (fila?.rol ?? null) as string | null;
+  // Las dos puertas en una sola lectura del rol, y en este orden: primero «¿cura?», que da el
+  // mensaje que la gente ya conoce, y solo después el recorte de la capacidad. Al revés, un
+  // stakeholder pidiendo C7 leería que «esto lo pide lead-boutique» —cierto y engañoso: no es
+  // que le falte ESTA capacidad, es que no cura ninguna—.
+  if (!rol || !(ROLES_CURADORES as readonly string[]).includes(rol)) {
+    throw new ErrorAI('Solo lead-boutique o diseñador pueden pedir y revisar propuestas AI');
+  }
+  const permitidos = CAPACIDADES[capacidad].roles;
+  if (!permitidos.includes(rol)) {
+    throw new ErrorAI(
+      `Esta capacidad la pide y la acepta ${permitidos.join(' o ')}: el objeto que materializa no admite escritura de otro rol, así que pedirla sería gastar en algo que después no se podría cerrar`,
+    );
   }
 }
 
@@ -444,7 +486,7 @@ function materialDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | nu
    */
   const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
   if (!definicion) return null;
-  return huellaDelMaterial(definicion.material(f)) === guardada;
+  return huellaDelMaterial((definicion.paraHuella ?? definicion.material)(f)) === guardada;
 }
 
 function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
@@ -507,6 +549,24 @@ type AnclaEnElPanel = {
    */
   columnas: (tx: TransactionSql) => PendingQuery<Row[]>;
 };
+
+/**
+ * El expediente de C7 recompuesto desde las columnas que proyectó su ancla.
+ *
+ * Existe para que el render del material y su huella salgan de UNA construcción y no de dos
+ * copias del mismo objeto literal: son la misma lectura contestando dos preguntas, y dos
+ * redacciones del mismo objeto es exactamente como este repositorio se ha equivocado antes.
+ */
+function expedienteDeLaFila(f: Record<string, unknown>): ExpedienteDePostMortem {
+  return {
+    codigo: (f.review_reto_codigo as string | null) ?? '',
+    titulo: (f.review_reto_titulo as string | null) ?? '',
+    descripcion: (f.review_reto_descripcion as string | null) ?? '',
+    metricaObjetivo: (f.review_reto_metrica as string | null) ?? '',
+    lecturas: (f.review_lecturas as ExpedienteDePostMortem['lecturas'] | null) ?? [],
+    conciliacion: (f.review_conciliacion as ExpedienteDePostMortem['conciliacion'] | null) ?? [],
+  };
+}
 
 const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
   item_id: {
@@ -621,6 +681,40 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
                 order by c.kpi, c.id), '[]'::json)
        from criterio_exito c
        where c.reto_id = rr.id and c.workspace_id = rr.workspace_id) as registry_criterios`,
+  },
+  outcome_review_id: {
+    // DOS joins, como el registry: el post mortem y su RETO. El reto no es adorno — el
+    // material de C7 sale de él (la conciliación de sus proyectos, las lecturas de sus
+    // criterios) y el título del panel también, porque un uuid de review no le dice nada a
+    // quien revisa.
+    join: (tx) => tx`left join outcome_review orv
+        on orv.id = p.outcome_review_id and orv.workspace_id = p.workspace_id
+      left join reto ror on ror.id = orv.reto_id and ror.workspace_id = orv.workspace_id`,
+    titulo: (tx) => tx`ror.codigo || ' ' || ror.titulo`,
+    /*
+     * El repertorio COMPLETO de la fila, no el de C7: el estado del review —que es su puerta,
+     * porque uno completado ya no se redacta—, el reto que lo titula, el tablero de
+     * conciliación y las lecturas por criterio.
+     *
+     * Las dos lecturas salen de funciones que ya existen y no de un SQL escrito aquí:
+     * `conciliacion_del_reto` compone `filas_de_conciliacion`, que es la MISMA que dibuja el
+     * tablero de G7. Que el material del modelo y el tablero del humano sean la misma lectura
+     * es la mitad de lo que hace determinista a esta capacidad; escribir aquí un segundo
+     * recorrido las separaría a la primera vez que una de las dos cambiara.
+     */
+    columnas: (tx) => tx`orv.estado as review_estado, orv.veredicto as review_veredicto,
+      ror.codigo as review_reto_codigo, ror.titulo as review_reto_titulo,
+      ror.descripcion as review_reto_descripcion, ror.estado as review_reto_estado,
+      ror.metrica_objetivo as review_reto_metrica,
+      conciliacion_del_reto(ror.id, ror.workspace_id) as review_conciliacion,
+      (select coalesce(json_agg(json_build_object(
+                'criterioId', c.id, 'kpi', c.kpi, 'objetivo', c.objetivo,
+                'ventanaDias', c.ventana_dias,
+                'lectura', rc.lectura, 'sinDatosMotivo', rc.sin_datos_motivo)
+                order by c.kpi, c.id), '[]'::json)
+       from resultado_criterio rc
+       join criterio_exito c on c.id = rc.criterio_id and c.workspace_id = rc.workspace_id
+       where rc.review_id = orv.id and rc.workspace_id = orv.workspace_id) as review_lecturas`,
   },
   gate_id: {
     // DOS joins: el gate y su proyecto. El proyecto no es adorno — es lo que distingue
@@ -783,6 +877,24 @@ type BaseDelPanel = {
    * texto crudo de la base. Una sola definición, dos usos.
    */
   material: (f: Record<string, unknown>) => string;
+  /**
+   * Y QUÉ SE HUELLA de ese material, cuando no es el propio texto.
+   *
+   * Casi siempre lo es —la pregunta que la huella responde es «¿cambió lo que el modelo
+   * leyó?», y lo que el modelo leyó es exactamente `material(f)`—, y por eso el valor por
+   * defecto es ése y las nueve capacidades restantes no lo declaran.
+   *
+   * C7 es la excepción y la razón está en qué se firma. Una narrativa de post mortem se acepta
+   * CONTRA UN TABLERO, y el tablero es el expediente entero, no el trozo que cupo en el prompt:
+   * con la huella del texto, un criterio o un elemento más allá de `MAX_MATERIAL` podía cambiar
+   * entre generar y aceptar sin que nada lo dijera, y la narrativa vieja se firmaba sobre un
+   * expediente ya movido. Que el modelo no llegara a ver ese trozo no lo arregla: lo agrava.
+   *
+   * Los dos usos de `material` siguen siendo uno solo —la presencia literal se mide contra lo
+   * que el modelo leyó, recortado—; lo que se separa es la tercera pregunta, que nunca fue la
+   * misma aunque durante nueve capacidades tuviera la misma respuesta.
+   */
+  paraHuella?: (f: Record<string, unknown>) => string;
   /**
    * Y contra QUÉ TROZO de ese material se mide una cita concreta, para las capacidades cuyo
    * material son varios documentos.
@@ -1489,6 +1601,83 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
       };
     },
   },
+  C7: {
+    /*
+     * Lo que deja obsoleto un borrador de post mortem es que el post mortem se COMPLETE: ahí
+     * lleva el veredicto firmado con nombre y fecha, y su narrativa deja de reescribirse.
+     * Aceptar un borrador sobre un documento ya cerrado cambiaría aquello sobre lo que alguien
+     * puso su firma.
+     *
+     * Es la misma pregunta que el guard diferido hace al materializar; aquí se anticipa para
+     * que la tarjeta lo diga en vez de dejar que aceptar falle con el gate ya firmado.
+     */
+    estado: (tx) => tx`case
+        when not exists (
+          select 1 from outcome_review o2
+          where o2.id = p.outcome_review_id and o2.workspace_id = p.workspace_id
+            and o2.estado = 'borrador')
+          then 'post-mortem-cerrado'
+        else 'disponible'
+      end`,
+    material: (f) => materialDePostMortem(expedienteDeLaFila(f)).texto,
+    /*
+     * Y la huella sobre el EXPEDIENTE, que es la tercera productora de este número —las otras
+     * dos, la que prepara la llamada y la que revalida, salen las dos de
+     * `huellaDelMaterialDelPostMortem`—. Las tres tienen que decir lo mismo o el panel marca
+     * «conciliación cambiada» a propuestas recién nacidas; que lo digan lo comprueban las
+     * sondas que aceptan una propuesta de C7 por el camino real.
+     */
+    paraHuella: (f) => JSON.stringify(expedienteDeLaFila(f)),
+    /* La huella se guarda al nacer, así que el panel puede decir si el expediente que
+     * recompone hoy es el que el modelo leyó. */
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
+    /*
+     * Y la misma comparación leída como ESTADO. Aquí el material se mueve más que en ninguna
+     * otra capacidad, y por trabajo perfectamente normal: mientras el borrador espera revisión,
+     * el lead sigue constatando elementos y registrando lecturas de criterios —eso ES la etapa
+     * 7—. Una narrativa escrita sobre un tablero que ya cambió no es un matiz: puede estar
+     * contando una desviación que se resolvió, o callando una que apareció.
+     *
+     * `=== false` y no `!== true`, como en C5 y C6: no saber —sin huella, u otro render del
+     * prompt— no puede volverse una alarma.
+     */
+    estadoDeLaFila: (f) => {
+      const comparable = materialDelPanelEsElDelModelo(f);
+      if (comparable === false) return 'conciliacion-cambiada';
+      if (comparable === null) return 'material-no-comparable';
+      return null;
+    },
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select orv.id, ror.codigo || ' ' || ror.titulo as titulo
+        from outcome_review orv
+        join reto ror on ror.id = orv.reto_id and ror.workspace_id = orv.workspace_id
+        where orv.workspace_id = ${workspaceId}
+          and orv.estado = 'borrador'
+          /*
+           * Y con algo que leer. Un post mortem recién abierto, sin ninguna lectura de
+           * criterio registrada ni ninguna design version conciliada, no tiene expediente: la
+           * llamada saldría cara y volvería con prosa inventada, que es exactamente lo que
+           * esta capacidad existe para no hacer.
+           */
+          and (exists (select 1 from resultado_criterio rc
+                 where rc.review_id = orv.id and rc.workspace_id = orv.workspace_id)
+            or exists (select 1 from proyecto pr
+                 join design_version dv on dv.workspace_id = pr.workspace_id
+                   and dv.id in (select design_versions_a_cargo_del_proyecto(pr.id, pr.workspace_id))
+                 where pr.reto_id = ror.id and pr.workspace_id = ror.workspace_id))
+          and not exists (select 1 from propuesta_ai p
+            where p.outcome_review_id = orv.id and p.workspace_id = orv.workspace_id
+              and p.capacidad = 'C7' and p.estado = 'propuesta')
+          and (${patron}::text is null or ror.codigo || ' ' || ror.titulo ilike ${patron})
+        order by ror.codigo asc, orv.id asc
+        limit ${limite}`;
+      return {
+        lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+        hayMas: false,
+      };
+    },
+  },
   C6: {
     /*
      * Lo que deja obsoleta una entrada propuesta es que su registry se FIRME —ahí el contrato
@@ -2090,7 +2279,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
   const unidades = INTENTOS_POR_GENERACION;
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await rolCurador(tx, actorId, entrada.workspaceId);
+    await rolParaCapacidad(tx, actorId, entrada.workspaceId, entrada.capacidad);
 
     const { keyWorkspace, keyEntorno } = credencialesAI();
     /*
@@ -2492,7 +2681,7 @@ async function comprobarDespacho(
     // despachar material a un tercero. La política de inserción lo rechazaría de todos modos
     // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
     // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
-    await rolCurador(tx, actorId, entrada.workspaceId);
+    await rolParaCapacidad(tx, actorId, entrada.workspaceId, entrada.capacidad);
     if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
       versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
@@ -2972,6 +3161,82 @@ async function huellaDelMaterialDeInsights(
  * la composición en el fixture sería fijar allí el prompt que se está probando; llamar a la
  * misma función no.
  */
+/**
+ * La huella del EXPEDIENTE del post mortem: el reto, sus lecturas por criterio y su tablero de
+ * conciliación, exactamente como los proyecta el panel.
+ *
+ * Los candados, en el orden del sistema —workspace en compartido, luego el reto— y por la misma
+ * razón que en el registry: lo que se lee decide si la llamada se despacha, y sin candado esa
+ * lectura es una foto que otro puede estar moviendo. Aquí se mueve más que en ninguna otra
+ * capacidad y por trabajo normal: mientras se prepara la llamada, el lead sigue constatando
+ * elementos y registrando lecturas — eso ES la etapa 7.
+ *
+ * No hay una tercera clave: `outcome_review` es 1:1 con su reto, así que la del reto ya lo
+ * serializa contra quien lo completa (`bloquearReto`) y contra quien constata.
+ */
+export async function huellaDelMaterialDelPostMortem(
+  tx: TransactionSql,
+  workspaceId: string,
+  anclaId: string,
+): Promise<{ huella: string; expediente: ExpedienteDePostMortem | null }> {
+  await tx`select pg_advisory_xact_lock_shared(
+    hashtextextended('designio:workspace:' || ${workspaceId}, 42))`;
+  const [dueno] = await tx`select reto_id from outcome_review
+    where id = ${anclaId} and workspace_id = ${workspaceId}`;
+  if (!dueno) return { huella: '', expediente: null };
+  const retoId = dueno.reto_id as string;
+  await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+  await tx`select 1 from reto where id = ${retoId} and workspace_id = ${workspaceId}
+    for share`;
+  await tx`select 1 from outcome_review
+    where id = ${anclaId} and workspace_id = ${workspaceId} for share`;
+  const [fila] = await tx`select
+      o.estado = 'borrador' as en_borrador,
+      r.codigo, r.titulo, r.descripcion, r.metrica_objetivo,
+      conciliacion_del_reto(r.id, r.workspace_id) as conciliacion,
+      (select coalesce(json_agg(json_build_object(
+                'criterioId', c.id, 'kpi', c.kpi, 'objetivo', c.objetivo,
+                'ventanaDias', c.ventana_dias,
+                'lectura', rc.lectura, 'sinDatosMotivo', rc.sin_datos_motivo)
+                order by c.kpi, c.id), '[]'::json)
+       from resultado_criterio rc
+       join criterio_exito c on c.id = rc.criterio_id and c.workspace_id = rc.workspace_id
+       where rc.review_id = o.id and rc.workspace_id = o.workspace_id) as lecturas
+    from outcome_review o
+    join reto r on r.id = o.reto_id and r.workspace_id = o.workspace_id
+    where o.id = ${anclaId} and o.workspace_id = ${workspaceId}`;
+  if (!fila || !(fila.en_borrador as boolean)) return { huella: '', expediente: null };
+  const expediente: ExpedienteDePostMortem = {
+    codigo: fila.codigo as string,
+    titulo: fila.titulo as string,
+    descripcion: fila.descripcion as string,
+    metricaObjetivo: fila.metrica_objetivo as string,
+    lecturas: (fila.lecturas as ExpedienteDePostMortem['lecturas'] | null) ?? [],
+    conciliacion: (fila.conciliacion as ExpedienteDePostMortem['conciliacion'] | null) ?? [],
+  };
+  /*
+   * La huella se toma sobre el EXPEDIENTE, no sobre su render.
+   *
+   * Las otras capacidades huellan `material…(x).texto`, que es lo que se le manda al modelo — y
+   * eso ya está recortado a `MAX_MATERIAL`. Para ellas responde a la pregunta buena: «¿cambió
+   * lo que el modelo leyó?». Aquí no basta, y la diferencia está en qué se firma: una narrativa
+   * de post mortem se acepta CONTRA UN TABLERO, y ese tablero es el objeto entero, no el trozo
+   * que cupo en el prompt. Con la huella del texto, un criterio o un elemento más allá del
+   * corte podía cambiar entre generar y aceptar —una constatación nueva, una lectura
+   * corregida— sin disparar `conciliacion-cambiada`, y la narrativa vieja se firmaba sobre un
+   * expediente que ya se había movido.
+   *
+   * Que el modelo no llegara a leer ese trozo no arregla nada: agrava. La narrativa se escribió
+   * sin verlo y se firma como si lo describiera.
+   *
+   * `JSON.stringify` es determinista aquí porque las dos mitades llegan ordenadas de la base
+   * —`json_agg(… order by c.kpi, c.id)` para las lecturas, y `conciliacion_del_reto` con su
+   * propio `order by` por proyecto, versión y orden del elemento— y porque el objeto se compone
+   * arriba con las claves en orden fijo. Nada de esto depende del recorte.
+   */
+  return { huella: huellaDelMaterial(JSON.stringify(expediente)), expediente };
+}
+
 export async function huellaDelMaterialDelRegistry(
   tx: TransactionSql,
   workspaceId: string,
@@ -3074,6 +3339,11 @@ async function entradasDelRegistry(
   return filas.map((e) => ({ nombre: e.nombre as string, definicion: e.definicion as string }));
 }
 
+const MOTIVO_POST_MORTEM_CERRADO =
+  'Ese post mortem se completó mientras se preparaba la llamada —lleva ya su veredicto firmado—, así que su narrativa no se reescribe';
+const MOTIVO_CONCILIACION_MOVIDA =
+  'La conciliación de ese reto cambió mientras se preparaba la llamada —se constató un elemento, o se registró la lectura de un criterio—, así que el material ya no es el que se iba a mandar';
+
 const MOTIVO_ENTRADAS_MOVIDAS =
   'Las entradas de ese Metric Registry cambiaron mientras se preparaba la llamada —se añadió una, se editó o se quitó—, así que el lote se armaría sin saber lo que ya se mide y podría proponerlo otra vez con otro nombre';
 
@@ -3159,6 +3429,31 @@ const REVALIDAR: Record<
     if (huella !== (huellaMaterial ?? '')) {
       throw new ErrorAI(
         'La evidencia de ese reto cambió mientras se preparaba la llamada —se revocaron derechos, se desenlazó o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
+      );
+    }
+  },
+  C7: async (tx, entrada, huellaMaterial) => {
+    /*
+     * Dos preguntas, las dos bajo los candados de `huellaDelMaterialDelPostMortem`: que el
+     * post mortem SIGA siendo un borrador —completarlo es un acto humano que cabe justo en el
+     * rato que va de preparar a despachar— y que el EXPEDIENTE siga siendo el que se armó.
+     *
+     * La segunda importa más aquí que en ninguna otra capacidad: en la etapa 7, constatar
+     * elementos y registrar lecturas es el trabajo en curso, así que el material se mueve
+     * mientras se prepara la llamada con toda normalidad. Una narrativa escrita sobre un
+     * tablero que ya cambió puede estar contando una desviación resuelta o callando una nueva.
+     */
+    const { huella, expediente } = await huellaDelMaterialDelPostMortem(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (!expediente) {
+      throw new ErrorAI(`${MOTIVO_POST_MORTEM_CERRADO}: no se llamó al proveedor`);
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        `${MOTIVO_CONCILIACION_MOVIDA}: no se llamó al proveedor. Vuelve a pedirlo.`,
       );
     }
   },
@@ -3521,6 +3816,50 @@ const PREPARAR: Record<
       evidenciaDelMaterial: llegado.ids,
     };
   },
+  C7: async (tx, entrada) => {
+    // El MISMO lector que la revalidación, no una consulta paralela: el material que se manda
+    // y el que se vuelve a mirar antes de despachar tienen que salir de la misma lectura, o la
+    // huella compara dos textos que nadie compuso igual.
+    const { expediente } = await huellaDelMaterialDelPostMortem(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (!expediente) {
+      throw new ErrorAI(
+        'Ese post mortem no existe aquí o ya se completó: uno cerrado lleva su veredicto firmado y su narrativa no se reescribe',
+      );
+    }
+    /*
+     * Sin expediente no se llama. «Datos deterministas» es lo que esta capacidad tiene de
+     * distinto: sin ninguna lectura de criterio registrada y sin ningún elemento conciliado, la
+     * única salida posible es prosa inventada con aspecto de post mortem — cara, y peor que no
+     * tener ninguna, porque parece trabajo hecho.
+     *
+     * Es el mismo caso que el item importado sin material y el reto sin criterios de C6, y la
+     * misma respuesta: no ofrecerlo y decir dónde se arregla.
+     */
+    const elementos = expediente.conciliacion.reduce((n, b) => n + b.elementos.length, 0);
+    if (expediente.lecturas.length === 0 && elementos === 0) {
+      throw new ErrorAI(
+        'Ese post mortem no tiene todavía nada que leer: ni lecturas de sus criterios ni elementos conciliados. Registra los resultados de la medición y concilia los releases de su design version —es el tablero de G7— y vuelve a pedirlo.',
+      );
+    }
+    return {
+      sistema: SISTEMA_POST_MORTEM,
+      prompt: promptPostMortem(expediente),
+      /*
+       * La huella de ESTE material, para volver a mirarla justo antes de despachar. Entre esta
+       * transacción y aquella hay un commit, y en la etapa 7 lo que puede pasar en medio no es
+       * excepcional: constatar un elemento y registrar la lectura de un criterio ES el trabajo
+       * en curso, y el prompt ya lleva el tablero viejo dentro.
+       */
+      // La misma huella que comprueba `huellaDelMaterialDelPostMortem`: sobre el expediente
+      // entero y no sobre su render recortado, por lo que allí queda explicado.
+      huellaMaterial: huellaDelMaterial(JSON.stringify(expediente)),
+    };
+  },
+
   C6: async (tx, entrada) => {
     // El MISMO lector que la revalidación, no una consulta paralela: el material que se manda
     // y el que se vuelve a mirar antes de despachar tienen que salir de la misma lectura, o la
@@ -3915,6 +4254,69 @@ const COMPROBAR: Record<
       );
     }
   },
+  C7: async (tx, entrada, contenidos, huellaMaterial) => {
+    const { huella, expediente } = await huellaDelMaterialDelPostMortem(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (!expediente) {
+      throw new ErrorAI(`${MOTIVO_POST_MORTEM_CERRADO}: la propuesta no se guarda`);
+    }
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(
+        `${MOTIVO_CONCILIACION_MOVIDA}: la propuesta no se guarda. Vuelve a pedirla.`,
+      );
+    }
+    /*
+     * Y que cada desviación señale un elemento QUE ESTABA EN EL MATERIAL. Es la misma puerta
+     * que C5 le pone a sus remediaciones y C6 a su `criterioId`, y por el mismo motivo: la
+     * huella de arriba dice que el material no cambió; esto dice otra cosa —que lo que la
+     * respuesta señala estaba DENTRO de lo que se mandó—.
+     *
+     * Un elemento inventado, o de otro reto del mismo workspace, es una avería de las caras:
+     * manda a alguien a revisar un release que estaba bien, con la firma de un post mortem
+     * detrás. Y no lo cubre ninguna clave ajena, porque las desviaciones no se materializan:
+     * viven en el contenido, que nadie más va a comprobar.
+     *
+     * Se descarta la respuesta ENTERA y no la desviación que sobra: media narrativa no es
+     * revisable, y cuál de las frases se apoyaba en el elemento inventado no lo puede decidir
+     * esta función.
+     */
+    /*
+     * Y el conjunto se arma con los elementos QUE ADMITEN LECTURA DE DESVIACIÓN, que no son
+     * todos. `filas_de_conciliacion` clasifica cada elemento en seis estados, y uno de ellos
+     * —`constatado`— significa que alguien lo miró y salió EXACTAMENTE COMO SE APROBÓ. El
+     * tablero, que es dato determinista, ya dijo que ahí no hubo discrepancia.
+     *
+     * Con el conjunto completo, un «riesgo de exclusión en el elemento X» sobre un X constatado
+     * pasaba: el id está en el material, y eso era todo lo que se comprobaba. El panel lo
+     * pintaba como discrepancia y aceptar lo archivaba, contradiciendo al tablero en el mismo
+     * expediente donde el tablero está impreso. Es la tesis de C7 al revés: el post mortem se
+     * redacta SOBRE lo constatado, no contra ello.
+     *
+     * Los otros cinco estados sí la admiten, y no solo `desviado`: `no-implementado` es lo
+     * aprobado que no llegó a hacerse —que el prediseño nombra como material del post mortem—,
+     * y `desplegado`, `en-release` y `aprobado` son grados de implementación SIN CONSTATAR con
+     * el reto cerrándose, que es una lectura legítima y de las que más enseñan.
+     */
+    const enElMaterial = new Set(
+      expediente.conciliacion.flatMap((b) =>
+        b.elementos.filter((e) => e.estado !== 'constatado').map((e) => e.elementoId),
+      ),
+    );
+    for (const contenido of contenidos) {
+      const fuera = (contenido as ContenidoPostMortem).desviaciones.filter(
+        (d) => !enElMaterial.has(d.elementoId),
+      );
+      if (fuera.length > 0) {
+        throw new ErrorAI(
+          `Ese borrador señala ${fuera.length} desviación(es) sobre elementos que la conciliación de este reto no admite como tales —o no están en el tablero, o el tablero los da por constatados «como aprobado»—: la propuesta no se guarda, porque contradiría al dato determinista en el mismo expediente donde está impreso. Vuelve a pedirla.`,
+        );
+      }
+    }
+  },
+
   C6: async (tx, entrada, contenidos, huellaMaterial, huellaEntradas) => {
     const { huella, registry } = await huellaDelMaterialDelRegistry(tx, entrada.workspaceId, entrada.anclaId);
     if (!registry) {
@@ -4674,8 +5076,9 @@ async function aceptarPropuestaEnTransaccion(
 ): Promise<{ estado: 'aceptada' | 'corregida'; objetoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await rolCurador(tx, actorId, entrada.workspaceId);
     const p = await leerParaRevisar(tx, entrada.workspaceId, entrada.propuestaId);
+    // Después de leer la propuesta y no antes: la capacidad la dice ELLA, no quien acepta.
+    await rolParaCapacidad(tx, actorId, entrada.workspaceId, p.capacidad);
 
     let contenido = p.contenido;
     // PRESENTE, no verdadera: la frontera transporta la corrección sin juzgarla (`unknown`),
@@ -4789,6 +5192,11 @@ async function aceptarPropuestaEnTransaccion(
           p,
           contenido as ContenidoOportunidad,
         ),
+      'outcome-review': () =>
+        // Sin `actorId`, y no por descuido: es la única materialización que no crea fila, así
+        // que aquí no hay `creado_por` que firmar. Quien aceptó consta en `revisada_por` de la
+        // propuesta, unas líneas más abajo, y de ahí cuelga el linaje del post mortem.
+        materializarPostMortem(tx, entrada.workspaceId, p, contenido as ContenidoPostMortem),
       'entrada-kpi': () =>
         materializarEntradaKpi(
           tx,
@@ -4808,7 +5216,7 @@ async function aceptarPropuestaEnTransaccion(
       set estado = case when contenido is distinct from ${tx.json(contenido)}::jsonb
                         then 'corregida' else 'aceptada' end,
           contenido = ${tx.json(contenido)}::jsonb,
-          revisada_por = ${actorId},
+          revisada_por = ${actorId}
           -- El enlace se escribe EN la columna que el destino nombra: el nombre viaja como
           -- identificador, no como una etiqueta contra la que comparar.
           --
@@ -4827,7 +5235,17 @@ async function aceptarPropuestaEnTransaccion(
           -- escribe, así que están todas en null. El CHECK de «propuesta_ai» que ata
           -- «estado in (aceptada, corregida)» a tener enlace es el respaldo en la base: un
           -- destino cuya columna nueva no entre en ese CHECK no se sella a medias, revienta.
-          ${tx(COLUMNA_DE_DESTINO[p.destino])} = ${objetoId}
+          --
+          -- Y una excepción, que es la consecuencia de que C7 tenga el ancla POR objeto: ahí
+          -- la columna de destino ES la del ancla, y ya trae el id desde que la propuesta
+          -- nació. Reescribirlo sería un no-op que además exigiría conceder UPDATE sobre una
+          -- columna de ancla —o sea, dejar re-anclar una propuesta después de nacida, que es
+          -- exactamente lo que el guard de linaje impide al insertar—. Así que no se asigna.
+          ${
+            COLUMNA_DE_DESTINO[p.destino] === CAPACIDADES[p.capacidad].ancla.columna
+              ? tx``
+              : tx`, ${tx(COLUMNA_DE_DESTINO[p.destino])} = ${objetoId}`
+          }
       where id = ${entrada.propuestaId} and workspace_id = ${entrada.workspaceId}
         and estado = 'propuesta'
       returning estado`;
@@ -5166,6 +5584,66 @@ async function materializarEntradaKpi(
  * portafolio, no la aprueba. El veredicto es un acto humano con su propia puerta —que
  * re-comprueba el razonamiento vivo— y su propia razón.
  */
+/**
+ * C7: escribir la narrativa en el post mortem que ya existe.
+ *
+ * La única materialización que NO crea una fila, y eso cambia dos cosas respecto a sus seis
+ * hermanas:
+ *
+ *  · Es un UPDATE, así que devuelve el id del ancla —que es el del objeto— y no el de una fila
+ *    nueva. El guard diferido lo comprueba con `xmin` a secas: «esta transacción escribió esta
+ *    versión», que es exactamente lo que hay que exigir cuando lo materializado es una edición.
+ *  · No hay «lo firma quien aceptó» que comprobar: nadie crea esta fila aquí, y `creado_por` es
+ *    de quien abrió el post mortem semanas antes. Quien aceptó consta donde tiene que constar,
+ *    en `revisada_por` de la propia propuesta.
+ *
+ * Y se escriben CUATRO columnas, ni una más. El veredicto y la casilla del diseño experimental
+ * no se tocan: si el lead ya había escrito algo en ellas mientras el borrador esperaba, sigue
+ * siendo suyo.
+ */
+async function materializarPostMortem(
+  tx: TransactionSql,
+  workspaceId: string,
+  p: PropuestaEnRevision,
+  c: ContenidoPostMortem,
+): Promise<string> {
+  /*
+   * Las dos preguntas que caducan entre generar y aceptar, por la MISMA función que las hace
+   * antes de llamar al proveedor —y con ella los candados en el orden del protocolo—:
+   *
+   * 1. Que el post mortem SIGA siendo un borrador. El guard diferido lo vuelve a preguntar en
+   *    el commit —ése es el suelo—; esto es para que el motivo llegue con nombre a quien
+   *    revisa, en vez de un 23514.
+   * 2. Que el MATERIAL siga siendo el que el modelo leyó. Ésta no la puede hacer la base: el
+   *    texto se compone en TypeScript, con su recorte, así que no hay SQL que lo recalcule.
+   */
+  const { huella, expediente } = await huellaDelMaterialDelPostMortem(tx, workspaceId, p.anclaId);
+  if (!expediente) {
+    throw new ErrorAI(
+      'Ese post mortem ya se completó: lleva su veredicto firmado y su narrativa no se reescribe. Esta propuesta quedó obsoleta y solo puede rechazarse',
+    );
+  }
+  if (huella !== (p.huellaMaterial ?? '')) {
+    throw new ErrorAI(
+      `${MOTIVO_CONCILIACION_MOVIDA}: esta propuesta se escribió sobre el tablero anterior y solo puede rechazarse. Pide otro borrador.`,
+    );
+  }
+  const [fila] = await tx`
+    update outcome_review
+    set contribucion = ${c.contribucion},
+        factores_externos = ${c.factoresExternos},
+        hipotesis_abiertas = ${c.hipotesisAbiertas},
+        aprendizajes = ${c.aprendizajes}
+    where id = ${p.anclaId} and workspace_id = ${workspaceId}
+    returning id`;
+  if (!fila) {
+    throw new ErrorAI(
+      'No se pudo escribir la narrativa en ese post mortem: puede que ya no admita cambios',
+    );
+  }
+  return fila.id as string;
+}
+
 async function materializarOportunidad(
   tx: TransactionSql,
   actorId: string,

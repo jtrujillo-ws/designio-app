@@ -344,9 +344,10 @@ y no aprueba ninguno; y el veredicto del post mortem lo dicta el lead, el sponso
 ### Mapa de componentes técnicos: con qué está construido
 
 Las capas de la solución, de izquierda a derecha en el sentido de un request. Las flechas sólidas
-son llamadas; las punteadas, las tres dependencias en tiempo de ejecución entre módulos de dominio.
-Cada módulo escribe solo en sus tablas; la AI solo llega al dominio a través de `propuesta_ai` y de
-la aceptación humana.
+son llamadas; las punteadas, las dependencias en tiempo de ejecución entre módulos de dominio y la
+escritura de la AI en las tablas de destino, que solo ocurre cuando una persona acepta. La
+propiedad de las tablas es **lógica**: cada módulo es dueño de las suyas, pero hay escritores
+cruzados y la guía de abajo los enumera.
 
 ```mermaid
 flowchart LR
@@ -401,6 +402,7 @@ flowchart LR
   M_ENT --> T_ENT
   M_AI --> T_AI
   M_AI --> LLM
+  M_AI -.->|al aceptar, escribe en<br/>las tablas de destino| T_EVI
   M_AI -.->|bloquearReto| M_MET
   M_AI -.->|lee y valida journeys| M_JOU
   M_ENT -.->|bloquearReto| M_MET
@@ -418,15 +420,22 @@ flowchart LR
   class RW,CI ops
 ```
 
-Guía de lectura del mapa técnico: la **propiedad de las tablas** es por módulo y los datos se
-relacionan por identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de objetos
-ajenos. En **tiempo de ejecución** hay tres dependencias entre servicios de dominio: `ai` llama a
-`bloquearReto` de `metodo` y a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de
-`journey`; `entrega` llama a `bloquearReto` de `metodo`; y todos los servicios llaman a
-`exigirCuentaActiva` de `auth` (no se dibuja para no cruzar el diagrama entero). Aprobaciones y
-Biblioteca son proyecciones que leen lo que otros módulos poseen, y la exportación lee el catálogo
-entero bajo RLS. La AI solo escribe en el dominio a través de `propuesta_ai` y de la aceptación
-humana; el detalle de tablas por contexto está en `21` y el de la capa AI en `22`.
+Guía de lectura del mapa técnico. La **propiedad de las tablas** es lógica y por módulo, y los
+datos se relacionan por identidad (ids y FKs compuestas con `workspace_id`), nunca por composición
+de objetos ajenos; pero quien busque **quién escribe en una tabla** debe contar tres cosas más: al
+aceptar una propuesta, `ai.servicio.ts` inserta directamente en `evidencia` y `derecho_uso` (CI),
+`criterio_exito` (C0), `insight`, `afirmacion`, `cita` y `contradiccion` (C2), `oportunidad` y
+`oportunidad_insight` (C3) y `entrada_kpi` (C6), y actualiza `outcome_review` (C7); todos los
+servicios insertan en `evento_dominio`; y las proyecciones (Aprobaciones, Biblioteca, la exportación
+bajo RLS) leen lo que otros poseen. En **tiempo de ejecución** hay cuatro dependencias entre módulos
+de dominio: `ai` llama a `bloquearReto` de `metodo` y a `leerJourneyCompleto`,
+`leerJourneysCompletos` y `validarJourney` de `journey`; `entrega` llama a `bloquearReto` de
+`metodo`; y `loop` lee las aprobaciones pendientes con `gatesAbiertos`, `gatesDelRol`,
+`conteoDeOtrosPendientes` y `rolEnWorkspace` de `aprobaciones` (los dos van en la misma caja del
+diagrama). Además, todos los servicios llaman a `exigirCuentaActiva` de `auth`, dos módulos
+reutilizan la sanitización de `evidencia`, y los esquemas Zod se importan libremente entre módulos
+como contratos compartidos. El detalle de tablas por contexto está en `21` y el de la capa AI en
+`22`.
 
 ### Componentes funcionales, de la pantalla a la tabla
 
@@ -1421,18 +1430,21 @@ issue [#19](https://github.com/jtrujillo-ws/designio-app/issues/19) (decisiones 
 
 # 20 — Arquitectura técnica
 
-## Stack fijado (lo que hay en `package.json`)
+## Stack fijado (lo que hay en `package.json` y `bun.lock`)
+
+`package.json` declara rangos con `^`; la versión que corre es la que resuelve `bun.lock`, y es la
+que se cita aquí entre paréntesis.
 
 | Ámbito | Elección | Nota |
 |---|---|---|
 | Runtime y gestor | **Bun 1.3.11** (fijado en Dockerfile y CI); `bun.lock`; cuarentena de 24 h para paquetes recién publicados (`bunfig.toml`) | Un runtime para instalar, desarrollar, testear y servir |
-| Lenguaje | **TypeScript estricto** (`strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`); `any` prohibido por ESLint; alias `@/*` → `src/*` | |
-| Framework | **TanStack Start** 1.167 (SSR + server functions) sobre **TanStack Router** (rutas file-based, `routeTree.gen.ts` generado) y **Vite 7** | Plugins en orden: tsconfig-paths → tailwind → tanstackStart → react |
-| UI | **React 19** + **TanStack Query**; **Tailwind CSS v4** con tokens propios del design system; **Mermaid 11** empaquetado (sin CDN en runtime) | Sin Radix ni react-hook-form todavía (diseñados para cuando lleguen primitivas complejas) |
-| Validación | **Zod 3**: los mismos esquemas en cliente y servidor; todo input externo se parsea antes de tocar lógica | |
-| Base de datos | **PostgreSQL 15** (imagen `pgvector/pgvector:pg15` en local y CI; plugin de Railway en nube); cliente **`postgres`** sin ORM; SQL etiquetado en `*.queries.ts` y `*.servicio.ts` | `pgvector` se crea de forma tolerante en `00-init.sql` pero **no se usa** todavía |
+| Lenguaje | **TypeScript estricto** (5.9.3; `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`); `any` prohibido por ESLint; alias `@/*` → `src/*` | |
+| Framework | **TanStack Start** (`^1.167.0`, resuelto 1.168.49; SSR + server functions) sobre **TanStack Router** (`^1.168.0`, resuelto 1.170.32; rutas file-based, `routeTree.gen.ts` generado) y **Vite 7** (7.3.6) | Plugins en orden: tsconfig-paths → tailwind → tanstackStart → react |
+| UI | **React 19** (19.2.8) + **TanStack Query**; **Tailwind CSS v4** (4.3.3) con tokens propios del design system; **Mermaid 11** (11.17.2) empaquetado (sin CDN en runtime) | Sin Radix ni react-hook-form todavía (diseñados para cuando lleguen primitivas complejas) |
+| Validación | **Zod 3** (3.25.76 en la app; Zod 4 aparece en el lockfile solo como dependencia transitiva): los mismos esquemas en cliente y servidor; todo input externo se parsea antes de tocar lógica | |
+| Base de datos | **PostgreSQL 15** (imagen `pgvector/pgvector:pg15` en local y CI; plugin de Railway en nube); cliente **`postgres`** (3.4.9) sin ORM; SQL etiquetado en `*.queries.ts` y `*.servicio.ts` | `pgvector` se crea de forma tolerante en `00-init.sql` pero **no se usa** todavía |
 | Auth | Nativa: **bcryptjs** + **jose** (JWT HS256) en cookie `designio_sesion` HttpOnly, 7 días | |
-| AI | **@anthropic-ai/sdk**; política de modelos en constantes | |
+| AI | **@anthropic-ai/sdk** (0.123.0); política de modelos en constantes | |
 | Servidor de producción | `serve.ts` con `Bun.serve`: `/healthz`, estáticos con caché inmutable, resto al worker SSR | |
 | Pruebas | **Vitest 4**; suite de autorización contra Postgres real | Playwright diseñado, no incorporado |
 

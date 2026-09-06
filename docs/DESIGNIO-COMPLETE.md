@@ -150,14 +150,14 @@ desde la importación del material previo hasta el post mortem, cuyo cierre alim
 ciclo (J7 → J2 vía retos candidatos). El estado de cada journey **se deriva de los gates** del
 proyecto en curso; nunca se declara a mano.
 
-| Journey | Etapas | Gates | Rol decisivo | Qué se produce | Pantalla donde se trabaja |
+| Journey | Etapas | Gates | Quién aprueba (y quién participa) | Qué se produce | Pantalla donde se trabaja |
 |---|---|---|---|---|---|
 | **J1** Arranque en frío | pre-0 | Curaduría humana | Lead y diseñador curan; lead o admin del cliente crean el servicio y conceden derechos | Evidencia curada con cinco dimensiones; servicio creado | Bandeja de importación |
-| **J2** Formulación del reto | 0 | **G0** | Sponsor | Reto con criterios de éxito, línea base y ventana por criterio; perfil del proyecto | Proyecto |
-| **J3** Investigación y entendimiento | 1–2 | **G1 G2** | Diseñadores + stakeholders | Evidencia, insights con citas, arquetipos, journey as-is | Insights |
-| **J4** Conceptualización y exploración | 3–4 | **G3 G4** | Sponsor + equipo | Oportunidades HMW trazables, conceptos, tests, decisiones pasa/muere | Oportunidades |
-| **J5** Detalle y plan | 5–6 | **G5 G6** | Sponsor + dueño del dato | Design version con diff, plan de releases, Metric Registry firmado | Design versions |
-| **J6** Implementación y medición | 7 | **G7** | Equipo cliente + dueño del dato | Releases, effective state con desviaciones, snapshots | Design versions / Proyecto |
+| **J2** Formulación del reto | 0 | **G0** | Aprueba el sponsor; el lead formula el reto y sus criterios | Reto con criterios de éxito, línea base y ventana por criterio; perfil del proyecto | Proyecto |
+| **J3** Investigación y entendimiento | 1–2 | **G1 G2** | Aprueba el lead (G1 y G2); diseñadores curan y stakeholders aportan material | Evidencia, insights con citas, arquetipos, journey as-is | Insights |
+| **J4** Conceptualización y exploración | 3–4 | **G3 G4** | Aprueba el sponsor (G3) y el lead (G4); el equipo explora y prueba | Oportunidades HMW trazables, conceptos, tests, decisiones pasa/muere | Oportunidades |
+| **J5** Detalle y plan | 5–6 | **G5 G6** | Aprueba el sponsor (G5 y G6, y firma el Metric Registry); el dueño del dato se compromete con cada KPI | Design version con diff, plan de releases, Metric Registry firmado | Design versions |
+| **J6** Implementación y medición | 7 | **G7** | Aprueba el lead (G7, tras constatar); el equipo del cliente implementa y el dueño del dato carga snapshots | Releases, effective state con desviaciones, snapshots | Design versions / Proyecto |
 | **J7** Post mortem y continuidad | PM | Veredicto | Lead redacta y completa el review; el sponsor lo recibe y decide la continuidad | Outcome review con veredicto; retos candidatos; suscripción o exportación | Proyecto |
 
 Las etapas y sus gates, tal como el código los fija (`src/lib/metodo/metodo.plantillas.ts`):
@@ -366,6 +366,9 @@ flowchart TB
   M_MED --> T_MED
   M_AI --> T_AI
   M_AI --> LLM
+  M_AI -.->|bloquearReto| M_MET
+  M_AI -.->|lee y valida journeys| M_JOU
+  M_ENT -.->|bloquearReto| M_MET
   T_AI -.->|aceptación humana<br/>materializa| T_EVI
   T_AI -.->|aceptación humana<br/>materializa| T_MET
   T_AI -.->|aceptación humana<br/>materializa| T_INS
@@ -384,8 +387,13 @@ flowchart TB
 Guía de lectura: las flechas sólidas son escritura y lectura del módulo dueño sobre sus tablas; las
 punteadas son **proyecciones de solo lectura** (Aprobaciones y Biblioteca leen lo que otros módulos
 poseen; la exportación lee el catálogo entero bajo RLS) y la **materialización** de propuestas AI, que
-solo ocurre cuando una persona acepta. No hay flechas entre módulos de dominio: se relacionan por
-identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de objetos ajenos.
+solo ocurre cuando una persona acepta. La **propiedad de las tablas** es por módulo y los datos se
+relacionan por identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de objetos
+ajenos; en **tiempo de ejecución** sí hay tres dependencias entre servicios de dominio, dibujadas
+como flechas punteadas entre módulos: `ai` llama a `bloquearReto` de `metodo` y a
+`leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`; `entrega` llama a
+`bloquearReto` de `metodo`; y todos los servicios llaman a `exigirCuentaActiva` de `auth` (esta
+última no se dibuja para no cruzar el diagrama entero).
 
 ### Componentes funcionales, de la pantalla a la tabla
 

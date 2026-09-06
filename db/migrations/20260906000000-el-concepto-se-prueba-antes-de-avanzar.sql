@@ -79,12 +79,31 @@ create table concepto (
   -- auditable, que es la forma que este esquema le da siempre a un juicio humano.
   umbral_test text not null default '' check (length(umbral_test) <= 500),
   test_lectura text not null default '' check (length(test_lectura) <= 500),
-  -- Lo que AVANZA dice una de dos cosas: «la N/A está aprobada, por esto» o «el umbral era X y
-  -- la lectura fue Y». Nunca ninguna. El que muere y el que sigue candidato no deben nada:
-  -- SYS-13 habla de «cada concepto que avanza».
+  -- Y el TERCER campo, que es el que cierra el invariante: «la lectura alcanza el umbral», sí
+  -- o no, dicho por quien la leyó.
+  --
+  -- Con solo el par —listón y lectura— «6 de 8» junto a «2 de 8» pasaba, porque las dos
+  -- cadenas estaban llenas. Y la base no puede resolverlo comparándolas: son textos del
+  -- método, y el umbral de un test cualitativo puede ser «ningún participante abandona en el
+  -- paso 3». Un comparador inventaría una aritmética que el dominio no tiene, y fallaría
+  -- callado justo donde importa.
+  --
+  -- Lo que la base sí puede exigir es la AFIRMACIÓN, que es lo que SYS-13 pide de verdad:
+  -- alguien mira el listón, mira la lectura y dice si se alcanzó. Nulo mientras no hay lectura
+  -- —no se afirma sobre lo que no se ha medido— y obligatorio en cuanto la hay. Es la misma
+  -- forma con la que este esquema trata siempre un juicio humano: se registra, se firma y
+  -- queda auditable, en vez de simularse con una comparación que no significa nada.
+  test_alcanza_umbral boolean,
+  check ((btrim(test_lectura) <> '') = (test_alcanza_umbral is not null)),
+  -- Lo que AVANZA dice una de dos cosas: «la N/A está aprobada, por esto» o «el umbral era X,
+  -- la lectura fue Y, y SÍ lo alcanzó». Nunca ninguna, y nunca una lectura que no llegó: un
+  -- concepto cuyo test no alcanzó el listón no pasa —muere con su razón, que es la otra mitad
+  -- de SYS-13— y la N/A tampoco lo salva, porque «no aplica» es mentira cuando el test se hizo
+  -- y salió corto. El que muere y el que sigue candidato no deben nada: SYS-13 habla de «cada
+  -- concepto que avanza».
   check (estado <> 'pasa'
          or btrim(test_na_justificacion) <> ''
-         or (btrim(umbral_test) <> '' and btrim(test_lectura) <> '')),
+         or (btrim(umbral_test) <> '' and test_alcanza_umbral)),
   creado_por uuid not null,
   creado_en timestamptz not null default now(),
   unique (id, workspace_id),
@@ -296,8 +315,8 @@ grant insert (workspace_id, reto_id, titulo, descripcion, creado_por) on concept
 -- diseñador —el veredicto atribuido a quien no lo tomó—, y un segundo UPDATE que no tocaba
 -- `estado` esquivaba entera la rama de transición y retro-databa el sello a 2001. Autoría de
 -- auditoría falsificable con la superficie concedida, sin SQL de propietario.
-grant update (titulo, descripcion, estado, veredicto_razon,
-              umbral_test, test_lectura, test_na_justificacion) on concepto to designio_app;
+grant update (titulo, descripcion, estado, veredicto_razon, umbral_test, test_lectura,
+              test_alcanza_umbral, test_na_justificacion) on concepto to designio_app;
 grant insert (concepto_id, evidencia_id, workspace_id) on concepto_evidencia to designio_app;
 grant delete on concepto_evidencia to designio_app;
 
@@ -374,6 +393,28 @@ begin
     end if;
   else
     new.test_na_aprobado_por := old.test_na_aprobado_por;
+  end if;
+
+  -- ── TRAS EL VEREDICTO, LO QUE EL VEREDICTO DIJO NO SE REESCRIBE ──
+  --
+  -- El evento es inmutable y lleva la razón dentro: `ConceptoMuere` archiva `veredicto_razon`
+  -- tal como estaba al decidir. Si la fila se puede seguir editando después, la razón que el
+  -- expediente enseña y la que el archivo guardó dicen cosas distintas, sin que nada lo
+  -- delate. Con la lectura del test es peor todavía: un resultado que se reescribe después de
+  -- que G4 lo mirara deja el gate certificando una prueba que ya no existe.
+  --
+  -- Se congela lo que el veredicto AFIRMÓ —la razón, el listón, la lectura y si la alcanzó—,
+  -- no la fila entera: el título y la descripción son cómo se llama el concepto, no lo que se
+  -- decidió sobre él, y corregir una errata no contradice a ningún evento.
+  --
+  -- `old.estado`, no `new.estado`: durante la propia transición el viejo todavía es
+  -- 'candidato', que es cuando esos campos se escriben junto con el veredicto.
+  if old.estado <> 'candidato' and (
+       new.veredicto_razon     is distinct from old.veredicto_razon
+    or new.umbral_test         is distinct from old.umbral_test
+    or new.test_lectura        is distinct from old.test_lectura
+    or new.test_alcanza_umbral is distinct from old.test_alcanza_umbral) then
+    raise exception 'ese concepto ya se decidió: su razón y el resultado de su test son lo que el veredicto afirmó, y el evento que lo archivó no se puede reescribir';
   end if;
 
   -- ── EL UMBRAL SE DEFINE ANTES DE VER EL RESULTADO ──
@@ -571,6 +612,22 @@ begin
         array[]::uuid[],
         array[]::uuid[]);
     end if;
+    -- Y los de la PRUEBA que certifica G4, por el recorrido concepto → evidencia. Mismo modo y
+    -- mismo orden por id que el del arquetipo justo debajo, y por la misma razón: la rama de
+    -- G4 lee `derechos_vigentes` sobre esas evidencias, y sin candado una revocación
+    -- concurrente y la firma se miran sin verse y commitean las dos.
+    perform du.evidencia_id
+      from derecho_uso du
+      where du.workspace_id = new.workspace_id
+        and new.numero = 4
+        and du.evidencia_id in (
+          select ce.evidencia_id from concepto c
+            join proyecto p on p.id = new.proyecto_id and p.workspace_id = new.workspace_id
+            join concepto_evidencia ce on ce.concepto_id = c.id and ce.workspace_id = c.workspace_id
+            where c.reto_id = p.reto_id and c.workspace_id = new.workspace_id
+              and c.estado = 'pasa')
+      order by du.evidencia_id
+      for share;
     -- El arquetipo no entra en ese protocolo: no es razonamiento citado, es el veredicto de
     -- un perfil. Su candado va aquí, en el mismo modo y con el mismo orden por id.
     perform du.evidencia_id
@@ -775,16 +832,50 @@ begin
     if v_falta_concepto is not null then
       return next row('P0001', format('no se puede aprobar G4: el concepto «%s» avanza sin evidencia de test enlazada ni N/A aprobada (SYS-13)', v_falta_concepto))::motivo_de_bloqueo;
     end if;
+    -- ── EJE TIEMPO: los derechos de la prueba, VIVOS al firmar ──
+    --
+    -- El enlace comprobó los derechos cuando se hizo, y eso fue entonces. Entre aquel momento
+    -- y éste se revocan permisos y caducan contratos, y G4 se firma con el cliente delante: un
+    -- concepto que avanza sostenido en una sesión que ya no se puede enseñar es exactamente lo
+    -- que G2 no admite para un arquetipo confirmado, y no hay razón para que la etapa 4 sea
+    -- más laxa que la 2 sobre el mismo material.
+    --
+    -- `derechos_vigentes` y no `evidencia_usable`: la regla sin la puerta anti-oráculo, que
+    -- aquí sobra porque esta función es la CRUDA —la llama el guard, que corre como
+    -- propietario, y la puerta la pone `gate_faltas_para_aprobar_visible`—. Es la misma
+    -- elección, y por el mismo motivo, que la rama de G2 tres bloques más arriba.
     select c.titulo into v_falta_concepto
     from concepto c
     where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
       and c.estado = 'pasa'
       and btrim(c.test_na_justificacion) = ''
-      and (btrim(c.umbral_test) = '' or btrim(c.test_lectura) = '')
+      -- Con evidencia enlazada, y solo entonces: al que no tiene ninguna ya lo nombra la rama
+      -- de arriba, y decirle además que su prueba perdió los derechos sería contarle dos veces
+      -- lo mismo con la segunda mitad mintiendo — no perdió nada, es que nunca hubo.
+      and exists (select 1 from concepto_evidencia ce
+        where ce.concepto_id = c.id and ce.workspace_id = c.workspace_id)
+      and not exists (select 1 from concepto_evidencia ce
+        where ce.concepto_id = c.id and ce.workspace_id = c.workspace_id
+          and derechos_vigentes(ce.evidencia_id, ce.workspace_id, 'cliente'))
     order by c.titulo asc
     limit 1;
     if v_falta_concepto is not null then
-      return next row('P0001', format('no se puede aprobar G4: el concepto «%s» avanza con evidencia de test pero sin umbral definido y su lectura, así que nadie puede decir que lo alcanzó (SYS-13)', v_falta_concepto))::motivo_de_bloqueo;
+      return next row('DR001', format('no se puede aprobar G4: la evidencia de test del concepto «%s» ya no tiene derechos vigentes para enseñarse al cliente', v_falta_concepto))::motivo_de_bloqueo;
+    end if;
+    -- Y la otra mitad de SYS-13: que la prueba ALCANCE el umbral definido. El CHECK de la fila
+    -- ya no deja pasar un concepto sin esa afirmación, pero la regla del gate se escribe
+    -- entera igual: el motivo tiene que decir QUÉ falta, y un gate que se apoyara en un CHECK
+    -- de otra tabla para explicarse dejaría de explicarse el día que ese CHECK cambie.
+    select c.titulo into v_falta_concepto
+    from concepto c
+    where c.reto_id = p.reto_id and c.workspace_id = g.workspace_id
+      and c.estado = 'pasa'
+      and btrim(c.test_na_justificacion) = ''
+      and (btrim(c.umbral_test) = '' or c.test_alcanza_umbral is not true)
+    order by c.titulo asc
+    limit 1;
+    if v_falta_concepto is not null then
+      return next row('P0001', format('no se puede aprobar G4: el concepto «%s» avanza sin un umbral definido cuya lectura lo alcance (SYS-13)', v_falta_concepto))::motivo_de_bloqueo;
     end if;
   end if;
 

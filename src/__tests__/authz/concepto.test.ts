@@ -20,6 +20,15 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
   let retoId = '';
   let evidenciaId = '';
   let evidenciaSinDerechos = '';
+  /**
+   * Una tercera, SOLO para el ítem del checklist de los gates de prueba.
+   *
+   * Compartir una con la prueba del concepto hacía que retirarle los derechos disparara
+   * también la regla general del checklist —«un ítem cumplido ya no tiene respaldo»—, con el
+   * mismo código DR001. El caso de los derechos pasaba con la rama de G4 neutralizada: medía
+   * la regla vieja creyendo medir la nueva.
+   */
+  let evidenciaDelChecklist = '';
 
   beforeAll(async () => {
     const admin = sqlAdmin();
@@ -69,6 +78,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     };
     evidenciaId = await nuevaEvidencia('Sesión de test con 6 participantes', true);
     evidenciaSinDerechos = await nuevaEvidencia('Sesión sin derechos concedidos', false);
+    evidenciaDelChecklist = await nuevaEvidencia('Material del ítem del checklist', true);
   });
 
   afterAll(async () => {
@@ -135,7 +145,8 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     // mediría esa otra en vez de SYS-13.
     await admin`insert into checklist_item
       (workspace_id, gate_id, orden, texto, estado, evidencia_id)
-      values (${ws}, ${g!.id as string}, 0, 'Hay conceptos probados', 'cumplido', ${evidenciaId})`;
+      values (${ws}, ${g!.id as string}, 0, 'Hay conceptos probados', 'cumplido',
+              ${evidenciaDelChecklist})`;
     return { reto, gateId: g!.id as string };
   };
 
@@ -162,7 +173,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     // umbral y su lectura, que es la primera mitad de SYS-13.
     const pasa = await nuevoConcepto('El que avanza');
     await conUsuario(leadId, (tx) => tx`update concepto
-      set estado = 'pasa', umbral_test = '6 de 8 completan sin ayuda', test_lectura = '7 de 8'
+      set estado = 'pasa', umbral_test = '6 de 8 completan sin ayuda', test_lectura = '7 de 8', test_alcanza_umbral = true
       where id = ${pasa} and workspace_id = ${ws}`);
 
     // El sello y el AUTOR los puso la base, no quien llamó: ninguno de los dos está en el
@@ -232,7 +243,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
 
     const avanza = await nuevoConcepto('Avanza sin prueba', reto);
     await conUsuario(leadId, (tx) => tx`update concepto
-      set estado = 'pasa', umbral_test = '6 de 8', test_lectura = '7 de 8'
+      set estado = 'pasa', umbral_test = '6 de 8', test_lectura = '7 de 8', test_alcanza_umbral = true
       where id = ${avanza} and workspace_id = ${ws}`);
     await expect(aprobar()).rejects.toThrow(/SYS-13/);
 
@@ -288,7 +299,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
       (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaId})`);
     await conUsuario(leadId, (tx) => tx`update concepto
-      set estado = 'pasa', test_lectura = '7 de 8'
+      set estado = 'pasa', test_lectura = '7 de 8', test_alcanza_umbral = true
       where id = ${c} and workspace_id = ${ws}`);
 
     await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
@@ -316,7 +327,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
       ).rejects.toThrow(/permission denied|denegado/i);
     }
     await conUsuario(leadId, (tx) => tx`update concepto
-      set estado = 'pasa', umbral_test = '6 de 8', test_lectura = '6 de 8'
+      set estado = 'pasa', umbral_test = '6 de 8', test_lectura = '6 de 8', test_alcanza_umbral = true
       where id = ${c} and workspace_id = ${ws}`);
     const [sellado] = await admin`select decidido_por, decidido_en from concepto where id = ${c}`;
     expect(sellado!.decidido_por).toBe(leadId);
@@ -412,7 +423,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
       (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaId})`);
     await conUsuario(leadId, (tx) => tx`update concepto
-      set estado = 'pasa', test_lectura = '7 de 8'
+      set estado = 'pasa', test_lectura = '7 de 8', test_alcanza_umbral = true
       where id = ${c} and workspace_id = ${ws}`);
   });
 
@@ -433,7 +444,7 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
     await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
       (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaId})`);
     await conUsuario(leadId, (tx) => tx`update concepto
-      set test_lectura = '7 de 8', estado = 'pasa'
+      set test_lectura = '7 de 8', test_alcanza_umbral = true, estado = 'pasa'
       where id = ${c} and workspace_id = ${ws}`);
     await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
       where id = ${gateId}`;
@@ -487,6 +498,128 @@ describeAuthz('conceptos: la solución candidata de la etapa 4', () => {
       where workspace_id = ${ws} and tipo = 'DecisionAprobada'
         and payload ->> 'decisionId' = ${decisionId}`;
     expect((ev!.payload as { conceptoId: string }).conceptoId).toBe(propio);
+  });
+
+  /**
+   * «Alcance EL UMBRAL» no lo dice un par de cadenas llenas.
+   *
+   * Con solo el listón y la lectura, «6 de 8» junto a «2 de 8» pasaba: las dos cadenas
+   * estaban escritas, y ahí se acababa la comprobación. Y la base no puede resolverlo
+   * comparándolas —el umbral de un test cualitativo puede ser «ningún participante abandona en
+   * el paso 3»—, así que lo que se exige es la AFIRMACIÓN de quien lo leyó, que es lo que
+   * SYS-13 pide de verdad y lo que se puede auditar.
+   */
+  it('un test que no alcanza su umbral no hace avanzar al concepto', async () => {
+    const c = await nuevoConcepto('Se queda corto');
+    await conUsuario(leadId, (tx) => tx`update concepto set umbral_test = '6 de 8'
+      where id = ${c} and workspace_id = ${ws}`);
+    await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
+      (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaId})`);
+
+    // La lectura obliga a decir si alcanzó: no hay lectura sin afirmación.
+    await expect(
+      conUsuario(leadId, (tx) => tx`update concepto set test_lectura = '2 de 8'
+        where id = ${c} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/check constraint/);
+
+    // Y dicha que NO, el concepto no avanza: lo que le queda es morir con su razón, que es la
+    // otra mitad de SYS-13.
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set test_lectura = '2 de 8', test_alcanza_umbral = false
+      where id = ${c} and workspace_id = ${ws}`);
+    await expect(
+      conUsuario(leadId, (tx) => tx`update concepto set estado = 'pasa'
+        where id = ${c} and workspace_id = ${ws}`),
+    ).rejects.toThrow(/check constraint/);
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set estado = 'muere', veredicto_razon = 'El test se quedó en 2 de 8'
+      where id = ${c} and workspace_id = ${ws}`);
+  });
+
+  /**
+   * G4 mira los derechos VIVOS de la prueba, no los que había al enlazarla.
+   *
+   * Entre el enlace y la firma se revocan permisos y caducan contratos, y G4 se firma con el
+   * cliente delante. Es el mismo eje tiempo que G2 tiene para los arquetipos confirmados, y no
+   * hay razón para que la etapa 4 sea más laxa que la 2 sobre el mismo material.
+   */
+  it('G4 no se aprueba si la prueba del concepto perdió sus derechos', async () => {
+    const admin = sqlAdmin();
+    const { reto, gateId } = await nuevoRetoConG4();
+    const c = await nuevoConcepto('Probado con material que caducó', reto);
+    await conUsuario(leadId, (tx) => tx`update concepto set umbral_test = '6 de 8'
+      where id = ${c} and workspace_id = ${ws}`);
+    await conUsuario(leadId, (tx) => tx`insert into concepto_evidencia
+      (workspace_id, concepto_id, evidencia_id) values (${ws}, ${c}, ${evidenciaId})`);
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set estado = 'pasa', test_lectura = '7 de 8', test_alcanza_umbral = true
+      where id = ${c} and workspace_id = ${ws}`);
+
+    // Se revoca DESPUÉS del enlace, que es el caso entero.
+    // Se retira como se retira de verdad: `denegado` es el estado del catálogo —no existe
+    // 'revocado'— y «ámbito y vigencia solo significan algo si hay concesión», así que el
+    // CHECK de la tabla obliga a devolver el ámbito a interno en el mismo movimiento.
+    await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+      where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    const faltas = await conUsuario(leadId, (tx) =>
+      tx`select * from gate_faltas_para_aprobar_visible(${gateId}::uuid, ${ws}::uuid)`);
+    // El código NO basta: la regla general del checklist emite el mismo DR001, y con ella el
+    // caso pasaba aun con la rama de G4 apagada. Se comprueba el motivo, que es de esta rama.
+    expect(faltas.map((f) => String(f.motivo))).toContainEqual(
+      expect.stringMatching(/la evidencia de test del concepto «Probado con material que caducó»/),
+    );
+    await expect(
+      admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+        where id = ${gateId}`,
+    ).rejects.toThrow(/derechos vigentes/);
+
+    // Y devueltos, se aprueba: sin esta mitad, un guard que bloqueara siempre pasaría la otra.
+    await admin`update derecho_uso set estado = 'concedido', ambito = 'cliente'
+      where evidencia_id = ${evidenciaId} and workspace_id = ${ws}`;
+    await admin`update gate_instancia set estado = 'aprobado', aprobado_por = ${leadId}
+      where id = ${gateId}`;
+    const [tras] = await admin`select estado from gate_instancia where id = ${gateId}`;
+    expect(tras!.estado).toBe('aprobado');
+  });
+
+  /**
+   * Lo que el veredicto AFIRMÓ no se reescribe después.
+   *
+   * El evento es inmutable y lleva la razón dentro: `ConceptoMuere` archiva `veredicto_razon`
+   * tal como estaba al decidir. Editable después, el expediente y el archivo dicen cosas
+   * distintas sin que nada lo delate. Con la lectura del test es peor: un resultado reescrito
+   * tras la firma deja a G4 certificando una prueba que ya no existe.
+   *
+   * Se congela lo que se afirmó, no la fila: corregir una errata del título no contradice a
+   * ningún evento.
+   */
+  it('tras el veredicto no se reescriben la razón ni el resultado del test', async () => {
+    const admin = sqlAdmin();
+    const c = await nuevoConcepto('Con su historia cerrada');
+    await conUsuario(leadId, (tx) => tx`update concepto
+      set estado = 'muere', veredicto_razon = 'No resuelve el problema de fondo'
+      where id = ${c} and workspace_id = ${ws}`);
+    for (const [columna, valor] of [
+      ['veredicto_razon', 'Otra razón distinta'],
+      ['umbral_test', '6 de 8'],
+      ['test_lectura', '7 de 8'],
+    ] as const) {
+      await expect(
+        conUsuario(leadId, (tx) => tx`update concepto
+          set ${tx.unsafe(columna)} = ${valor}
+          where id = ${c} and workspace_id = ${ws}`),
+      ).rejects.toThrow(/ya se decidió/);
+    }
+    // Y el evento sigue diciendo lo mismo que la fila.
+    const [ev] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'ConceptoMuere'
+        and payload ->> 'conceptoId' = ${c}`;
+    const [fila] = await admin`select veredicto_razon from concepto where id = ${c}`;
+    expect((ev!.payload as { razon: string }).razon).toBe(fila!.veredicto_razon);
+
+    // El nombre sí se corrige: no es lo que se decidió, es cómo se llama.
+    await conUsuario(leadId, (tx) => tx`update concepto set titulo = 'Con su historia cerrada (bis)'
+      where id = ${c} and workspace_id = ${ws}`);
   });
 
   /** Quien no hace método no propone conceptos: es trabajo de diseño, no de lectura. */

@@ -7810,6 +7810,19 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * ofrece un concepto con una propuesta de C4 pendiente —así que no se puede pedir otro lote
    * hasta resolver éste—, y la ventana de lentes descuenta las ya revisadas —así que el lote
    * siguiente pide exactamente las que faltan—. La sonda recorre el ciclo entero.
+   *
+   * Y ESE ORDEN TIENE UN PRECIO, que conviene decir aquí porque es lo que se está eligiendo:
+   * recuperar no es «volver a pedir». Con el lote parcial pendiente, pedir otra vez responde
+   * «ese concepto ya tiene revisiones propuestas esperando decisión: decídelas antes de pedir
+   * otras», así que primero hay que DECIDIR las que llegaron. No son propuestas ajenas —son
+   * lentes que quien revisa pidió—, pero sí una decisión adelantada sobre una foto parcial, y
+   * la llamada por las que faltan se paga igual.
+   *
+   * La alternativa es tratar el lote corto como respuesta fuera de contrato y descartarlo, como
+   * se hace con dos sesiones del mismo arquetipo o con una cita fuera de su lente. Se queda sin
+   * hacer a propósito: con 5 de 6 conservar es claramente mejor y con 1 de 6 claramente peor,
+   * o sea que lo que hay debajo es un umbral, y un umbral es decisión de producto. Queda
+   * anotado para quien la tome, con el precio medido y no supuesto.
    */
   it('un lote de C4 incompleto se guarda, y el siguiente pide exactamente las lentes que faltan', async () => {
     await enWorkspaceLimpio('c4-parcial', async ({ ws: wsC, curadorId, retoId: retoC }) => {

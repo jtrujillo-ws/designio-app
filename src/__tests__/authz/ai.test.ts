@@ -10622,6 +10622,138 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * EL ID DE LA LENTE SE NORMALIZA, Y EN TODOS LOS SITIOS QUE LO COMPARAN.
+   *
+   * `z.string().uuid()` admite los hexadecimales en MAYÚSCULA y Postgres almacena el uuid en
+   * minúscula, así que el contrato normaliza al parsear —`IdCopiadoDelMaterial`— y los guards
+   * ponen `lower(...)` como suelo, «porque el suelo no depende de que la aplicación haya hecho
+   * bien su parte». Eso ya estaba escrito en este repositorio, y en C4 se cumplía en UN sitio de
+   * cinco: el guard de materialización. El de linaje, el recheck bajo candado, el índice único
+   * de la lente pendiente y la rotación del selector comparaban el texto crudo.
+   *
+   * Lo que se veía era una NEGATIVA falsa: por la superficie concedida, un `arquetipoId` válido
+   * escrito en mayúscula no acertaba ningún arquetipo y salía por «esa lente no es del reto del
+   * concepto» — un mensaje que además apunta al sitio equivocado. Y detrás quedaba lo peor: dos
+   * propuestas pendientes de la MISMA lente escrita en dos cajas distintas son dos claves
+   * distintas para el índice, así que la exclusión de la ronda 27 no las veía.
+   */
+  it('C4 normaliza el id de la lente: mayúscula entra, y sigue siendo la misma lente', async () => {
+    await enWorkspaceLimpio('c4-lente-mayuscula', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const proponer = (arquetipoId: string) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId,
+            sintesis: 'Una lectura.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas: [
+                  { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+                ],
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [pr] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return pr!.id as string;
+        });
+
+      // En MAYÚSCULA entra: es el mismo uuid, y el contrato lo admitiría igual.
+      expect(await proponer(lenteA.toUpperCase())).toBeTruthy();
+      // Y sigue siendo LA MISMA LENTE para el índice de pendientes: en minúscula ya no cabe otra.
+      await expect(
+        proponer(lenteA),
+        'dos pendientes de la misma lente, escrita en dos cajas: el índice no las vio',
+      ).rejects.toThrow();
+    });
+  });
+
+  /**
+   * Y LA REVISIÓN A MANO RELEE SU ARQUETIPO BAJO EL CANDADO, que es la OTRA puerta.
+   *
+   * La ronda anterior cerró esto para la PROPUESTA y me dejé la ruta que no pasa por
+   * `propuesta_ai`: escribir la revisión directamente. Su política pide que la lente sea del reto
+   * y no esté refutada, y eso cierra la escritura tardía secuencial y no la concurrente — RLS
+   * decidió con la instantánea de antes de esperar el candado, y el veredicto que se firma
+   * mientras espera no lo ve nadie. Queda una revisión en la que HABLA un perfil ya declarado
+   * inexistente, que es peor que dibujarlo.
+   *
+   * Es la tercera vez que la misma regla aparece con una capa menos en un camino: primero el
+   * concepto, luego la lente en la propuesta, ahora la lente aquí.
+   */
+  it('C4 a mano no deja entrar una revisión cuya lente se refutó mientras esperaba el candado', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-lente-refutada-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update arquetipo set estado = 'refutado',
+          veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+          where id = ${lenteA} and workspace_id = ${wsC}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      const escritura = conUsuario(curadorId, (tx) =>
+        tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó después del veredicto', ${curadorId})`,
+      );
+      try {
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
+        for (let i = 0; i < 100; i++) {
+          if ((await esperandoLaClave()) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(
+          await esperandoLaClave(),
+          'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
+        ).toBe(1);
+      } finally {
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/se refutó mientras|refutado no describe/i);
+    });
+  });
+
+  /**
    * EL GUARD DE SOSTÉN SE VUELVE A PREGUNTAR TAMBIÉN AL AÑADIR UNA CITA.
    *
    * Las dos clases de RF-08.2 se excluyen desde la ronda 28, y cada dirección entra por su
@@ -11022,18 +11154,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(await seOfrece()).toBe(true);
 
       /*
-       * 2. LA POLÍTICA: ni siquiera escrita a mano entra una revisión de la refutada.
+       * 2. EL SUELO: ni siquiera escrita a mano entra una revisión de la refutada.
        *
        * Va COMPLETA —hallazgo, cita y pregunta— y no como una fila suelta, porque una suelta
        * la para el trigger de completitud y la sonda mediría esa puerta. Medido: con el
        * predicado neutralizado, la fila suelta respondía «esa revisión simulada se queda sin
        * hallazgos», o sea que se movía sin medir lo que dice medir.
+       *
+       * Y ahora lo cubren DOS capas, así que la afirmación admite las dos salidas. La política
+       * era la única cuando esto se escribió; desde que el guard del candado relee el arquetipo
+       * —para el veredicto que se firma MIENTRAS se espera—, responde él primero: un trigger
+       * BEFORE corre antes de que se evalúe el `with check` de la política. Es literalmente el
+       * caso que este repositorio ya tenía escrito, «las dos capas de una misma regla se tapan:
+       * neutralizando cualquiera, la otra rechaza; lo que las separa es la SALIDA del mensaje».
+       * Fijar aquí una de las dos convertiría esta sonda en una prueba del orden de las capas.
        */
       await expect(
         conUsuario(curadorId, (tx) =>
           revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Lo que diría quien no existe'),
         ),
-      ).rejects.toThrow(/row-level security|violates row-level/i);
+      ).rejects.toThrow(/row-level security|violates row-level|refutado no describe/i);
       // Y la sana entra, que es lo que separa «no revisa la refutada» de «no revisa nadie».
       await expect(
         conUsuario(curadorId, (tx) =>

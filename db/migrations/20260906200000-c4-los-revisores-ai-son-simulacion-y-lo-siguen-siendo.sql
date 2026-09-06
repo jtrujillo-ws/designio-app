@@ -439,10 +439,12 @@ declare
   v_revision uuid;
   v_hallazgo uuid;
   v_reto uuid;
+  v_arquetipo uuid;
 begin
   v_fila := coalesce(new, old);
   if tg_table_name = 'revision_simulada' then
     v_concepto := v_fila.concepto_id;
+    v_arquetipo := v_fila.arquetipo_id;
   elsif tg_table_name = 'hallazgo_simulado_evidencia' then
     v_hallazgo := v_fila.hallazgo_id;
     select h.revision_id into v_revision
@@ -499,6 +501,42 @@ begin
                         where c.id = v_concepto and c.workspace_id = v_fila.workspace_id
                           and c.estado = 'candidato') then
       raise exception 'ese concepto ya no es candidato: su veredicto se firmó mientras esta escritura esperaba el candado del reto, así que llega después del pasa/muere que la revisión existía para informar';
+    end if;
+    /*
+     * Y EL ARQUETIPO, que es la tercera mitad de la misma pregunta.
+     *
+     * La política de inserción ya exige que la lente sea del reto del concepto y no esté
+     * refutada, y eso —otra vez— cierra la escritura tardía secuencial y no la concurrente: la
+     * instantánea con la que RLS decidió se tomó antes de que este trigger empezara a esperar.
+     * El veredicto de SPEC-04.11 que se firma MIENTRAS espera no lo ve nadie, y queda una
+     * revisión en la que HABLA un perfil que ya se declaró inexistente.
+     *
+     * La propuesta de C4 ya se releía así desde la ronda anterior; ésta es la OTRA puerta a las
+     * mismas tablas, la que no pasa por `propuesta_ai`, y me la dejé. Es la tercera vez que la
+     * misma regla aparece con una capa menos en un camino.
+     *
+     * Sólo al INSERTAR: borrar una revisión cuya lente se refutó después tiene que seguir siendo
+     * posible —es como se corrige— y las hojas cuelgan de una revisión que era legal cuando
+     * nació; refutar no deshace lo escrito, igual que no desenlaza su evidencia.
+     *
+     * Y sólo por el VEREDICTO, en positivo, no por «la lente sigue siendo válida». Que el
+     * arquetipo sea del reto del concepto es IDENTIDAD y no cambia nunca: un arquetipo no se
+     * muda de reto, así que ahí no hay carrera que ganar y la política ya lo dice con su propio
+     * mensaje. La primera versión de esto preguntaba las dos cosas juntas y contestaba «esa
+     * lente se refutó» ante una lente de otro reto — un mensaje que apunta al sitio equivocado,
+     * que es la avería que este PR ya arregló una vez en el motivo de `conciliacion-cambiada`.
+     * Lo cazó una sonda de la ronda 1 al correr la suite entera.
+     *
+     * Y NO se pide aquí evidencia utilizable, a diferencia de la propuesta: el modelo necesita
+     * material del que salir y una persona no — una revisión de puras hipótesis sobre una lente
+     * sin documentos citables es legítima, y las citas que sí escriba las gobiernan los guards
+     * de la hoja.
+     */
+    if session_user = 'designio_app' and tg_op = 'INSERT' and v_arquetipo is not null
+       and exists (select 1 from arquetipo a
+                    where a.id = v_arquetipo and a.workspace_id = v_fila.workspace_id
+                      and a.estado = 'refutado') then
+      raise exception 'esa lente se refutó mientras esta escritura esperaba el candado del reto: un arquetipo refutado no describe a nadie (SPEC-04.11), así que no puede hablar en una revisión que llega después de su veredicto';
     end if;
   end if;
   return v_fila;
@@ -854,7 +892,7 @@ create unique index reserva_ai_outcome_review_idx
 -- Sólo sobre las PENDIENTES, para que reintentar después de rechazar siga siendo posible — que
 -- es justo lo que la rotación de lentes existe para permitir.
 create unique index propuesta_ai_c4_lente_pendiente_idx
-  on propuesta_ai (workspace_id, concepto_id, (contenido ->> 'arquetipoId'))
+  on propuesta_ai (workspace_id, concepto_id, (lower(contenido ->> 'arquetipoId')))
   where capacidad = 'C4' and estado = 'propuesta';
 
 -- El nombre lo elige el CENSO, no el gusto: la suite recorre las restricciones cuyo nombre
@@ -1024,7 +1062,7 @@ begin
       from concepto c
       join arquetipo a on a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
      where c.id = new.concepto_id and c.workspace_id = new.workspace_id
-       and a.id::text = new.contenido ->> 'arquetipoId'
+       and a.id::text = lower(new.contenido ->> 'arquetipoId')
        and a.estado <> 'refutado') then
     raise exception 'esa propuesta declara una lente que no es un arquetipo vigente del reto de su concepto: una sesión de C4 es la lectura de UNA lente de ESE concepto (SYS-20), y nacería imposible de aceptar';
   end if;
@@ -2672,7 +2710,7 @@ begin
           from concepto c
           join arquetipo a on a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
          where c.id = new.concepto_id and c.workspace_id = new.workspace_id
-           and a.id::text = new.contenido ->> 'arquetipoId'
+           and a.id::text = lower(new.contenido ->> 'arquetipoId')
            and a.estado <> 'refutado'
            and exists (
              select 1 from arquetipo_evidencia ae

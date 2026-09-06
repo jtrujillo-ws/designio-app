@@ -3483,7 +3483,7 @@ function lentesDelConcepto(
                   where pd.concepto_id = ${alias.concepto}.id
                     and pd.workspace_id = ${alias.concepto}.workspace_id
                     and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
-                    and pd.contenido ->> 'arquetipoId' = a.id::text
+                    and lower(pd.contenido ->> 'arquetipoId') = a.id::text
                     and pd.llamada_id is distinct from ${alias.lote})),
                   a.nombre, a.id), '[]'::json)
        from arquetipo a

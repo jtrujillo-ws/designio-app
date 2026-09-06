@@ -10293,6 +10293,160 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * un id que no nombra ningún documento de este workspace no puede autorizar el pasaje que
    * lleva al lado.
    */
+  /**
+   * NINGUNA COMPARACIÓN DEL GUARD DE SELLO SE APOYA EN UN ARRAY QUE PUEDE NO ESTAR.
+   *
+   * `jsonb_array_length(NULL)` es NULL, y en plpgsql un `IF NULL` no salta. Un contenido de C4
+   * sin la clave `hallazgos` dejaba la comparación de la cuenta en NULL y la del `exists` en
+   * falso —`jsonb_array_elements(NULL)` no devuelve filas—, así que `NULL or false` es NULL y el
+   * guard entero se saltaba: se podían materializar hojas arbitrarias y sellar la propuesta
+   * aunque su contenido inmutable no registrara ninguna. Eso es la procedencia rota, que es lo
+   * único que el sello promete. Medido antes de tocarlo:
+   *
+   *   rama de la cuenta es NULL: true | rama del exists: false | el IF entero NO salta: true
+   *
+   * `coalesce(..., -1)` y no `..., 0`: cero significaría «el contenido declara ninguna», que
+   * para un array obligatorio no es un estado legal, y con cero hojas selladas la comparación
+   * volvería a pasar. Menos uno no es igual a ningún recuento real, así que el guard SIEMPRE
+   * salta. Y no se apoya en que otro trigger exija al menos un hallazgo: un guard que necesita
+   * otro guard para ser total no es total.
+   *
+   * Se mide sobre el guard VIVO —`pg_get_functiondef`— y por la FORMA, no sobre los tres sitios
+   * que hay hoy: eran tres y el hallazgo nombraba dos, así que la lista escrita a mano habría
+   * dejado el tercero, que además es de C2. El cuarto lo caza esto solo.
+   */
+  it('el guard de sello no compara contra un array que puede faltar', async () => {
+    const admin = sqlAdmin();
+    const [g] = await admin`select pg_get_functiondef(oid) as cuerpo from pg_proc
+      where proname = 'propuesta_ai_materializacion_guard'`;
+    const cuerpo = g!.cuerpo as string;
+    const todas = [...cuerpo.matchAll(/jsonb_array_length\(\s*new\.contenido[^)]*\)/g)].map(
+      (m) => m[0],
+    );
+    // Y el censo se cae si no encuentra ninguna, en vez de pasar sobre una lista vacía.
+    expect(
+      todas.length,
+      'el censo no encontró ninguna lectura de array en el guard: está mirando la función equivocada',
+    ).toBeGreaterThan(0);
+    const desnudas = todas.filter(
+      (lectura) => !cuerpo.includes(`coalesce(${lectura}`) && !cuerpo.includes(`coalesce( ${lectura}`),
+    );
+    expect(
+      desnudas,
+      'una comparación del sello lee un array del contenido sin coalesce: si la clave falta, la rama vale NULL y el IF no salta, así que se puede sellar contra hojas que el contenido no declara',
+    ).toEqual([]);
+    // Y la mitad que lo hace verdad y no sólo forma: con la clave ausente, la comparación ya no
+    // es NULL sino verdadera, que es lo que hace saltar el guard.
+    const [r] = await admin`select
+      (coalesce(jsonb_array_length('{}'::jsonb->'hallazgos'), -1) <> 0) as salta,
+      (jsonb_array_length('{}'::jsonb->'hallazgos') <> 0) is null as antes_era_null`;
+    expect(r!.antes_era_null).toBe(true);
+    expect(r!.salta).toBe(true);
+  });
+
+  /**
+   * UNA CITA GUARDADA EN MAYÚSCULA NO CONVIERTE LA PROPUESTA EN INCORREGIBLE.
+   *
+   * Es la sexta vez que un identificador comparado en crudo cuesta una ronda en este PR, y la
+   * segunda con esta forma exacta: la ronda 35 la arregló para el `arquetipoId` y las citas se
+   * quedaron byte a byte, una capa más adentro. Peor: el comentario que lo justificaba decía que
+   * las citas «son texto, y ahí la igualdad exacta es la pregunta» — y una cita lleva un uuid.
+   *
+   * Con el id guardado en mayúscula, el contrato lo baja al parsear la corrección y las dos
+   * capas —el guard de la base y la comprobación del servicio— leían esa normalización como una
+   * edición del testimonio. La propuesta sólo se podía aceptar tal cual o rechazar.
+   *
+   * Y la otra mitad, sin la cual esto sería debilitar el guard: mover una cita de hallazgo
+   * SIGUE rechazándose. Es lo único contrastable que hay en una revisión simulada.
+   */
+  it('C4 corrige los textos de una propuesta cuya cita se guardó en mayúscula, y no las citas', async () => {
+    await enWorkspaceLimpio('c4-cita-mayuscula-correccion', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+          {
+            titulo: 'Puede que abandone antes',
+            descripcion: 'Extrapolado del perfil.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      // Por el camino real, para que la huella del material sea la de verdad.
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+      // Y se sube la caja del id de la CITA por fuera del servicio, en las dos columnas: lo que
+      // se simula es una fila que NACIÓ así, no una corrección.
+      for (const col of ['contenido', 'contenido_original']) {
+        await admin`update propuesta_ai
+            set ${admin(col)} = jsonb_set(${admin(col)}, '{hallazgos,0,citas,0,evidenciaId}',
+                                          to_jsonb(upper(${evA}::text)))
+          where id = ${propuestaId} and workspace_id = ${wsC}`;
+      }
+
+      /*
+       * Cambiar la cita DE VERDAD sigue rechazándose, esté el id en la caja que esté. Se cambia
+       * el `fragmento` y no el reparto porque mover una cita a un hallazgo marcado como
+       * hipótesis lo rechaza ANTES el contrato —una hipótesis no lleva citas, que es la mitad
+       * de SYS-20 que hace que la marca signifique algo—, y esa puerta no es la que se mide
+       * aquí. Medido: sin esto salía «La corrección no cumple el formato de la capacidad».
+       */
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId,
+          correccion: {
+            ...contenido,
+            hallazgos: [
+              {
+                ...contenido.hallazgos[0]!,
+                citas: [{ ...contenido.hallazgos[0]!.citas[0]!, fragmento: 'Otra cosa dijo' }],
+              },
+              contenido.hallazgos[1]!,
+            ],
+          },
+        }),
+      ).rejects.toThrow(/citas/i);
+
+      // Y corregir los TEXTOS entra, que es para lo que existe la corrección.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+        correccion: { ...contenido, sintesis: 'La misma lectura, con la síntesis pulida.' },
+      });
+      const [fila] = await admin`select sintesis from revision_simulada where id = ${objetoId}`;
+      expect(fila!.sintesis).toBe('La misma lectura, con la síntesis pulida.');
+      // Y el enlace materializado cuelga del documento de verdad, no de un id en otra caja.
+      const [enlace] = await admin`select he.evidencia_id from hallazgo_simulado_evidencia he
+        join hallazgo_simulado h on h.id = he.hallazgo_id and h.workspace_id = he.workspace_id
+        where h.revision_id = ${objetoId}`;
+      expect(enlace!.evidencia_id).toBe(evA);
+    });
+  });
+
   it('C4: una cita con un id que no es uuid no tumba el panel entero', async () => {
     await enWorkspaceLimpio('c4-id-torcido', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();

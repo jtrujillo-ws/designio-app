@@ -1115,20 +1115,57 @@ create trigger a_propuesta_ai_c4_linaje
 --
 -- Las tres partes son las mismas que el servicio declara intocables, escritas donde no hace
 -- falta pasar por él. Y solo en UPDATE: al insertar, el contenido ES el original.
+-- LAS CITAS DE C4, EN FORMA CANÓNICA: el reparto intacto, el identificador en minúscula.
+--
+-- La comparación de arriba era byte a byte, y el comentario de al lado lo justificaba diciendo
+-- que «las citas son texto, y ahí la igualdad exacta es la pregunta». Se contradecía solo: una
+-- cita lleva un `evidenciaId` dentro, y eso es un UUID. Por la superficie concedida entra en
+-- mayúscula —los guards lo admiten desde que comparan con `lower()`—, el contrato lo canoniza al
+-- parsear la corrección, y entonces este guard leía la normalización como una edición de citas:
+-- una propuesta así sólo se podía aceptar tal cual o rechazar, ni una coma de sus textos.
+--
+-- Es la misma avería que la de la lente, una capa más adentro, y hace la sexta vez que un
+-- identificador comparado en crudo cuesta una ronda en este PR.
+--
+-- Lo que NO se canoniza: `fragmento` y `localizacion`, que son el texto copiado del documento y
+-- ahí la igualdad byte a byte sí es exactamente la pregunta. Y las dos dimensiones del reparto
+-- —qué cita cuelga de qué hallazgo, y en qué orden— se conservan con los dos `ordinality`,
+-- porque son lo único contrastable que hay en una revisión simulada.
+create function citas_c4_canonicas(p_contenido jsonb) returns jsonb
+language sql immutable set search_path = public, pg_temp as
+$$
+  select coalesce(jsonb_agg(porHallazgo order by pos), '[]'::jsonb)
+    from jsonb_array_elements(coalesce(p_contenido -> 'hallazgos', '[]'::jsonb))
+         with ordinality as h(hallazgo, pos),
+    lateral (
+      select coalesce(jsonb_agg(
+               case when jsonb_typeof(c.cita -> 'evidenciaId') = 'string'
+                    then jsonb_set(c.cita, '{evidenciaId}',
+                                   to_jsonb(lower(c.cita ->> 'evidenciaId')))
+                    else c.cita end
+               order by c.orden), '[]'::jsonb) as porHallazgo
+        from jsonb_array_elements(coalesce(h.hallazgo -> 'citas', '[]'::jsonb))
+             with ordinality as c(cita, orden)
+    ) agrupadas
+$$;
+comment on function citas_c4_canonicas(jsonb) is
+  'SYS-17 + SYS-20: las citas de una revisión simulada con el reparto por hallazgo intacto y el identificador del documento en minúscula, para poder preguntar si SON LAS MISMAS sin que la caja del uuid cuente como una corrección.';
+revoke execute on function citas_c4_canonicas(jsonb) from public;
+grant execute on function citas_c4_canonicas(jsonb) to designio_app;
+
 create function propuesta_ai_c4_testimonio_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $fn$
 begin
   if new.capacidad <> 'C4' then
     return new;
   end if;
-  if jsonb_path_query_array(new.contenido, '$.hallazgos[*].citas')
-     is distinct from jsonb_path_query_array(new.contenido_original, '$.hallazgos[*].citas')
+  if citas_c4_canonicas(new.contenido)
+     is distinct from citas_c4_canonicas(new.contenido_original)
   then
     raise exception 'las citas de una revisión simulada no se corrigen, ni se reparten entre sus hallazgos: son el rastro de lo que el modelo dijo haber leído, y qué documento sostiene cuál lectura es lo único contrastable que hay aquí';
   end if;
-  -- Y el identificador, CANÓNICO en los dos lados. Las citas y las marcas de hipótesis se
-  -- comparan byte a byte porque son texto y booleanos —ahí la igualdad exacta es la pregunta—,
-  -- pero un uuid no: lo que esto pregunta es si sigue siendo LA MISMA lente. Sin `lower()`, una
+  -- Y el identificador de la LENTE, canónico en los dos lados por la misma razón que el de
+  -- cada cita: lo que esto pregunta es si sigue siendo el MISMO perfil. Sin `lower()`, una
   -- propuesta guardada con el id en mayúscula no se podía corregir en absoluto, porque el
   -- contrato canoniza al parsear la corrección y este guard leía la normalización como un
   -- cambio de lente.
@@ -1820,7 +1857,7 @@ begin
   if new.destino = 'revision-simulada' and (
     (select count(*) from hallazgo_simulado h
       where h.revision_id = new.revision_simulada_id and h.workspace_id = new.workspace_id)
-    <> jsonb_array_length(new.contenido->'hallazgos')
+    <> coalesce(jsonb_array_length(new.contenido->'hallazgos'), -1)
     or exists (
       select 1
       from jsonb_array_elements(new.contenido->'hallazgos') with ordinality as p(ha, pos)
@@ -1867,7 +1904,7 @@ begin
   if new.destino = 'revision-simulada' and (
     (select count(*) from pregunta_de_test q
       where q.revision_id = new.revision_simulada_id and q.workspace_id = new.workspace_id)
-    <> jsonb_array_length(new.contenido->'preguntas')
+    <> coalesce(jsonb_array_length(new.contenido->'preguntas'), -1)
     or exists (
       select 1
       from jsonb_array_elements(new.contenido->'preguntas') with ordinality as p(pr, pos)
@@ -2066,7 +2103,7 @@ begin
   if new.destino = 'insight' and (
     (select count(*) from afirmacion a
       where a.insight_id = new.insight_id and a.workspace_id = new.workspace_id)
-    <> jsonb_array_length(new.contenido->'afirmaciones')
+    <> coalesce(jsonb_array_length(new.contenido->'afirmaciones'), -1)
     or exists (
       select 1
       from jsonb_array_elements(new.contenido->'afirmaciones') with ordinality as p(af, pos)

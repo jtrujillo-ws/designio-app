@@ -962,14 +962,32 @@ const CITAS_POR_CAPACIDAD: Record<
 export const CITAS_DEL_CONTENIDO = Object.fromEntries(
   Object.entries(CITAS_POR_CAPACIDAD).map(([capacidad, leer]) => [
     capacidad,
-    (contenido: ContenidoPropuesta) =>
-      leer(contenido).map((cita) =>
-        cita.alcanceId === undefined
-          ? cita
-          : { ...cita, alcanceId: cita.alcanceId.toLowerCase() },
-      ),
+    (contenido: ContenidoPropuesta) => leer(contenido).map(conIdsCanonicos),
   ]),
 ) as Record<CapacidadActiva, (contenido: ContenidoPropuesta) => CitaDelContenido[]>;
+
+/**
+ * Y el `evidenciaId` con él, que es la misma pregunta un campo más allá.
+ *
+ * Esta lista se usa para DOS cosas, y las dos la necesitan canónica: buscar el tramo del
+ * documento —de ahí salió el `alcanceId`— y preguntar «¿son las mismas citas?» al corregir. Lo
+ * segundo se comparaba byte a byte, y yo lo justifiqué diciendo que una cita «es texto, y ahí la
+ * igualdad exacta es la pregunta». Se contradecía solo: una cita lleva un uuid dentro. Con el id
+ * guardado en mayúscula, el contrato lo baja al parsear la corrección y esa normalización se
+ * leía como una edición del testimonio, así que la propuesta sólo se podía aceptar tal cual o
+ * rechazar.
+ *
+ * Lo que NO se toca: `fragmento` y `localizacion`. Son el texto copiado del documento, y ahí la
+ * igualdad byte a byte sí es exactamente lo que se pregunta.
+ */
+function conIdsCanonicos(cita: CitaDelContenido): CitaDelContenido {
+  const canon = (v: unknown) => (typeof v === 'string' ? v.toLowerCase() : v);
+  return {
+    ...cita,
+    ...(cita.alcanceId === undefined ? {} : { alcanceId: cita.alcanceId.toLowerCase() }),
+    ...('evidenciaId' in cita ? { evidenciaId: canon((cita as { evidenciaId: unknown }).evidenciaId) } : {}),
+  } as CitaDelContenido;
+}
 
 /**
  * Qué MÁS, aparte de las citas, es testimonio del modelo y por tanto no se corrige.

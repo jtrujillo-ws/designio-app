@@ -12705,19 +12705,30 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // El `motivo` no es relleno: la base exige que todo desenlace que NO sea
       // `salida-valida` ni `despachada` traiga uno no vacío, porque una llamada pagada que
       // falló sin decir por qué no se puede remediar.
-      const llamada = (resultado: string, costo: number | null, latencia: number | null) =>
+      // Y los TOKENS son parte del fixture, no un adorno: son lo que separa «falta la tarifa»
+      // de «el proveedor no dijo cuánto usó», y sin ellos la sonda no distinguiría las dos.
+      const llamada = (
+        resultado: string,
+        costo: number | null,
+        latencia: number | null,
+        tokens: number | null = null,
+      ) =>
         admin`insert into llamada_ai
           (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo,
-           costo_usd, latencia_ms, creado_por)
+           tokens_entrada, tokens_salida, costo_usd, latencia_ms, creado_por)
           values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', ${resultado},
                   ${resultado === 'salida-valida' || resultado === 'despachada' ? '' : 'la respuesta no cumplió el esquema'},
-                  ${costo}, ${latencia}, ${curadorId})
+                  ${tokens}, ${tokens}, ${costo}, ${latencia}, ${curadorId})
           returning id`.then((r) => r[0]!.id as string);
 
-      await llamada('salida-valida', 0.01, 100);
-      await llamada('salida-valida', 0.02, 300);
-      // Cerrada y FALLIDA, y además sin tarifa: las dos mitades a la vez.
-      await llamada('fuera-de-contrato', null, 500);
+      await llamada('salida-valida', 0.01, 100, 500);
+      await llamada('salida-valida', 0.02, 300, 500);
+      /*
+       * Cerrada y FALLIDA, y además sin coste conocido: las dos mitades a la vez. CON tokens,
+       * que es lo que la hace «sin tarifa» de verdad —hubo uso y no había arancel para ese
+       * modelo—, la única de las dos causas que se arregla registrando una tarifa.
+       */
+      await llamada('fuera-de-contrato', null, 500, 800);
       /*
        * Y las dos clases de `despachada`, que NO son la misma y confundirlas fue el hallazgo
        * de la primera revisión de este PR:
@@ -12735,7 +12746,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         returning id`;
       await admin`update llamada_ai set reserva_id = ${res!.id as string}
         where id = ${await llamada('despachada', null, null)}`;
-      // Y la huérfana: despachada, sin reserva que la cubra.
+      // Y la huérfana: despachada, sin reserva que la cubra. SIN tokens, que es el caso real
+      // de un timeout o un 5xx: el proveedor no devolvió uso, así que el coste no se puede
+      // calcular por mucha tarifa que haya.
       await llamada('despachada', null, null);
 
       const obs = await observabilidadAI(curadorId, wsO);
@@ -12747,17 +12760,25 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           huerfanas: c0.llamadasHuerfanas,
           validas: c0.llamadasValidas,
           sinTarifa: c0.llamadasSinTarifa,
+          sinUso: c0.llamadasSinUso,
           costo: Number(c0.costoUsd.toFixed(2)),
           tasaError: c0.tasaError,
         },
-        'el lector cuenta la línea en vuelo, confunde la huérfana con ella, o suma el coste desconocido como cero',
+        'el lector cuenta la línea en vuelo, confunde la huérfana con ella, suma el coste desconocido como cero, o achaca a una tarifa que falta lo que es un uso que el proveedor no devolvió',
       ).toEqual({
         cerradas: 3,
         enVuelo: 1,
         huerfanas: 1,
         validas: 2,
-        // La fallida sin tarifa Y la huérfana sin tarifa: las dos pueden haberse pagado.
-        sinTarifa: 2,
+        /*
+         * Las dos causas por separado, que fue el hallazgo de la segunda revisión. Las dos
+         * hacen que el total sea un mínimo —la cerrada y la huérfana pueden haberse pagado—,
+         * pero piden cosas distintas: la primera se arregla registrando una tarifa y la
+         * segunda no se arregla. Juntas bajo un solo rótulo, la pantalla mandaba a registrar
+         * una tarifa que no habría cambiado nada.
+         */
+        sinTarifa: 1,
+        sinUso: 1,
         costo: 0.03,
         tasaError: 1 / 3,
       });

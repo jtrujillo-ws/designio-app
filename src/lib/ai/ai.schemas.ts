@@ -10,7 +10,6 @@ import { z } from 'zod';
  * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
  */
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
-import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
@@ -1134,25 +1133,18 @@ export type PropuestaEnPanel = PropuestaEnPanelComun &
     | { contenidoLegible: false; contenido: null; contenidoOriginal: null }
   );
 
-/**
- * Quién puede leer el libro de costos AI del workspace, DERIVADO y no copiado.
+/*
+ * La puerta de rol de la observabilidad AI vive en `ai.roles.ts` —un módulo sin Zod— y aquí se
+ * REEXPORTA para quien ya la importaba de este contrato.
  *
- * §14 pone «observabilidad de costos, latencia, errores y calidad» en la misma fila que la
- * auditoría —«Auditoría y operación»—, así que quien puede leer el registro operativo del
- * workspace puede leer esto. Se deriva de `ROLES_AUDITORIA` en vez de escribir los tres roles
- * otra vez: si algún día tienen que divergir, la divergencia será una edición deliberada en un
- * sitio y no dos listas que se separan solas.
- *
- * Y una asimetría que hay que decir en vez de dar por hecha: la nota de `ROLES_AUDITORIA`
- * presume que «la autoridad es la política RLS», y ahí es cierto —`evento_dominio` devuelve
- * cero filas a los demás roles—. Aquí NO: la política de `llamada_ai` pide membresía a secas,
- * porque el tope diario y el estado de la capacidad la leen para todo el que abre el panel.
- * Así que esta puerta es de PANTALLA y el suelo es más ancho. Cerrar el suelo por rol
- * repetiría la avería de la ronda 42 de #48 —cerrar una fila por rol y romper una lectura ya
- * declarada—, y queda como pregunta de producto: en BYOAI (RF-09.9) `origen_key = 'workspace'`
- * dice que paga el cliente, y quien paga probablemente deba ver la factura.
+ * El motivo es la nota de arriba llevada a sus consecuencias: importar UNA cosa de este fichero
+ * arrastra todos sus esquemas, y el lateral del Loop —que se pinta en cada visita a `/app`— solo
+ * necesitaba una lista de tres roles. Medido con el grafo de módulos: `LoopScreen → lateral →
+ * ai.schemas` era el ÚNICO camino por el que la pantalla del método alcanzaba el contrato de la
+ * capa AI. (En el bundle de hoy no se nota, porque Rollup ya iza este módulo al chunk común al
+ * usarlo tres rutas perezosas; eso es una coincidencia del troceado, no una garantía.)
  */
-export const ROLES_OBSERVABILIDAD_AI = ROLES_AUDITORIA;
+export { ROLES_OBSERVABILIDAD_AI } from './ai.roles';
 
 /**
  * RF-08.9 — lo que el libro de costos dice de UNA capacidad en este workspace.
@@ -1181,12 +1173,25 @@ export type ObservabilidadDeCapacidad = {
   /** Suma de lo que SÍ tiene tarifa registrada. Lo que no la tiene se cuenta al lado. */
   costoUsd: number;
   /**
-   * Llamadas sin coste conocido —cerradas y HUÉRFANAS—: el modelo no tenía tarifa registrada
-   * cuando se llamó. Viaja porque sin este número nadie puede saber si `costoUsd` es el total o
-   * una parte, y «no se sabe» no es «salió gratis». Las huérfanas cuentan aquí porque pueden
-   * haberse pagado; dejarlas fuera apagaba el aviso justo en el caso que lo necesita.
+   * Llamadas sin coste conocido PORQUE FALTA LA TARIFA: hubo uso del proveedor, pero el modelo
+   * no estaba en el arancel cuando se llamó. Es la que se arregla registrando una tarifa.
+   *
+   * Viaja porque sin este número nadie puede saber si `costoUsd` es el total o una parte, y «no
+   * se sabe» no es «salió gratis». Las huérfanas cuentan aquí porque pueden haberse pagado;
+   * dejarlas fuera apagaba el aviso justo en el caso que lo necesita.
    */
   llamadasSinTarifa: number;
+  /**
+   * Y las que no lo tienen PORQUE EL PROVEEDOR NO DIJO CUÁNTO USÓ: ante un timeout, un 5xx o un
+   * fallo de red no vuelve uso, así que los tokens y el coste quedan nulos aunque el modelo
+   * tenga su tarifa.
+   *
+   * Separada de la anterior porque piden cosas distintas: aquélla se arregla registrando una
+   * tarifa y ésta no se arregla —es un fallo del proveedor—. Juntas bajo un solo rótulo, la
+   * pantalla mandaba a registrar una tarifa que no habría cambiado nada. Las dos hacen que
+   * `costoUsd` sea un mínimo.
+   */
+  llamadasSinUso: number;
   latenciaP50Ms: number | null;
   /** El percentil 95, porque una alarma de latencia es sobre la cola: una media se la come
    * el resto de la distribución y deja de avisar justo cuando hay que avisar. */
@@ -1215,6 +1220,7 @@ export type ObservabilidadAI = {
     llamadasHuerfanas: number;
     costoUsd: number;
     llamadasSinTarifa: number;
+    llamadasSinUso: number;
     propuestas: number;
   };
 };

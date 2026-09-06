@@ -93,11 +93,18 @@ function Fila({ c }: { c: ObservabilidadDeCapacidad }) {
       </td>
       <td style={celda}>
         {formatearCosteUsd(c.costoUsd)}
-        {/* Cuántas líneas cerradas no tienen tarifa registrada. Sin este número nadie puede
-            saber si el total de al lado es el total, y «no se sabe» no es «salió gratis». */}
+        {/* Cuántas líneas no tienen coste conocido, y POR QUÉ. Sin este número nadie puede
+            saber si el total de al lado es el total, y «no se sabe» no es «salió gratis»; sin
+            la causa, el aviso manda a registrar una tarifa que en la mitad de los casos no
+            arregla nada, porque lo que falta es el uso que el proveedor no llegó a devolver. */}
         {c.llamadasSinTarifa > 0 && (
           <div style={{ font: '400 11px var(--font-sans)', color: 'var(--warn)' }}>
-            {c.llamadasSinTarifa} sin tarifa
+            {c.llamadasSinTarifa} sin tarifa registrada
+          </div>
+        )}
+        {c.llamadasSinUso > 0 && (
+          <div style={{ font: '400 11px var(--font-sans)', color: 'var(--warn)' }}>
+            {c.llamadasSinUso} sin uso devuelto
           </div>
         )}
       </td>
@@ -190,7 +197,11 @@ function PantallaObservabilidad() {
                 {datos.total.llamadasHuerfanas > 0 &&
                   ` · ${datos.total.llamadasHuerfanas} sin cierre, que pueden haberse pagado y no tienen desenlace`}
                 {datos.total.llamadasSinTarifa > 0 &&
-                  ` · ${datos.total.llamadasSinTarifa} sin tarifa registrada, así que el total es un mínimo`}
+                  ` · ${datos.total.llamadasSinTarifa} sin tarifa registrada`}
+                {datos.total.llamadasSinUso > 0 &&
+                  ` · ${datos.total.llamadasSinUso} sin uso devuelto por el proveedor`}
+                {datos.total.llamadasSinTarifa + datos.total.llamadasSinUso > 0 &&
+                  ', así que el total es un mínimo'}
                 {' · '}
                 {datos.total.propuestas} propuestas nacidas de ellas
               </span>

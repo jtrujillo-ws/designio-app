@@ -1,7 +1,7 @@
 import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
-import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.schemas';
+import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.roles';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
 /**

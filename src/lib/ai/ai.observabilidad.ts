@@ -53,6 +53,7 @@ const NINGUNA: Omit<ObservabilidadDeCapacidad, 'capacidad' | 'etiqueta'> = {
   llamadasValidas: 0,
   costoUsd: 0,
   llamadasSinTarifa: 0,
+  llamadasSinUso: 0,
   latenciaP50Ms: null,
   latenciaP95Ms: null,
   tasaError: null,
@@ -91,12 +92,30 @@ export async function observabilidadAI(
                )::int as huerfanas,
                count(*) filter (where l.resultado = 'salida-valida')::int as validas,
                coalesce(sum(l.costo_usd), 0) as costo_usd,
-               -- Las cerradas Y las huérfanas: las dos pueden haberse pagado, así que si no
-               -- tienen coste conocido el total de arriba es un mínimo y hay que decirlo.
+               /*
+                * Y POR QUÉ no se conoce el coste, que son DOS causas y piden cosas distintas.
+                *
+                * Las dos hacen que el total de arriba sea un mínimo —las cerradas y las
+                * huérfanas pueden haberse pagado—, pero contarlas juntas bajo «sin tarifa» le
+                * decía al operador que le falta registrar una tarifa cuando lo que falta puede
+                * ser otra cosa: ante un timeout, un 5xx o un fallo de red, el proveedor no
+                * devuelve uso, así que cerrarLlamadas persiste los tokens Y el coste en nulo
+                * AUNQUE el modelo tenga su tarifa. Registrarla no habría arreglado nada, y el
+                * aviso mandaba justo ahí.
+                *
+                * Los tokens son lo que las separa, y no por casualidad: costoDeUso devuelve
+                * null exactamente cuando el modelo no está en el arancel, y solo se le llama
+                * habiendo uso. Con uso y sin coste, falta la tarifa; sin uso, falta el dato del
+                * proveedor y la tarifa no pinta nada.
+                */
                count(*) filter (
-                 where l.costo_usd is null
+                 where l.costo_usd is null and l.tokens_entrada is not null
                    and (l.resultado <> 'despachada' or not ${reservaSigueViva(tx, 'l')})
                )::int as sin_tarifa,
+               count(*) filter (
+                 where l.costo_usd is null and l.tokens_entrada is null
+                   and (l.resultado <> 'despachada' or not ${reservaSigueViva(tx, 'l')})
+               )::int as sin_uso,
                percentile_cont(0.5) within group (order by l.latencia_ms) as p50,
                percentile_cont(0.95) within group (order by l.latencia_ms) as p95
           from llamada_ai l
@@ -151,6 +170,7 @@ export async function observabilidadAI(
           llamadasValidas: validas,
           costoUsd: l ? Number(l.costo_usd) : 0,
           llamadasSinTarifa: l ? (l.sin_tarifa as number) : 0,
+          llamadasSinUso: l ? (l.sin_uso as number) : 0,
           latenciaP50Ms: l && l.p50 !== null ? Math.round(Number(l.p50)) : null,
           latenciaP95Ms: l && l.p95 !== null ? Math.round(Number(l.p95)) : null,
           // `null` y no cero cuando no hay ninguna cerrada: un 0 % de error sobre cero llamadas
@@ -182,6 +202,7 @@ export async function observabilidadAI(
           llamadasHuerfanas: filas.reduce((n, f) => n + f.llamadasHuerfanas, 0),
           costoUsd: filas.reduce((n, f) => n + f.costoUsd, 0),
           llamadasSinTarifa: filas.reduce((n, f) => n + f.llamadasSinTarifa, 0),
+          llamadasSinUso: filas.reduce((n, f) => n + f.llamadasSinUso, 0),
           propuestas: filas.reduce((n, f) => n + f.propuestas, 0),
         },
       };

@@ -717,9 +717,11 @@ módulo aparte (ADR-0007).
   concepto** del reto (`decision.concepto_id`, obligatorio para ese tipo y prohibido para los demás;
   un guard comprueba que el concepto sea del reto del proyecto); el formulario ofrece los conceptos
   del reto y, si no hay ninguno, lo dice y no deja registrarla.
-- **Arquetipos** del reto: definición, mapeo n:m a segmentos, evidencia enlazada obligatoria y
-  veredicto `hipotesis` → `confirmado` o `refutado` con razón. Un arquetipo sin evidencia con
-  derechos vigentes no pasa G2; un arquetipo refutado dispara una señal en el journey que lo use.
+- **Arquetipos** del reto: definición, mapeo n:m a segmentos, evidencia enlazada y veredicto
+  `hipotesis` → `confirmado` o `refutado` con razón. La evidencia es obligatoria para **confirmar**
+  (`arquetipo_veredicto_guard`), no para refutar: un arquetipo refutado sin evidencia es válido.
+  G2 exige que ningún arquetipo siga en hipótesis y que los **confirmados** conserven evidencia con
+  derechos vigentes; un arquetipo refutado dispara una señal en el journey que lo use.
 - **Reabrir una etapa** registra motivo y cambios, marca los insights afectados y las decisiones
   aguas abajo, y nunca borra historia (SYS-10). No se reabre un proyecto cerrado.
 
@@ -777,9 +779,11 @@ irreversible, umbral congelado con prueba enlazada, N/A firmada por el rol de G4
 ## Permisos
 
 Los **roles curadores** (lead y diseñador) crean retos candidatos, definen y editan criterios,
-marcan ítems del checklist, y definen y deciden arquetipos; por política también crean, editan,
-prueban y deciden conceptos, aunque hoy sin pantalla. Solo el **lead** activa el reto,
-enlaza evidencia a un arquetipo, registra y revalida decisiones y reabre etapas. Aprueba cada gate
+marcan ítems del checklist, y definen, **enlazan evidencia** y deciden arquetipos
+(`arquetipo_evidencia_insert` admite a ambos y la pantalla ofrece «Enlazar evidencia» a todo
+curador mientras el arquetipo es hipótesis); por política también crean, editan, prueban y deciden
+conceptos, aunque hoy sin pantalla. Solo el **lead** activa el reto, registra y revalida decisiones
+y reabre etapas. Aprueba cada gate
 su rol aprobador. Miembros leen todo el proyecto.
 
 ## Fuente
@@ -917,8 +921,10 @@ una sola sentencia** para que no puedan discrepar entre sí.
 
 ## Design version
 
-- Nace en `borrador` desde un proyecto que aún no certificó G6/G7, enlazada al journey to-be; código
-  `DV-n` asignado por la base.
+- Nace en `borrador` desde un proyecto que aún no certificó G6/G7, con el journey to-be enlazado o
+  **sin él**: `journeyId` es opcional al crear («se puede enlazar después») y `enlazarJourney` lo ata
+  mientras siga en borrador; aprobar exige el journey y su snapshot. Código `DV-n` asignado por la
+  base.
 - **Elementos de cambio** tipados (`touchpoint`, `proceso-backstage`, `canal`, `politica`, `sistema`,
   `paso`, `rol`) con operación (`agrega`, `modifica`, `retira`), nodo del grafo al que afectan y los
   **motivos**: decisiones vigentes e insights validados que lo justifican (solo citables si su
@@ -956,9 +962,10 @@ La design version tiene hilos de comentarios: es el objeto que el cliente discut
 ## Permisos
 
 Miembros leen la cadena completa (es lo que el cliente audita). Los **roles curadores** (lead y
-diseñador) redactan el borrador: crean la design version, enlazan su journey y añaden, editan y
-quitan elementos de cambio. Solo el **lead** aprueba y congela, declara la sucesión, planifica y
-despliega releases y constata el effective state.
+diseñador) redactan el borrador: crean la design version, enlazan su journey, **declaran o corrigen
+a cuál supera** (`supera_a` se escribe bajo la política de borrador, que admite a ambos) y añaden,
+editan y quitan elementos de cambio. Solo el **lead** aprueba y congela, planifica y despliega
+releases y constata el effective state.
 
 ## Fuente
 

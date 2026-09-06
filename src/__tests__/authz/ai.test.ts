@@ -10432,6 +10432,62 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y TAMPOCO PUEDE SABER PARA QUÉ CONCEPTO SE ESCRIBIÓ.
+   *
+   * El contenido de C4 nombra su arquetipo —`arquetipoId`, y hay un guard que lo comprueba
+   * contra el reto del concepto desde la ronda 26— pero NO nombra su concepto: ése viaja como
+   * columna. No hay nada dentro del texto que contrastar, así que una revisión redactada para el
+   * concepto A y escrita bajo el B del mismo reto pasa TODAS las comprobaciones: la lente sigue
+   * siendo del reto, su evidencia sigue siendo la suya, y el veredicto y la ventana son los del
+   * mismo reto.
+   *
+   * Esta sonda mide justo eso —que la base no puede decir que no— y por eso está: es lo que
+   * obliga a que el reinicio viva en el FORMULARIO, que es el único sitio que sabe para qué
+   * concepto se escribió lo que hay en pantalla. Lo mismo que el pasaje que no está en su
+   * documento: donde no hay contra qué comparar, la pantalla es el suelo.
+   */
+  it('C4 a mano no puede saber para qué concepto se escribió: el contenido nombra la lente, no el concepto', async () => {
+    await enWorkspaceLimpio('c4-concepto-ajeno', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un SEGUNDO concepto del MISMO reto, que es donde el selector puede saltar.
+      const [otro] = await admin`insert into concepto
+        (workspace_id, reto_id, titulo, descripcion, umbral_test, creado_por)
+        values (${wsC}, ${retoC}, 'Verificación en sucursal',
+                'El documento se entrega en persona', '6 de cada 8 completan sin ayuda',
+                ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que esta lente ve en el concepto para el que lo escribí.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      // El MISMO texto entra bajo los dos conceptos, uno detrás de otro: nada dentro de él dice
+      // de cuál habla, y la clave única es por `(concepto, lente)`, así que ni siquiera choca.
+      await expect(
+        escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido }),
+      ).resolves.toBeTruthy();
+      await expect(
+        escribirRevisionAMano(curadorId, {
+          workspaceId: wsC,
+          conceptoId: otro!.id as string,
+          contenido,
+        }),
+      ).resolves.toBeTruthy();
+    });
+  });
+
+  /**
    * Y LO QUE LA RUTA MANUAL NO COMPRUEBA: que el pasaje esté en el documento.
    *
    * La presencia literal la mide el panel sobre el material de la llamada (`presenteLiteral`), y

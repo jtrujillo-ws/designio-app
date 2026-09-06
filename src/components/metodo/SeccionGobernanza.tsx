@@ -1073,17 +1073,27 @@ function FormularioRevisionAMano({
   );
 
   /*
-   * Cambiar de lente REINICIA la revisión entera, no sólo sus citas.
+   * Cambiar de LENTE o de CONCEPTO reinicia la revisión entera, no sólo sus citas.
    *
-   * Una revisión es la voz de SU arquetipo: la lectura de conjunto, lo que ve y qué hay que ir a
-   * preguntar son de esa lente y de ninguna otra. Vaciar sólo las citas dejaba lo escrito para A
-   * guardado como lectura de B —y una revisión de puras hipótesis, que no lleva citas, se podía
-   * mandar tal cual—: exactamente la falsa atribución que el guard de corrección impide en la
-   * ruta AI cuando el `arquetipoId` se mueve. El concepto no se toca, que no es de la lente.
+   * Una revisión es lo que UNA lente ve en UN concepto: la lectura de conjunto, los hallazgos y
+   * qué hay que ir a preguntar son de ese par y de ningún otro. Vaciar sólo las citas dejaba lo
+   * escrito para uno guardado como lectura del otro —y una revisión de puras hipótesis, que no
+   * lleva citas, se podía mandar tal cual—: la falsa atribución que el guard de corrección
+   * impide en la ruta AI cuando el `arquetipoId` se mueve.
    *
-   * Y se dice antes de que pase, junto al selector, porque perder lo escrito en silencio es su
-   * propia avería.
+   * Con el concepto es PEOR, y por eso también se reinicia aquí aunque no sea «de la lente»: el
+   * contenido nombra su arquetipo —y hay un guard que lo comprueba contra el reto del concepto—
+   * pero NO nombra su concepto, que viaja como columna. No hay nada dentro del texto que
+   * contrastar, así que ninguna capa puede detectar una revisión escrita para otro concepto del
+   * mismo reto: la lente sigue siendo del reto, su evidencia también, y todo pasa. Medido.
+   *
+   * Y se dice antes de que pase, junto a los selectores, porque perder lo escrito en silencio es
+   * su propia avería.
    */
+  const cambiarConcepto = (v: string) => {
+    setConceptoId(v);
+    limpiar();
+  };
   const cambiarLente = (v: string) => {
     setArquetipoId(v);
     limpiar();
@@ -1157,7 +1167,7 @@ function FormularioRevisionAMano({
       <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
         Revisión escrita a mano · queda marcada como simulación y sin procedencia AI
       </span>
-      <Select value={conceptoId} onChange={(e) => setConceptoId(e.target.value)}>
+      <Select value={conceptoId} onChange={(e) => cambiarConcepto(e.target.value)}>
         <option value="">Concepto que se revisa…</option>
         {candidatos.map((c) => (
           <option key={c.id} value={c.id}>
@@ -1174,7 +1184,8 @@ function FormularioRevisionAMano({
         ))}
       </Select>
       <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
-        Cambiar de lente vacía lo escrito: una revisión es la lectura de SU arquetipo.
+        Cambiar de concepto o de lente vacía lo escrito: una revisión es lo que ESA lente ve en
+        ESE concepto.
       </span>
       <Input
         placeholder="Lectura de conjunto"

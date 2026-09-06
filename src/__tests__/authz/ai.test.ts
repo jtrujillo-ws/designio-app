@@ -10042,6 +10042,88 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Y que el contrato sea el MISMO: lo que no puede escribir el modelo tampoco lo escribe una
    * persona, porque la regla no es sobre quién escribe sino sobre qué se sostiene.
    */
+  /**
+   * EL PASAJE COPIADO ES MATERIAL, y deja de leerse cuando el derecho de uso se va.
+   *
+   * `hallazgo_simulado_evidencia` guarda `fragmento` y `localizacion`: texto copiado del
+   * documento, no una referencia a él. Su gemela de C2 —`cita`— lo tiene dicho desde
+   * RF-03.10: la política de SELECT la gobierna `material_evidencia_visible`, no la membresía.
+   * Ésta nació pidiendo sólo membresía, así que quien no tiene el uso concedido seguía leyendo
+   * el pasaje por la superficie SQL que el rol de la aplicación tiene concedida.
+   *
+   * Y el recorte de la proyección de gobernanza no lo tapa: la lectura directa de la tabla no
+   * pasa por ahí. Menos aún en las revisiones escritas a MANO, que no tienen copia en ninguna
+   * propuesta de la que recortar.
+   *
+   * Se mide con las tres mitades que la regla tiene: quien no tiene el uso deja de ver el
+   * pasaje, la boutique lo sigue viendo porque es su material de trabajo, y la IDENTIDAD de la
+   * evidencia sigue visible para todos, que es lo que SYS-14 exige para poder explicar el
+   * bloqueo.
+   */
+  it('C4: el pasaje de una cita deja de leerse cuando se revoca el derecho de uso', async () => {
+    await enWorkspaceLimpio('c4-pasaje-sin-derechos', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Un miembro sin acceso al material: `material_evidencia_visible` deja pasar siempre a
+      // lead-boutique, diseñador y admin-cliente, así que con uno de ésos no se mediría nada.
+      const correo = `${marca}-c4-pasaje-stake@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${correo}, 'Sponsor del cliente', 'activo') returning id`;
+      const stakeId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${stakeId}, 'Sponsor del cliente', ${correo}, 'stakeholder')`;
+
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido: {
+          arquetipoId: lenteA,
+          sintesis: 'Lo que leo yo de este concepto con esta lente.',
+          hallazgos: [
+            {
+              titulo: 'Pide saber para qué',
+              descripcion: 'No entrega el documento sin motivo.',
+              esHipotesis: false,
+              citas: [
+                { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+              ],
+            },
+          ],
+          preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        },
+      });
+      const pasajes = (quien: string) =>
+        conUsuario(quien, (tx) => tx`select he.fragmento, he.localizacion
+          from hallazgo_simulado_evidencia he
+          join hallazgo_simulado h on h.id = he.hallazgo_id and h.workspace_id = he.workspace_id
+          where h.revision_id = ${revisionId}`);
+
+      // Con el derecho vigente lo ve: no se le esconde el trabajo, se le esconde el material
+      // que todavía no está autorizado para él.
+      expect(await pasajes(stakeId)).toHaveLength(1);
+
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno'
+        where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+
+      expect(
+        await pasajes(stakeId),
+        'el pasaje copiado sigue legible para quien ya no tiene el uso concedido',
+      ).toHaveLength(0);
+      // Y la boutique lo sigue viendo, o el arreglo sería esconderle a todos su propio trabajo.
+      expect(await pasajes(curadorId)).toHaveLength(1);
+      // La IDENTIDAD de la evidencia sigue visible: sin ella no se puede explicar el bloqueo.
+      expect(
+        await conUsuario(stakeId, (tx) => tx`select titulo from evidencia where id = ${evA}`),
+      ).toHaveLength(1);
+      // Y el HALLAZGO al que colgaba se sigue leyendo: lo que se retira es el pasaje del
+      // documento, no la lectura que la revisión hizo de él.
+      expect(
+        await conUsuario(stakeId, (tx) => tx`select titulo from hallazgo_simulado
+          where revision_id = ${revisionId}`),
+      ).toHaveLength(1);
+    });
+  });
+
   it('sin AI, una revisión simulada se escribe a mano y llega entera (SYS-21)', async () => {
     await enWorkspaceLimpio('c4-a-mano-sys21', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();

@@ -582,15 +582,34 @@ alter table hallazgo_simulado enable row level security;
 alter table hallazgo_simulado_evidencia enable row level security;
 alter table pregunta_de_test enable row level security;
 
--- Verlas es de todo miembro del workspace.
+-- Verlas es de todo miembro del workspace: la LECTURA que la revisión hizo no es de nadie en
+-- particular, y esconderla convertiría el archivo en un cuarto cerrado.
 create policy revision_simulada_select on revision_simulada
   for select using (is_workspace_member(app_user_id(), workspace_id));
 create policy hallazgo_simulado_select on hallazgo_simulado
   for select using (is_workspace_member(app_user_id(), workspace_id));
-create policy hallazgo_simulado_evidencia_select on hallazgo_simulado_evidencia
-  for select using (is_workspace_member(app_user_id(), workspace_id));
 create policy pregunta_de_test_select on pregunta_de_test
   for select using (is_workspace_member(app_user_id(), workspace_id));
+
+-- Salvo el PASAJE, que no es lectura sino MATERIAL: `fragmento` y `localizacion` son texto
+-- copiado del documento, y RF-03.10 tiene una sola definición de quién puede recibirlo.
+--
+-- Su gemela de C2 —`cita`— lo dice desde entonces, y ésta nació pidiendo sólo membresía: quien
+-- no tiene el uso concedido seguía leyendo el pasaje por la superficie SQL que el rol de la
+-- aplicación tiene concedida, y el recorte de la proyección de gobernanza no lo tapa porque la
+-- lectura directa de la tabla no pasa por ahí. Menos aún en las revisiones escritas a MANO, que
+-- no tienen copia en ninguna propuesta de la que recortar.
+--
+-- Y es la MISMA función y no una condición equivalente escrita al lado: el día que el derecho
+-- de uso cambie de forma, cambia en un sitio. `material_evidencia_visible` ya envuelve la
+-- membresía, así que no hace falta repetirla.
+--
+-- El hallazgo del que cuelga sigue siendo visible, que es la frontera: se retira el trozo del
+-- documento, no la lectura que la revisión hizo de él. Igual que la IDENTIDAD de la evidencia
+-- —título, resumen, motivo del bloqueo— sigue visible para todos, porque SYS-14 exige poder
+-- explicar por qué está bloqueada.
+create policy hallazgo_simulado_evidencia_select on hallazgo_simulado_evidencia
+  for select using (material_evidencia_visible(evidencia_id, workspace_id));
 
 -- Escribe quien hace método, mientras la etapa 4 siga abierta para este reto Y mientras el
 -- concepto siga siendo CANDIDATO.

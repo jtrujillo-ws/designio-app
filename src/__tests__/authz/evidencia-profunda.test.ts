@@ -1812,6 +1812,59 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     expect(visible).toHaveLength(1);
   });
 
+  /**
+   * Y TODA tabla que guarde un pasaje copiado va bajo el MISMO predicado, se llame como se
+   * llame.
+   *
+   * Esto no es una regla nueva: es la de arriba, contada por la FORMA del esquema en vez de
+   * por la tabla que la estrenó. Se escribió para `cita`, y la siguiente que guardó pasajes
+   * —`hallazgo_simulado_evidencia`, la de las revisiones simuladas— nació pidiendo sólo
+   * membresía, así que quien no tenía el uso concedido leía el texto copiado por la superficie
+   * SQL. Nadie lo vio hasta que un revisor lo leyó, porque no había nada que lo dijera.
+   *
+   * `fragmento` ES la marca: una columna con ese nombre junto a un `evidencia_id` significa
+   * «trozo del documento», y no hay otra cosa que pueda significar. Se busca por ahí y no
+   * contra una lista escrita a mano de «las tablas con material»: esa lista sería una segunda
+   * redacción de la regla, y la tabla que llegue mañana pasaría por no estar en ella.
+   *
+   * Y se exige la MISMA función, no una condición equivalente escrita al lado, porque el día
+   * que el derecho de uso cambie de forma tiene que cambiar en un sitio. Sin `or`, además: un
+   * `is_workspace_member(...) or material_evidencia_visible(...)` mencionaría la función y
+   * dejaría la puerta abierta de par en par.
+   */
+  it('toda tabla con un pasaje copiado la gobierna material_evidencia_visible', async () => {
+    const admin = sqlAdmin();
+    const tablas = await admin`
+      select c.table_name,
+             (select pg_get_expr(pol.polqual, pol.polrelid) from pg_policy pol
+               where pol.polrelid = format('public.%I', c.table_name)::regclass
+                 and pol.polcmd = 'r') as usando
+      from information_schema.columns c
+      where c.table_schema = 'public' and c.column_name = 'fragmento'
+        and exists (select 1 from information_schema.columns e
+          where e.table_schema = c.table_schema and e.table_name = c.table_name
+            and e.column_name = 'evidencia_id')
+      order by 1`;
+    // El censo se cae si no encuentra ninguna, en vez de pasar sobre una lista vacía: hoy son
+    // `cita` y `hallazgo_simulado_evidencia`, y son dos porque la regla se estrenó en una y la
+    // segunda es justo la que se saltó.
+    expect(
+      tablas.map((t) => t.table_name as string),
+      'el censo no encontró ninguna tabla con pasajes copiados: está midiendo el esquema equivocado',
+    ).toEqual(['cita', 'hallazgo_simulado_evidencia']);
+    for (const t of tablas) {
+      const usando = (t.usando as string | null) ?? '(sin política de SELECT)';
+      expect(
+        usando,
+        `${t.table_name as string} guarda pasajes copiados y su SELECT no pasa por material_evidencia_visible: quien perdió el derecho de uso sigue leyendo el texto del documento`,
+      ).toMatch(/\bmaterial_evidencia_visible\(/);
+      expect(
+        usando.toLowerCase(),
+        `la política de ${t.table_name as string} ofrece una alternativa al predicado del material: mencionarlo dentro de un «or» lo deja abierto`,
+      ).not.toMatch(/\bor\b/);
+    }
+  });
+
   it('el sello de la decisión de derechos no lo puede escribir el caller', async () => {
     // `decidido_en` salió del grant de UPDATE: lo fija el guard de la transición. Sin eso,
     // un UPDATE directo podía retro o post-datar cuándo se concedieron unos derechos.

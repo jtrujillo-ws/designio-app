@@ -761,19 +761,33 @@ export const TESTIMONIO_ADICIONAL: Record<
   // C5 no guarda nada aparte de sus citas: sus remediaciones son el consejo, y ése SÍ se
   // corrige —para eso está la revisión humana—.
   C5: null,
-  /*
-   * C7 tampoco, y por el mismo argumento que C5, que es su pariente: las desviaciones son la
-   * LECTURA del modelo sobre el tablero, y una lectura es exactamente lo que quien revisa está
-   * para revisar. Lo contrastable —que el elemento exista en la conciliación de ESTE reto— no
-   * se protege dejándolo intocable, se protege comprobándolo antes de que la propuesta nazca,
-   * que es donde el servicio lo hace.
-   *
-   * La diferencia con el `criterioId` de C6, que sí es testimonio: allí el id ES el destino —
-   * dice a qué criterio responde el KPI que se va a materializar— y cambiarlo cambia el objeto
-   * que nace. Aquí no se materializa nada: las desviaciones se quedan en el contenido, que es
-   * inmutable por SYS-17 en su versión original.
-   */
-  C7: null,
+  C7: {
+    parte: (c) => (c as ContenidoPostMortem).desviaciones.map((d) => d.elementoId),
+    /*
+     * LOS IDS, no las desviaciones enteras — y aquí hay una corrección mía que conviene dejar
+     * escrita, porque el razonamiento que la sostenía era casi bueno.
+     *
+     * Puse `null` argumentando que las desviaciones son la LECTURA del modelo sobre el tablero,
+     * y que una lectura es exactamente lo que quien revisa está para revisar. Eso es cierto de
+     * la `lectura`, y por eso sigue corrigiéndose. No lo es del `elementoId`, que no es lectura
+     * de nada: es un PUNTERO a una fila del tablero determinista.
+     *
+     * La otra mitad del argumento —«lo contrastable se protege comprobándolo antes de que la
+     * propuesta nazca»— tenía un agujero de forma. Esa comprobación corre al GENERAR, contra el
+     * material de entonces; la corrección llega después y por otra puerta, y la frontera solo
+     * exige que cada id sea un uuid. Un cliente que no fuera el formulario de la casa podía
+     * reapuntar la desviación a cualquier elemento y sellarlo como contenido aceptado, sin que
+     * la comprobación del tablero volviera a correr nunca.
+     *
+     * Con lo cual es el mismo caso que el `criterioId` de C6, y por la misma frase: la parte
+     * que se puede contrastar no la reescribe quien revisa. La diferencia que yo alegaba —«en
+     * C6 el id ES el destino y aquí no se materializa nada»— no cambia el riesgo: lo que se
+     * sella es el testimonio, y un testimonio reapuntado manda a alguien a revisar un release
+     * que estaba bien con la firma de un post mortem detrás.
+     */
+    motivo:
+      'Los elementos que señala una desviación no se corrigen: cada uno apunta a una fila del tablero de conciliación, y esa comprobación se hizo contra el material que el modelo leyó. Corrige el texto de la lectura, o rechaza el borrador y pide otro.',
+  },
   C6: {
     parte: (c) => (c as ContenidoEntradaKpi).criterioId,
     /*

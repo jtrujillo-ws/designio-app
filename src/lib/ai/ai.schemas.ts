@@ -9,6 +9,8 @@ import { z } from 'zod';
  * validadores de contenido estaban en el chunk de `/propuestas` desde antes de esta rama, sin
  * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
  */
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
   ContenidoAsistenteGate,
@@ -307,6 +309,25 @@ export type DefinicionCapacidad = {
    * que llegar hasta `propuesta_ai.es_simulacion` sin que nadie se acuerde de ponerla.
    */
   esSimulacion: boolean;
+  /**
+   * QUIÉN puede pedir y aceptar propuestas de esta capacidad.
+   *
+   * Casi siempre es `ROLES_CURADORES` —los mismos que curan la bandeja piden y revisan—, y
+   * durante seis capacidades esa respuesta fue tan uniforme que estaba escrita una sola vez,
+   * en el `rolCurador` del servicio, sin preguntar de qué capacidad se hablaba.
+   *
+   * C7 la rompe, y no por un capricho suyo: su destino es `outcome_review`, la ÚNICA tabla de
+   * destino cuya política de escritura pide `lead-boutique` —medido contra `pg_policy`: las
+   * otras cinco admiten `disenador`—. Con la puerta uniforme, un diseñador generaba una
+   * propuesta de C7 con toda la ceremonia (presupuesto apartado, llamada pagada, propuesta en
+   * la bandeja) y al aceptarla se topaba con un 42501 de RLS: dinero gastado en algo que nunca
+   * podría cerrar, y un mensaje que no dice por qué.
+   *
+   * Se declara aquí y no se deriva de la base porque lo que la base tiene son políticas por
+   * TABLA, y la pregunta que hay que responder antes de gastar es por CAPACIDAD. Que las dos
+   * respuestas coincidan es lo que comprueban las sondas.
+   */
+  roles: readonly string[];
 };
 
 /**
@@ -384,6 +405,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     lote: null,
     exigeConsentimiento: true,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C0: {
     etiqueta: 'Borrador de reto → criterio de éxito',
@@ -408,6 +430,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     lote: { campo: 'criterios', minimo: 1, maximo: MAX_CRITERIOS_POR_LOTE },
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   CT: {
     etiqueta: 'Asistente de gates → qué falta para este gate',
@@ -449,6 +472,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C2: {
     etiqueta: 'Insights del reto → insight con afirmaciones citadas',
@@ -502,6 +526,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C5: {
     etiqueta: 'Remediación del grafo → cómo cerrar lo que la validación señala',
@@ -541,6 +566,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * personas por ningún lado — eso entra por `item_importacion`, que es otra ancla. */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C6: {
     etiqueta: 'Borrador del Metric Registry → entrada KPI',
@@ -583,6 +609,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C7: {
     etiqueta: 'Conciliación del reto → borrador del post mortem',
@@ -630,6 +657,13 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    /*
+     * La excepción, y la única de las ocho. Su destino es `outcome_review`, cuya política
+     * `review_completar` pide `lead-boutique`: un diseñador podía pedir el borrador y no
+     * podía aceptarlo nunca. Se cierra ANTES de apartar presupuesto, que es donde el error
+     * todavía no ha costado nada.
+     */
+    roles: ['lead-boutique'] as const,
   },
   C3: {
     etiqueta: 'Oportunidades del reto → pregunta HMW trazada a insights',
@@ -687,6 +721,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
 };
 

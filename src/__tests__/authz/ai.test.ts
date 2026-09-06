@@ -34,11 +34,13 @@ import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   criteriosQueLlegaronConLasOportunidades,
   evidenciaQueLlegoAlModelo,
+  materialDePostMortem,
   MAX_MATERIAL,
 } from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
+  huellaDelMaterialDelPostMortem,
   huellaDelMaterialDelRegistry,
   generarPropuestas,
   panelPropuestas,
@@ -6651,6 +6653,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // La cita se copió del tablero, así que se mide presente contra el material real.
       expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
 
+      // El rastro ANTES de aceptar: el expediente se montó escribiendo en el review —el
+      // veredicto a mano, más arriba—, así que contar desde cero mediría la sonda y no la
+      // aceptación. Lo que se mide es el DELTA.
+      const [antesDeAceptar] = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'OutcomeReviewEditado'`);
+      const edicionesAntes = antesDeAceptar!.n as number;
+
       const { objetoId } = await aceptarPropuesta(curadorId, {
         workspaceId: wsC,
         propuestaId: p!.id,
@@ -6673,7 +6683,103 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(rev!.diseno_experimental_justificacion).toBe('Hubo grupo de control en dos sucursales');
       // El sello lo escribe el guard: la columna está fuera del grant de la aplicación.
       expect(rev!.propuesta_ai_id).toBe(p!.id);
+
+      /*
+       * Y el RASTRO cuenta UNA escritura, no dos.
+       *
+       * La aceptación escribe la narrativa —`OutcomeReviewEditado`, correcto— y después el
+       * guard diferido le escribe su `propuesta_ai_id`, que no es un campo de la narrativa.
+       * Ese segundo UPDATE dejaba otro `OutcomeReviewEditado` con el «antes» idéntico al
+       * «después»: una edición que nadie hizo, apuntada en el rastro de la pieza de la que sale
+       * el veredicto de un reto. Es el mismo caso que C6 ya había curado en la rama de al lado.
+       */
+      const eventos = await conUsuario(curadorId, (tx) => tx`
+        select payload from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'OutcomeReviewEditado'
+        order by creado_en`);
+      expect(
+        eventos.length - edicionesAntes,
+        'la aceptación de C7 dejó más de una edición en el rastro',
+      ).toBe(1);
+      expect(eventos.at(-1)!.payload).toMatchObject({ contribucion: propuesta.contribucion });
     });
+  });
+
+  /**
+   * Los ELEMENTOS que señala una desviación no se corrigen; su lectura sí.
+   *
+   * La distinción no es de estilo. La `lectura` es lo que el modelo dice, y revisarla es
+   * exactamente para lo que está quien revisa. El `elementoId` no dice nada: APUNTA a una fila
+   * del tablero determinista, y esa correspondencia se comprobó una sola vez, al generar,
+   * contra el material de entonces. La corrección llega después y por otra puerta —la frontera
+   * solo exige que cada id sea un uuid—, así que un cliente que no fuera el formulario de la
+   * casa podía reapuntar la desviación a cualquier elemento y sellarlo como contenido aceptado.
+   *
+   * Se mide en los dos sentidos, que es lo que distingue «los ids están blindados» de «C7 no
+   * admite correcciones»: cambiar el TEXTO de la lectura pasa.
+   */
+  it('C7 no deja reapuntar una desviación al corregir, y sí reescribir su lectura', async () => {
+    await enWorkspaceLimpio(
+      'c7-desviacion-testimonio',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        const original = {
+          contribucion: 'El servicio movió la aguja a medias.',
+          factoresExternos: '',
+          hipotesisAbiertas: '',
+          aprendizajes: 'Conviene constatar antes de verificar.',
+          desviaciones: [{ elementoId, lectura: 'Salió sin el aviso previo.' }],
+          citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+          confianzaPropuesta: 'media' as const,
+        };
+        const pedir = async () => {
+          await conProveedor(
+            { ok: true, datos: original, intentos: [intento({ uso: null })] },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          );
+          const panel = await panelPropuestas(curadorId, wsC);
+          return panel.pendientes.find((x) => x.capacidad === 'C7')!.id;
+        };
+
+        const primera = await pedir();
+        await expect(
+          aceptarPropuesta(curadorId, {
+            workspaceId: wsC,
+            propuestaId: primera,
+            correccion: {
+              ...original,
+              // Un uuid con forma buena que NO es el elemento del tablero.
+              desviaciones: [
+                { elementoId: '00000000-0000-4000-8000-0000000c4c4c', lectura: 'Lo mismo.' },
+              ],
+            },
+          }),
+        ).rejects.toThrow(/no se corrigen/i);
+
+        // Y el otro sentido: la LECTURA sí se reescribe, que es para lo que está la revisión.
+        const { objetoId } = await aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId: primera,
+          correccion: {
+            ...original,
+            desviaciones: [
+              { elementoId, lectura: 'Salió sin el aviso previo, y eso costó dos semanas.' },
+            ],
+          },
+        });
+        expect(objetoId).toBe(reviewId);
+      },
+    );
   });
 
   /**
@@ -6715,7 +6821,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               anclaId: reviewId,
             }),
         ),
-      ).rejects.toThrow(/no están en la conciliación de este reto/);
+      ).rejects.toThrow(/no está[n]? en el tablero|no admite como tales/i);
     });
   });
 
@@ -6765,6 +6871,137 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         ),
       ).rejects.toThrow(/no cumplió el esquema/);
     });
+  });
+
+  /**
+   * Un DISEÑADOR no puede pedir C7, y el «no» llega antes de gastar.
+   *
+   * `outcome_review` es la única tabla de destino cuya política de escritura pide
+   * `lead-boutique` —las otras cinco admiten `disenador`—, así que la puerta uniforme de
+   * `rolCurador` dejaba a un diseñador apartar presupuesto, pagar la llamada y llegar a una
+   * propuesta que RLS no le dejaba aceptar nunca. El gasto ya hecho, y un 42501 por toda
+   * explicación.
+   *
+   * Se mide en los dos sentidos, que es lo que separa «C7 está acotada» de «este usuario no
+   * cura»: el mismo diseñador SÍ pasa la puerta de C2, y falla por otro sitio.
+   */
+  it('C7 la piden solo los lead: un diseñador no gasta en algo que no podría aceptar', async () => {
+    await enWorkspaceLimpio('c7-rol', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${`${marca}-c7-disenador@test.demo`}, 'Diseñador', 'activo') returning id`;
+      const disenadorId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${disenadorId}, 'Diseñador',
+                ${`${marca}-c7-disenador@test.demo`}, 'disenador')`;
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        generarPropuestas(disenadorId, { workspaceId: wsC, capacidad: 'C7', anclaId: reviewId }),
+      ).rejects.toThrow(/la pide y la acepta lead-boutique/i);
+      // Y el otro sentido: el mismo diseñador pasa la puerta del rol en C2. Sin esta mitad, un
+      // usuario mal montado —sin rol de curador— daría el mismo verde a la sonda de arriba.
+      await expect(
+        generarPropuestas(disenadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      ).rejects.not.toThrow(/la pide y la acepta/i);
+    });
+  });
+
+  /**
+   * La huella del material de C7 se toma sobre el EXPEDIENTE, no sobre su render recortado.
+   *
+   * Las otras capacidades huellan lo que se le manda al modelo, que ya viene cortado a
+   * `MAX_MATERIAL`, y para ellas responde a la pregunta buena. Aquí no: una narrativa de post
+   * mortem se firma CONTRA UN TABLERO, y el tablero es el objeto entero. Con la huella del
+   * texto, un criterio más allá del corte podía cambiar entre generar y aceptar sin disparar
+   * `conciliacion-cambiada`.
+   *
+   * La sonda empuja el corte a propósito: una descripción de reto más larga que `MAX_MATERIAL`
+   * se lleva por delante TODO lo que el render pone detrás —las lecturas y la conciliación—,
+   * así que mover una lectura no cambia ni un carácter del texto recortado. Si la huella
+   * saliera de ahí, esta comparación daría igual a igual.
+   */
+  it('la huella de C7 ve lo que el recorte del prompt deja fuera', async () => {
+    await enWorkspaceLimpio(
+      'c7-huella-recorte',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const { reviewId, criterioId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        await admin`update reto set descripcion = ${'x'.repeat(MAX_MATERIAL + 1000)}
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        const antes = await conUsuario(curadorId, (tx) =>
+          huellaDelMaterialDelPostMortem(tx, wsC, reviewId),
+        );
+        // El render, para dejar constancia de que el corte ocurre de verdad: si esto dejara de
+        // ser cierto la sonda seguiría pasando sin medir nada.
+        expect(materialDePostMortem(antes.expediente!).truncado).toBe(true);
+        const textoAntes = materialDePostMortem(antes.expediente!).texto;
+        await admin`update resultado_criterio
+          set sin_datos_motivo = 'La serie se recuperó y la lectura final llegó en septiembre'
+          where review_id = ${reviewId} and criterio_id = ${criterioId}`;
+        const despues = await conUsuario(curadorId, (tx) =>
+          huellaDelMaterialDelPostMortem(tx, wsC, reviewId),
+        );
+        // El texto NO se movió —lo que cambió cae detrás del corte— y la huella SÍ.
+        expect(materialDePostMortem(despues.expediente!).texto).toBe(textoAntes);
+        expect(despues.huella).not.toBe(antes.huella);
+      },
+    );
+  });
+
+  /**
+   * Un elemento que el tablero da por CONSTATADO no admite lectura de desviación.
+   *
+   * `constatado` significa que alguien lo miró y salió exactamente como se aprobó: el dato
+   * determinista ya dijo que ahí no hubo discrepancia. Señalarlo como desviación contradice al
+   * tablero en el mismo expediente donde el tablero está impreso, que es la tesis de C7 al
+   * revés — el post mortem se redacta SOBRE lo constatado, no contra ello.
+   *
+   * La sonda usa el MISMO elemento que la conciliación nombra, así que no la puede pasar por
+   * «no está en el material»: lo que la mueve es el estado, y solo el estado.
+   */
+  it('C7 no guarda un borrador que llame desviación a un elemento constatado', async () => {
+    await enWorkspaceLimpio(
+      'c7-constatado',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+          { desviado: false },
+        );
+        await expect(
+          conProveedor(
+            {
+              ok: true,
+              datos: {
+                contribucion: 'Algo se movió.',
+                factoresExternos: '',
+                hipotesisAbiertas: '',
+                aprendizajes: 'Algo se aprendió.',
+                desviaciones: [
+                  { elementoId, lectura: 'Esto quedó distinto y explica el resultado.' },
+                ],
+                citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+                confianzaPropuesta: 'baja',
+              },
+              intentos: [intento({ uso: null })],
+            },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          ),
+        ).rejects.toThrow(/da por constatados|no admite como tales/i);
+      },
+    );
   });
 
   /**

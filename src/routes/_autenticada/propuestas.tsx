@@ -157,14 +157,23 @@ const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
   'alcance-incompleto': false,
   'journey-cambiado': false,
   /*
-   * Un post mortem CERRADO no admite corrección: no hay dónde escribir la narrativa, se
-   * corrija o no. Un tablero MOVIDO sí la admite, y es de los pocos casos en los que corregir
-   * es lo razonable: quien revisa tiene el tablero nuevo delante en la pantalla de la etapa 7,
-   * así que puede ajustar la narrativa a lo que hoy dice — y su firma queda como corrección
-   * humana, que es exactamente lo que la métrica de corrección mide.
+   * Ninguno de los dos admite corrección.
+   *
+   * El post mortem CERRADO es evidente: no hay dónde escribir la narrativa, se corrija o no.
+   *
+   * El tablero MOVIDO lo puse en `true` razonando que quien revisa tiene el tablero nuevo
+   * delante en la pantalla de la etapa 7 y puede ajustar la narrativa a lo que hoy dice. El
+   * razonamiento es defendible y la pantalla mentía igual: `materializarPostMortem` compara la
+   * huella guardada con la del expediente de hoy SIEMPRE, haya corrección o no, así que cada
+   * envío que este estado invitaba a hacer terminaba rechazado por obsoleto. Ofrecer un camino
+   * que el backend cierra es peor que no ofrecerlo.
+   *
+   * Y puestos a elegir, el `false` es además lo coherente: `criterios-cambiados`,
+   * `insights-cambiados` y `journey-cambiado` son el mismo caso —el material se movió por
+   * debajo— y los tres dicen `false`. C7 no tenía por qué ser la excepción.
    */
   'post-mortem-cerrado': false,
-  'conciliacion-cambiada': true,
+  'conciliacion-cambiada': false,
   'ancla-ausente': false,
 };
 

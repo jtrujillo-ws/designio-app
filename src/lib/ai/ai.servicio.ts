@@ -158,6 +158,43 @@ async function rolCurador(tx: TransactionSql, actorId: string, workspaceId: stri
 }
 
 /**
+ * Y la puerta POR CAPACIDAD, que es la de arriba más lo que cada una añada.
+ *
+ * Existe porque «quién cura» y «quién puede escribir el objeto que esta capacidad materializa»
+ * no son la misma pregunta, y durante seis capacidades lo parecieron. C7 las separa: su
+ * destino es `outcome_review`, cuya política de escritura pide `lead-boutique` mientras las
+ * otras cinco tablas de destino admiten `disenador`. Con la puerta uniforme, un diseñador
+ * apartaba presupuesto, pagaba la llamada y llegaba a una propuesta que RLS no le dejaba
+ * aceptar — el gasto ya hecho, y un 42501 por toda explicación.
+ *
+ * Se comprueba en los TRES sitios donde importa —al preparar el alcance, antes de despachar y
+ * al aceptar— y no en rechazar: descartar una propuesta no escribe en el objeto, y dejar la
+ * bandeja sin quien la limpie sería cambiar un problema por otro.
+ */
+async function rolParaCapacidad(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  capacidad: CapacidadActiva,
+): Promise<void> {
+  const [fila] = await tx`select workspace_role(${actorId}, ${workspaceId}) as rol`;
+  const rol = (fila?.rol ?? null) as string | null;
+  // Las dos puertas en una sola lectura del rol, y en este orden: primero «¿cura?», que da el
+  // mensaje que la gente ya conoce, y solo después el recorte de la capacidad. Al revés, un
+  // stakeholder pidiendo C7 leería que «esto lo pide lead-boutique» —cierto y engañoso: no es
+  // que le falte ESTA capacidad, es que no cura ninguna—.
+  if (!rol || !(ROLES_CURADORES as readonly string[]).includes(rol)) {
+    throw new ErrorAI('Solo lead-boutique o diseñador pueden pedir y revisar propuestas AI');
+  }
+  const permitidos = CAPACIDADES[capacidad].roles;
+  if (!permitidos.includes(rol)) {
+    throw new ErrorAI(
+      `Esta capacidad la pide y la acepta ${permitidos.join(' o ')}: el objeto que materializa no admite escritura de otro rol, así que pedirla sería gastar en algo que después no se podría cerrar`,
+    );
+  }
+}
+
+/**
  * Presupuesto AI del workspace (RF-08.5): llamadas al proveedor ATENDIDAS hoy. Es un corte
  * SUAVE, con el día del servidor, y se cuenta sobre `llamada_ai` —el mismo libro que suma
  * el reporte de costos— porque el tope acota lo que se PAGA, no lo que se produce.
@@ -449,7 +486,7 @@ function materialDelPanelEsElDelModelo(f: Record<string, unknown>): boolean | nu
    */
   const definicion = CAPACIDAD_EN_EL_PANEL[f.capacidad as CapacidadActiva];
   if (!definicion) return null;
-  return huellaDelMaterial(definicion.material(f)) === guardada;
+  return huellaDelMaterial((definicion.paraHuella ?? definicion.material)(f)) === guardada;
 }
 
 function grafoParaElModelo(journey: JourneyCompleto): GrafoDelJourney {
@@ -512,6 +549,24 @@ type AnclaEnElPanel = {
    */
   columnas: (tx: TransactionSql) => PendingQuery<Row[]>;
 };
+
+/**
+ * El expediente de C7 recompuesto desde las columnas que proyectó su ancla.
+ *
+ * Existe para que el render del material y su huella salgan de UNA construcción y no de dos
+ * copias del mismo objeto literal: son la misma lectura contestando dos preguntas, y dos
+ * redacciones del mismo objeto es exactamente como este repositorio se ha equivocado antes.
+ */
+function expedienteDeLaFila(f: Record<string, unknown>): ExpedienteDePostMortem {
+  return {
+    codigo: (f.review_reto_codigo as string | null) ?? '',
+    titulo: (f.review_reto_titulo as string | null) ?? '',
+    descripcion: (f.review_reto_descripcion as string | null) ?? '',
+    metricaObjetivo: (f.review_reto_metrica as string | null) ?? '',
+    lecturas: (f.review_lecturas as ExpedienteDePostMortem['lecturas'] | null) ?? [],
+    conciliacion: (f.review_conciliacion as ExpedienteDePostMortem['conciliacion'] | null) ?? [],
+  };
+}
 
 const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
   item_id: {
@@ -822,6 +877,24 @@ type BaseDelPanel = {
    * texto crudo de la base. Una sola definición, dos usos.
    */
   material: (f: Record<string, unknown>) => string;
+  /**
+   * Y QUÉ SE HUELLA de ese material, cuando no es el propio texto.
+   *
+   * Casi siempre lo es —la pregunta que la huella responde es «¿cambió lo que el modelo
+   * leyó?», y lo que el modelo leyó es exactamente `material(f)`—, y por eso el valor por
+   * defecto es ése y las nueve capacidades restantes no lo declaran.
+   *
+   * C7 es la excepción y la razón está en qué se firma. Una narrativa de post mortem se acepta
+   * CONTRA UN TABLERO, y el tablero es el expediente entero, no el trozo que cupo en el prompt:
+   * con la huella del texto, un criterio o un elemento más allá de `MAX_MATERIAL` podía cambiar
+   * entre generar y aceptar sin que nada lo dijera, y la narrativa vieja se firmaba sobre un
+   * expediente ya movido. Que el modelo no llegara a ver ese trozo no lo arregla: lo agrava.
+   *
+   * Los dos usos de `material` siguen siendo uno solo —la presencia literal se mide contra lo
+   * que el modelo leyó, recortado—; lo que se separa es la tercera pregunta, que nunca fue la
+   * misma aunque durante nueve capacidades tuviera la misma respuesta.
+   */
+  paraHuella?: (f: Record<string, unknown>) => string;
   /**
    * Y contra QUÉ TROZO de ese material se mide una cita concreta, para las capacidades cuyo
    * material son varios documentos.
@@ -1546,16 +1619,15 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           then 'post-mortem-cerrado'
         else 'disponible'
       end`,
-    material: (f) =>
-      materialDePostMortem({
-        codigo: (f.review_reto_codigo as string | null) ?? '',
-        titulo: (f.review_reto_titulo as string | null) ?? '',
-        descripcion: (f.review_reto_descripcion as string | null) ?? '',
-        metricaObjetivo: (f.review_reto_metrica as string | null) ?? '',
-        lecturas: (f.review_lecturas as ExpedienteDePostMortem['lecturas'] | null) ?? [],
-        conciliacion:
-          (f.review_conciliacion as ExpedienteDePostMortem['conciliacion'] | null) ?? [],
-      }).texto,
+    material: (f) => materialDePostMortem(expedienteDeLaFila(f)).texto,
+    /*
+     * Y la huella sobre el EXPEDIENTE, que es la tercera productora de este número —las otras
+     * dos, la que prepara la llamada y la que revalida, salen las dos de
+     * `huellaDelMaterialDelPostMortem`—. Las tres tienen que decir lo mismo o el panel marca
+     * «conciliación cambiada» a propuestas recién nacidas; que lo digan lo comprueban las
+     * sondas que aceptan una propuesta de C7 por el camino real.
+     */
+    paraHuella: (f) => JSON.stringify(expedienteDeLaFila(f)),
     /* La huella se guarda al nacer, así que el panel puede decir si el expediente que
      * recompone hoy es el que el modelo leyó. */
     materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
@@ -2207,7 +2279,7 @@ async function prepararAlcance(actorId: string, entrada: GenerarPropuestas): Pro
   const unidades = INTENTOS_POR_GENERACION;
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await rolCurador(tx, actorId, entrada.workspaceId);
+    await rolParaCapacidad(tx, actorId, entrada.workspaceId, entrada.capacidad);
 
     const { keyWorkspace, keyEntorno } = credencialesAI();
     /*
@@ -2609,7 +2681,7 @@ async function comprobarDespacho(
     // despachar material a un tercero. La política de inserción lo rechazaría de todos modos
     // (es el suelo, y sigue estando), pero un 42501 llega aquí sin nada que decirle a la
     // persona salvo «vuelve a intentarlo», que además es falso: reintentar no devuelve un rol.
-    await rolCurador(tx, actorId, entrada.workspaceId);
+    await rolParaCapacidad(tx, actorId, entrada.workspaceId, entrada.capacidad);
     if (CAPACIDADES[entrada.capacidad].exigeConsentimiento) {
       versionConsentimiento = await exigirConsentimientoVigente(tx, entrada, 'antes-de-despachar');
     }
@@ -3142,7 +3214,27 @@ export async function huellaDelMaterialDelPostMortem(
     lecturas: (fila.lecturas as ExpedienteDePostMortem['lecturas'] | null) ?? [],
     conciliacion: (fila.conciliacion as ExpedienteDePostMortem['conciliacion'] | null) ?? [],
   };
-  return { huella: huellaDelMaterial(materialDePostMortem(expediente).texto), expediente };
+  /*
+   * La huella se toma sobre el EXPEDIENTE, no sobre su render.
+   *
+   * Las otras capacidades huellan `material…(x).texto`, que es lo que se le manda al modelo — y
+   * eso ya está recortado a `MAX_MATERIAL`. Para ellas responde a la pregunta buena: «¿cambió
+   * lo que el modelo leyó?». Aquí no basta, y la diferencia está en qué se firma: una narrativa
+   * de post mortem se acepta CONTRA UN TABLERO, y ese tablero es el objeto entero, no el trozo
+   * que cupo en el prompt. Con la huella del texto, un criterio o un elemento más allá del
+   * corte podía cambiar entre generar y aceptar —una constatación nueva, una lectura
+   * corregida— sin disparar `conciliacion-cambiada`, y la narrativa vieja se firmaba sobre un
+   * expediente que ya se había movido.
+   *
+   * Que el modelo no llegara a leer ese trozo no arregla nada: agrava. La narrativa se escribió
+   * sin verlo y se firma como si lo describiera.
+   *
+   * `JSON.stringify` es determinista aquí porque las dos mitades llegan ordenadas de la base
+   * —`json_agg(… order by c.kpi, c.id)` para las lecturas, y `conciliacion_del_reto` con su
+   * propio `order by` por proyecto, versión y orden del elemento— y porque el objeto se compone
+   * arriba con las claves en orden fijo. Nada de esto depende del recorte.
+   */
+  return { huella: huellaDelMaterial(JSON.stringify(expediente)), expediente };
 }
 
 export async function huellaDelMaterialDelRegistry(
@@ -3762,7 +3854,9 @@ const PREPARAR: Record<
        * excepcional: constatar un elemento y registrar la lectura de un criterio ES el trabajo
        * en curso, y el prompt ya lleva el tablero viejo dentro.
        */
-      huellaMaterial: huellaDelMaterial(materialDePostMortem(expediente).texto),
+      // La misma huella que comprueba `huellaDelMaterialDelPostMortem`: sobre el expediente
+      // entero y no sobre su render recortado, por lo que allí queda explicado.
+      huellaMaterial: huellaDelMaterial(JSON.stringify(expediente)),
     };
   },
 
@@ -4189,8 +4283,27 @@ const COMPROBAR: Record<
      * revisable, y cuál de las frases se apoyaba en el elemento inventado no lo puede decidir
      * esta función.
      */
+    /*
+     * Y el conjunto se arma con los elementos QUE ADMITEN LECTURA DE DESVIACIÓN, que no son
+     * todos. `filas_de_conciliacion` clasifica cada elemento en seis estados, y uno de ellos
+     * —`constatado`— significa que alguien lo miró y salió EXACTAMENTE COMO SE APROBÓ. El
+     * tablero, que es dato determinista, ya dijo que ahí no hubo discrepancia.
+     *
+     * Con el conjunto completo, un «riesgo de exclusión en el elemento X» sobre un X constatado
+     * pasaba: el id está en el material, y eso era todo lo que se comprobaba. El panel lo
+     * pintaba como discrepancia y aceptar lo archivaba, contradiciendo al tablero en el mismo
+     * expediente donde el tablero está impreso. Es la tesis de C7 al revés: el post mortem se
+     * redacta SOBRE lo constatado, no contra ello.
+     *
+     * Los otros cinco estados sí la admiten, y no solo `desviado`: `no-implementado` es lo
+     * aprobado que no llegó a hacerse —que el prediseño nombra como material del post mortem—,
+     * y `desplegado`, `en-release` y `aprobado` son grados de implementación SIN CONSTATAR con
+     * el reto cerrándose, que es una lectura legítima y de las que más enseñan.
+     */
     const enElMaterial = new Set(
-      expediente.conciliacion.flatMap((b) => b.elementos.map((e) => e.elementoId)),
+      expediente.conciliacion.flatMap((b) =>
+        b.elementos.filter((e) => e.estado !== 'constatado').map((e) => e.elementoId),
+      ),
     );
     for (const contenido of contenidos) {
       const fuera = (contenido as ContenidoPostMortem).desviaciones.filter(
@@ -4198,7 +4311,7 @@ const COMPROBAR: Record<
       );
       if (fuera.length > 0) {
         throw new ErrorAI(
-          `Ese borrador señala ${fuera.length} desviación(es) sobre elementos que no están en la conciliación de este reto: la propuesta no se guarda, porque mandaría a revisar releases que el material no nombra. Vuelve a pedirla.`,
+          `Ese borrador señala ${fuera.length} desviación(es) sobre elementos que la conciliación de este reto no admite como tales —o no están en el tablero, o el tablero los da por constatados «como aprobado»—: la propuesta no se guarda, porque contradiría al dato determinista en el mismo expediente donde está impreso. Vuelve a pedirla.`,
         );
       }
     }
@@ -4963,8 +5076,9 @@ async function aceptarPropuestaEnTransaccion(
 ): Promise<{ estado: 'aceptada' | 'corregida'; objetoId: string }> {
   return conUsuario(actorId, async (tx) => {
     await exigirCuentaActiva(tx, actorId);
-    await rolCurador(tx, actorId, entrada.workspaceId);
     const p = await leerParaRevisar(tx, entrada.workspaceId, entrada.propuestaId);
+    // Después de leer la propuesta y no antes: la capacidad la dice ELLA, no quien acepta.
+    await rolParaCapacidad(tx, actorId, entrada.workspaceId, p.capacidad);
 
     let contenido = p.contenido;
     // PRESENTE, no verdadera: la frontera transporta la corrección sin juzgarla (`unknown`),

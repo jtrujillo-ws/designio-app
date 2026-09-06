@@ -12901,6 +12901,69 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * UNA CAPACIDAD QUE NO SE PUEDE ACEPTAR NO TIENE TASA DE ACEPTACIÓN.
+   *
+   * CT y C5 son informativas: declaran `destino: null`, así que la base y la pantalla de
+   * revisión sólo admiten `propuesta → rechazada`. Con la fórmula a secas, en cuanto alguien
+   * lee un aviso de gate y lo descarta —que es el uso NORMAL de esas dos— su tasa caía a cero
+   * y el cuadro presentaba el funcionamiento correcto como un rechazo universal.
+   *
+   * Se mide junto a una que SÍ tiene destino y con el mismo movimiento, porque lo que hay que
+   * distinguir no es «cero» de «null» en abstracto: es que la misma acción —rechazar— significa
+   * cosas distintas según lo que la capacidad pueda hacer.
+   */
+  it('RF-08.9: una capacidad informativa no reporta 0 % de aceptación al descartarla', async () => {
+    await enWorkspaceLimpio('obs-informativa', async ({ ws: wsO, curadorId, servicioId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      /*
+       * La informativa que se usa aquí es C5 y no CT, y la razón es del ANCLA, no del destino:
+       * las dos declaran `destino: null`, pero CT cuelga de un `gate_id` —lo exige
+       * `llamada_ai_ancla_gate`— y montar una instancia de gate para medir una división sería
+       * el fixture midiendo otra cosa. C5 cuelga de un journey, que este arnés ya sabe crear.
+       * (Lo cazó la propia sonda al fallar por el CHECK: el fallo estaba en la MEDICIÓN.)
+       */
+      const j = await nuevoJourney({ ws: wsO, servicioId, retoId: retoO, actorId: curadorId });
+      const anclaDe = (capacidad: string) =>
+        capacidad === 'C5'
+          ? { columna: 'journey_id' as const, id: j.journeyId }
+          : { columna: 'reto_id' as const, id: retoO };
+      // Una rechazada de C5 (informativa, sin destino) y otra de C0 (con destino).
+      for (const capacidad of ['C5', 'C0'] as const) {
+        const a = anclaDe(capacidad);
+        const [ll] = await admin`insert into llamada_ai
+          (workspace_id, capacidad, ${admin(a.columna)}, modelo, origen_key, resultado, creado_por)
+          values (${wsO}, ${capacidad}, ${a.id}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                  ${curadorId})
+          returning id`;
+        await admin`insert into propuesta_ai
+          (workspace_id, capacidad, destino, ${admin(a.columna)}, contenido, contenido_original,
+           modelo, prompt_version, origen_key, huella_material, llamada_id, estado, revisada_por,
+           revisada_en, creado_por)
+          values (${wsO}, ${capacidad}, ${capacidad === 'C5' ? null : 'criterio-exito'}, ${a.id},
+                  '{}'::jsonb, '{}'::jsonb, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                  -- La huella que la base exige a las capacidades que la declaran (C5 entre
+                  -- ellas). No es la del material de verdad, y da igual: esta sonda mide una
+                  -- división, no la obsolescencia.
+                  ${capacidad === 'C5' ? 'huella-del-material' : null},
+                  ${ll!.id as string}, 'rechazada', ${curadorId}, now(), ${curadorId})`;
+      }
+
+      const obs = await observabilidadAI(curadorId, wsO);
+      const informativa = obs.capacidades.find((c) => c.capacidad === 'C5')!;
+      const c0 = obs.capacidades.find((c) => c.capacidad === 'C0')!;
+      expect(informativa.rechazadas, 'el fixture no escribió la rechazada de C5').toBe(1);
+      expect(
+        informativa.tasaAceptacion,
+        'C5 no puede aceptarse: un 0 % ahí presenta su uso normal como un rechazo universal',
+      ).toBeNull();
+      // Y la que SÍ tiene destino sigue diciendo cero, que ahí es la verdad: se rechazó lo que
+      // se podía haber aceptado. Sin esta mitad, el arreglo podría haber apagado la métrica
+      // entera y la sonda pasaría igual.
+      expect(c0.tasaAceptacion).toBe(0);
+    });
+  });
+
+  /**
    * Y LA FRONTERA de la puerta de rol, medida en vez de afirmada — CORREGIDA.
    *
    * Esta sonda decía antes lo contrario de lo que dice ahora, y el cambio es un arreglo, no un

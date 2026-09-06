@@ -203,6 +203,12 @@ export async function observabilidadAI(
         const corregidas = p ? (p.corregidas as number) : 0;
         const rechazadas = p ? (p.rechazadas as number) : 0;
         const decididas = aceptadas + corregidas + rechazadas;
+        /*
+         * Si esta capacidad puede llegar a materializar algo. `undefined` —una capacidad que el
+         * registro ya no cubre— cuenta como que NO: sin registro no se sabe si tiene destino, y
+         * afirmar una tasa de aceptación sobre eso diría más de lo que se sabe.
+         */
+        const sinDestino = (CAPACIDADES[capacidad as CapacidadActiva]?.destino ?? null) === null;
         const materializadas = aceptadas + corregidas;
         return {
           ...NINGUNA,
@@ -229,7 +235,22 @@ export async function observabilidadAI(
           aceptadas,
           corregidas,
           rechazadas,
-          tasaAceptacion: decididas === 0 ? null : materializadas / decididas,
+          /*
+           * Y `null` TAMBIÉN cuando la capacidad no puede aceptarse, que no es lo mismo que un
+           * cero.
+           *
+           * CT y C5 son informativas: declaran `destino: null` en el registro, así que la base
+           * y la pantalla de revisión sólo admiten `propuesta → rechazada` — no hay objeto que
+           * materializar. Con la fórmula a secas, en cuanto alguien lee un aviso de gate y lo
+           * descarta —el uso NORMAL de esas dos— su tasa de aceptación caía a cero, y el cuadro
+           * de operación presentaba el funcionamiento correcto como un rechazo universal.
+           *
+           * Se pregunta por el REGISTRO y no por una lista de capacidades escrita aquí: el día
+           * que una informativa gane destino, o llegue otra sin él, la respuesta cambia sola.
+           * (`destino` anulable es la ausencia REPRESENTABLE que la Fase 1 dejó dicha
+           * precisamente para poder preguntar esto sin adivinar.)
+           */
+          tasaAceptacion: sinDestino || decididas === 0 ? null : materializadas / decididas,
           /*
            * Y la de corrección, que es una de las cuatro de RF-08.7 y sale del MISMO recuento:
            * la base garantiza que una propuesta `aceptada` tiene el contenido idéntico a su

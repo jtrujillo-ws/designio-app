@@ -987,8 +987,41 @@ create function revision_simulada_libro_guard() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $fn$
 declare
   v_fila record;
+  v_propuesta uuid;
 begin
   v_fila := coalesce(new, old);
+  -- DIFERIDO Y RELEYENDO LA FILA, y las dos cosas por el sello.
+  --
+  -- La materialización inserta la revisión SIN `propuesta_ai_id` a propósito: esa columna no
+  -- está en el grant, la estampa el guard diferido al aceptar. En un `after insert` inmediato
+  -- todavía es nula, así que `jsonb_strip_nulls` se llevaba `propuestaAiId` y toda revisión
+  -- hecha por la AI quedaba anotada como si la hubiera escrito una persona — que es justo la
+  -- pregunta que este evento existe para contestar.
+  --
+  -- Al ser diferido, `new` sigue siendo la fila TAL COMO SE INSERTÓ, no como está al cerrar. Por
+  -- eso se relee: lo que interesa es el sello de ahora. Si la revisión ya no está —se insertó y
+  -- se borró en la misma transacción— no hay nada que anotar por el lado del alta.
+  if tg_op = 'INSERT' then
+    select * into v_fila from revision_simulada r
+     where r.id = new.id and r.workspace_id = new.workspace_id;
+    if not found then
+      return null;
+    end if;
+    -- Y EL SELLO SE LEE DESDE EL OTRO LADO, que es donde ya está.
+    --
+    -- Releer la fila no basta: `revision_simulada.propuesta_ai_id` lo estampa el guard de
+    -- materialización, que también es diferido y se encola DESPUÉS que éste —el insert de la
+    -- revisión ocurre antes que el update de la propuesta—, así que aquí todavía es nulo.
+    -- Medido: con la relectura sola, el evento seguía saliendo sin `propuestaAiId`.
+    --
+    -- Lo que SÍ está puesto es `propuesta_ai.revision_simulada_id`: lo escribe la propia
+    -- aplicación en su UPDATE, dentro de esta transacción y antes del commit. Es el mismo
+    -- vínculo mirado desde el extremo que ya lo tiene.
+    if v_fila.propuesta_ai_id is null then
+      select p.id into v_propuesta from propuesta_ai p
+       where p.revision_simulada_id = v_fila.id and p.workspace_id = v_fila.workspace_id;
+    end if;
+  end if;
   insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
   values (v_fila.workspace_id,
     case when tg_op = 'INSERT' then 'RevisionSimuladaCreada' else 'RevisionSimuladaBorrada' end,
@@ -996,7 +1029,7 @@ begin
       'revisionSimuladaId', v_fila.id,
       'conceptoId', v_fila.concepto_id,
       'arquetipoId', v_fila.arquetipo_id,
-      'propuestaAiId', v_fila.propuesta_ai_id)),
+      'propuestaAiId', coalesce(v_fila.propuesta_ai_id, v_propuesta))),
     app_user_id(), workspace_role(app_user_id(), v_fila.workspace_id));
   return null;
 end;
@@ -1004,8 +1037,9 @@ $fn$;
 
 revoke execute on function revision_simulada_libro_guard() from public;
 
-create trigger revision_simulada_libro
+create constraint trigger revision_simulada_libro
   after insert or delete on revision_simulada
+  deferrable initially deferred
   for each row execute function revision_simulada_libro_guard();
 
 -- ── Y el linaje inverso, atado como el de sus seis hermanas ──
@@ -2268,6 +2302,21 @@ begin
       select mr.reto_id into v_reto from metric_registry mr
        where mr.id = new.registry_id and mr.workspace_id = new.workspace_id;
     end if;
+    -- Y LAS DOS QUE FALTABAN, por la MISMA razón y con la misma forma. Esta lista enumera
+    -- anclas a mano y se quedó en la de C6: ni el concepto de C4 ni el post mortem de C7
+    -- —que entró con #47 y ya está en `agents`— resolvían su reto, así que para ellas no
+    -- había candado, y por tanto tampoco ninguna de las puertas que el candado protege.
+    --
+    -- Es la TERCERA vez que esta forma falla en este fichero: antes fueron las tres listas de
+    -- `num_nonnulls` y el payload del evento de aceptación. Queda dicho aquí.
+    if v_reto is null and new.concepto_id is not null then
+      select c.reto_id into v_reto from concepto c
+       where c.id = new.concepto_id and c.workspace_id = new.workspace_id;
+    end if;
+    if v_reto is null and new.outcome_review_id is not null then
+      select orv.reto_id into v_reto from outcome_review orv
+       where orv.id = new.outcome_review_id and orv.workspace_id = new.workspace_id;
+    end if;
     if v_reto is not null then
       perform 1 from reto r
        where r.id = v_reto and r.workspace_id = new.workspace_id
@@ -2279,6 +2328,22 @@ begin
         and r.estado = 'archivado'
     ) then
       raise exception 'ese reto está archivado: no admite propuestas AI nuevas';
+    end if;
+    -- LAS DOS PUERTAS DE C4, aquí y no solo al materializar. Una propuesta que nace sobre un
+    -- concepto ya decidido —o con la etapa 4 cerrada— no se podrá aceptar NUNCA: la política y
+    -- el guard diferido la paran. Lo que queda es una fila pendiente que además bloquea pedir
+    -- otra, porque el selector no ofrece un concepto con propuesta de C4 en curso, y la llamada
+    -- al proveedor ya está pagada. El candado del reto ya está en la mano, así que lo que se lee
+    -- aquí no es una foto.
+    if new.concepto_id is not null and session_user = 'designio_app' then
+      if not exists (select 1 from concepto c
+                      where c.id = new.concepto_id and c.workspace_id = new.workspace_id
+                        and c.estado = 'candidato') then
+        raise exception 'ese concepto ya no es candidato: su pasa/muere está firmado, así que una revisión simulada nueva llegaría después de la decisión que existía para informar';
+      end if;
+      if v_reto is not null and not reto_admite_conceptos(v_reto, new.workspace_id) then
+        raise exception 'la etapa 4 de ese reto está cerrada: no admite revisiones simuladas nuevas';
+      end if;
     end if;
     -- Y la puerta de los criterios, por DESTINO y no por ancla. Escrita como «toda
     -- propuesta que cuelgue de un reto» era exacta mientras solo C0 colgara de ahí; con C2

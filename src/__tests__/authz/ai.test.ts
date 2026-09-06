@@ -9045,6 +9045,137 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Una propuesta de C4 tampoco nace cuando el concepto ya está decidido.
+   *
+   * El guard de inserción resuelve el reto para tomar su candado, y lo hacía por una lista de
+   * anclas escrita a mano: `reto_id`, y `registry_id` para C6. Ni `concepto_id` ni
+   * —medido de paso— `outcome_review_id`, que llegó con C7 y ya está en `agents`. Es la TERCERA
+   * vez que esa forma falla en este fichero: las tres listas de `num_nonnulls` y el payload del
+   * evento de aceptación fueron las dos primeras.
+   *
+   * Sin resolverlo no hay candado del reto, y por tanto no hay ninguna de las dos puertas de C4:
+   * ni el estado del concepto ni la ventana de la etapa. Lo que queda es una propuesta pendiente
+   * que NUNCA se podrá aceptar —la política y el guard diferido la paran al materializar— y que
+   * mientras tanto bloquea pedir otra, porque el selector no ofrece un concepto con propuesta de
+   * C4 en curso. La llamada ya está pagada.
+   */
+  it('C4 no acepta propuestas nuevas sobre un concepto ya decidido', async () => {
+    await enWorkspaceLimpio('c4-propuesta-tardia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const proponer = () =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return p!.id as string;
+        });
+
+      // Con el concepto candidato entra: la puerta la cierra el veredicto y no otra cosa.
+      await expect(proponer()).resolves.toBeTruthy();
+      await admin`update concepto set estado = 'pasa',
+        decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+      await expect(proponer()).rejects.toThrow(/ya no es candidato|no admite/i);
+    });
+  });
+
+  /**
+   * Y el libro dice de qué propuesta salió la revisión, cuando salió de una.
+   *
+   * El evento se escribía en un `after insert` inmediato, y ahí `propuesta_ai_id` todavía es
+   * nulo: la materialización lo inserta sin sello a propósito —esa columna no está en el grant,
+   * la estampa el guard diferido— así que `jsonb_strip_nulls` se llevaba `propuestaAiId` y TODA
+   * revisión hecha por la AI quedaba anotada como si la hubiera escrito una persona. La avería
+   * la abrió mi propio arreglo de la ronda 8, y su sonda no la vio porque medía el camino manual,
+   * donde el sello es nulo de verdad.
+   *
+   * Se mide por el camino REAL, que es el único donde hay sello que perder.
+   */
+  it('el libro distingue la revisión que nació de una propuesta de la escrita a mano', async () => {
+    await enWorkspaceLimpio('c4-libro-sello', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Una lectura del primero.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide saber para qué',
+                    descripcion: 'No entrega el documento sin motivo.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+                confianzaPropuesta: 'media',
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+      });
+      const [evento] = await admin`select payload from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'RevisionSimuladaCreada'
+          and payload->>'revisionSimuladaId' = ${objetoId}`;
+      expect(evento, 'la revisión aceptada no dejó rastro en el libro').toBeDefined();
+      expect(
+        (evento!.payload as Record<string, unknown>).propuestaAiId,
+        'el libro anota como escrita a mano una revisión que salió de una propuesta',
+      ).toBe(propuestaId);
+    });
+  });
+
+  /**
    * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
    *
    * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el

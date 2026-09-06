@@ -33,9 +33,13 @@ import {
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
+  arquetiposQueLlegaronEnteros,
   criteriosQueLlegaronConLasOportunidades,
   evidenciaQueLlegoAlModelo,
+  lentesDelLote,
   materialDePostMortem,
+  materialDeRevision,
+  promptRevision,
   MAX_MATERIAL,
 } from '@/lib/ai/ai.prompts';
 import {
@@ -43,6 +47,7 @@ import {
   ErrorAI,
   huellaDelMaterialDelPostMortem,
   huellaDelMaterialDelRegistry,
+  huellaDelMaterialDeRevision,
   generarPropuestas,
   panelPropuestas,
   proyeccionDelPanel,
@@ -56,6 +61,7 @@ import {
   COLUMNA_DE_DESTINO,
   COLUMNAS_DE_ANCLA,
   MAX_REMEDIACIONES,
+  MAX_REVISIONES_POR_LOTE,
   type AnclaCapacidad,
   type CapacidadActiva,
   type Destino,
@@ -7091,6 +7097,250 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * arquetipo_id)`—. No hay dónde meter el segundo usuario del mismo perfil, así que el modo
    * «N usuarios» que SYS-20 prohíbe no se puede pedir aunque se quiera.
    */
+  /**
+   * El LOTE tiene un techo, y el prompt no puede pedir más sesiones de las que caben.
+   *
+   * `MAX_REVISIONES_POR_LOTE` vale 6 y el esquema del proveedor lo copia en su `maxItems`. Pedir
+   * «una sesión por CADA UNO de sus 8 arquetipos» era pedir una respuesta que el contrato
+   * rechaza al llegar: el modelo tenía que desobedecer una de las dos instrucciones, y cuál
+   * desobedece no lo decidía nadie. Lo mismo, en pequeño, con un arquetipo SIN evidencia: pedir
+   * una sesión desde una lente vacía es pedir el perfil inventado que SYS-20 prohíbe.
+   *
+   * Se mide sobre las funciones puras porque es donde vive: el material y el prompt.
+   */
+  it('C4 pide tantas sesiones como lentes caben en el lote, y dice cuáles deja fuera', async () => {
+    const lente = (n: number, evidencias: number) => ({
+      id: `11111111-1111-4111-8111-${String(n).padStart(12, '0')}`,
+      nombre: `Arquetipo ${n}`,
+      definicion: 'Perfil emergente de la evidencia',
+      estado: 'hipotesis',
+      evidencia: Array.from({ length: evidencias }, (_, i) => ({
+        id: `22222222-2222-4222-8222-${String(n * 100 + i).padStart(12, '0')}`,
+        titulo: `Entrevista ${n}-${i}`,
+        resumen: 'Lo que dijo quien la dio.',
+      })),
+    });
+    // Ocho lentes con evidencia y dos sin ella: por encima del tope, y con vacías por medio.
+    const concepto = {
+      titulo: 'Verificación diferida',
+      descripcion: 'Se abre la cuenta y el documento se pide después',
+      umbralTest: '',
+      arquetipos: [
+        ...Array.from({ length: 8 }, (_, i) => lente(i + 1, 2)),
+        lente(90, 0),
+        lente(91, 0),
+      ],
+    };
+    const { lentes, sinEvidencia, sobreElTope } = lentesDelLote(concepto.arquetipos);
+    expect(lentes.length).toBe(MAX_REVISIONES_POR_LOTE);
+    expect(sinEvidencia).toBe(2);
+    expect(sobreElTope).toBe(8 - MAX_REVISIONES_POR_LOTE);
+
+    // El prompt nombra EXACTAMENTE esas lentes, por su id, y ninguna más.
+    const { usuario } = promptRevision(concepto);
+    expect(usuario).toContain(`ESTOS ${MAX_REVISIONES_POR_LOTE} arquetipos`);
+    for (const a of lentes) expect(usuario).toContain(`[${a.id}]`);
+    for (const a of concepto.arquetipos.filter((x) => !lentes.some((l) => l.id === x.id))) {
+      expect(usuario).not.toContain(`[${a.id}]`);
+    }
+    // Y el material DICE lo que deja fuera, en vez de dejar que parezca el reto entero.
+    const material = materialDeRevision(concepto).texto;
+    expect(material).toContain('2 sin evidencia citable enlazada');
+    expect(material).toContain(`${8 - MAX_REVISIONES_POR_LOTE} por encima del tope`);
+  });
+
+  /**
+   * Y una lente que el recorte dejó A MEDIAS no es una lente.
+   *
+   * Es el caso raro y el que más caro sale. Si el corte cae después de la cabecera de un
+   * arquetipo y antes de su evidencia, esa lente seguía contando como disponible: una sesión
+   * suya SIN NINGUNA CITA —toda de hipótesis, que es lo único que puede escribir quien no vio
+   * nada— pasaba las dos puertas de `COMPROBAR`, porque donde no hay citas no hay nada que
+   * comprobar. Se guardaba, llegaba al panel, alguien la leía entera… y aceptarla fallaba
+   * SIEMPRE en el guard diferido, con un mensaje que habla de evidencia enlazada DESPUÉS, que
+   * es justo lo que no había pasado.
+   *
+   * La sonda infla la descripción del concepto hasta que el corte cae dentro de las lentes, y
+   * mide las dos cosas: que el lote se descarta, y que la llamada queda registrada como
+   * fuera-de-contrato, que es la única forma de que esto se vea en la observabilidad.
+   */
+  it('C4 no guarda una sesión de una lente que el recorte dejó a medias', async () => {
+    await enWorkspaceLimpio('c4-lente-cortada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      /*
+       * El relleno engorda el resumen de la evidencia de la PRIMERA lente, que es lo que empuja
+       * a la segunda contra el corte. Y se calibra por bisección contra el material REAL —no con
+       * una cuenta a ojo— para que la sonda siga midiendo lo mismo si `MAX_MATERIAL` o el
+       * formato del cuerpo cambian: lo que se busca es el punto exacto en que deja de caber una.
+       */
+      const enterasCon = async (relleno: number) => {
+        return conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          if (relleno >= 0) {
+            const primera = material!.arquetipos[0]!;
+            await admin`update evidencia set resumen = ${primera.evidencia[0]!.resumen.split('·')[0]! + '·'.repeat(relleno)}
+              where id = ${primera.evidencia[0]!.id}`;
+          }
+          const { material: m2 } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return arquetiposQueLlegaronEnteros(m2!).ids;
+        });
+      };
+      // Invariante de la bisección: con `cabe` llegan las dos lentes; con `noCabe`, no las dos.
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      expect((await enterasCon(cabe)).length).toBe(2);
+      expect((await enterasCon(noCabe)).length).toBeLessThan(2);
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await enterasCon(medio)).length === 2) cabe = medio;
+        else noCabe = medio;
+      }
+      const enteras = await enterasCon(noCabe);
+      expect(enteras.length, 'no se logró cortar exactamente una lente').toBe(1);
+      const cortadas = [lenteA, lenteB].filter((id) => !enteras.includes(id));
+      expect(cortadas.length).toBe(1);
+
+      const sesionCiega = {
+        arquetipoId: cortadas[0]!,
+        sintesis: 'Una lectura escrita sin haber visto el testimonio de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Se sigue del perfil y de nada más',
+            descripcion: 'Nada en la evidencia lo dice: se sigue del arquetipo.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría abandonar aquí?', escenario: '' }],
+        confianzaPropuesta: 'baja' as const,
+      };
+      await expect(
+        conProveedor(
+          { ok: true, datos: { revisiones: [sesionCiega] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/arquetipo que no es de este reto, o que el recorte dejó fuera/);
+      // Y no se guardó ninguna propuesta: media respuesta no es revisable.
+      const [n] = await admin`select count(*)::int as n from propuesta_ai
+        where concepto_id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(n!.n).toBe(0);
+    });
+  });
+
+  /**
+   * Una revisión existe para dar preguntas al test que decide el pasa/muere. Materializarla
+   * DESPUÉS del veredicto añade al expediente una lectura que parece haberlo informado y llegó
+   * tarde.
+   *
+   * La vía AI ya no llega ahí —`huellaDelMaterialDeRevision` no devuelve material para un
+   * concepto decidido—, y por eso esto se mide contra LA BASE por la superficie concedida: es
+   * la que queda cuando la revisión se escribe a mano, y es la que la política guarda.
+   */
+  it('una revisión simulada no entra después de que el concepto se decida', async () => {
+    await enWorkspaceLimpio('c4-tarde', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const escribir = () =>
+        conUsuario(curadorId, (tx) => tx`insert into revision_simulada
+          (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+          values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura', ${curadorId})`);
+      // Mientras es CANDIDATO, entra: la puerta se cierra por el estado, no por otra cosa.
+      await escribir();
+      await admin`delete from revision_simulada where concepto_id = ${conceptoId}`;
+      await admin`update concepto set estado = 'pasa',
+        decidido_por = ${curadorId}, decidido_en = now()
+        where id = ${conceptoId}`;
+      await expect(escribir()).rejects.toThrow(/row-level security|violates row-level/i);
+    });
+  });
+
+  /**
+   * «Corregir una revisión es borrarla y escribir la buena», dice su política de DELETE. Con el
+   * enlace del sello puesto, esa salida se cerraba justo para las revisiones que propuso la AI:
+   * la clave ajena de `propuesta_ai` las retiene, y lo que llegaba a quien revisa era una
+   * violación de clave ajena en vez de la corrección que la política le concede.
+   *
+   * El puntero se suelta porque ya no hay a qué apuntar; el HECHO no se va, vive en
+   * `evento_dominio`, que es append-only. Es lo mismo que C6 hizo con su entrada de KPI.
+   */
+  it('borrar una revisión aceptada suelta el puntero de su propuesta, y el hecho queda', async () => {
+    await enWorkspaceLimpio('c4-borrar', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Este perfil llega con la guardia alta.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide confianza antes de darla',
+                    descripcion: 'Entrega el documento cuando entiende para qué.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula sin saber para qué.',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C4')!;
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p.id,
+      });
+
+      // Borrar por la superficie CONCEDIDA, que es la que la política describe. Las hojas van
+      // en la misma transacción: el guard diferido del sostén mira en el commit.
+      await conUsuario(curadorId, async (tx) => {
+        await tx`delete from hallazgo_simulado_evidencia he using hallazgo_simulado h
+          where he.hallazgo_id = h.id and h.revision_id = ${objetoId}`;
+        await tx`delete from pregunta_de_test where revision_id = ${objetoId}`;
+        await tx`delete from hallazgo_simulado where revision_id = ${objetoId}`;
+        await tx`delete from revision_simulada where id = ${objetoId}`;
+      });
+      const [quedan] = await admin`select count(*)::int as n from revision_simulada
+        where id = ${objetoId}`;
+      expect(quedan!.n).toBe(0);
+      // El puntero se soltó; el estado de la propuesta NO se toca: sigue aceptada, que es lo
+      // que ocurrió.
+      const [prop] = await admin`select estado, revision_simulada_id from propuesta_ai
+        where id = ${p.id}`;
+      expect(prop!.estado).toBe('aceptada');
+      expect(prop!.revision_simulada_id).toBeNull();
+      // Y el hecho sigue escrito donde no lo borra nadie.
+      const [ev] = await admin`select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and payload->>'propuestaId' = ${p.id}`;
+      expect(ev!.n).toBeGreaterThan(0);
+    });
+  });
+
   it('C4 no admite dos sesiones del mismo arquetipo sobre el mismo concepto (SYS-20)', async () => {
     await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();
@@ -7155,6 +7405,71 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   'Aquí 6 de cada 10 abandonan', ${curadorId})`,
       ).rejects.toThrow(/violates check constraint/);
     });
+  });
+
+  /**
+   * Y el corte del contrato y el de la base tienen que decir LO MISMO.
+   *
+   * Son dos escrituras de una regla —una regex de JS y un `!~` de Postgres— y divergían: al
+   * contrato le faltaba la frontera de palabra que la función de la base pone a propósito, para
+   * que un «100%» dentro de un identificador o una URL no se lea como una medición. El contrato
+   * rechazaba entonces textos que el CHECK acepta, con el motivo de SYS-20 puesto encima, que
+   * ahí no aplica: una llamada pagada perdida y un mensaje que no se entiende.
+   *
+   * Se mide enfrentando las dos, sobre los mismos textos, en vez de leer las dos regex y
+   * convencerse de que dicen lo mismo.
+   */
+  it('el corte de agregados sintéticos dice lo mismo en el contrato que en la base', async () => {
+    const admin = sqlAdmin();
+    const casos = [
+      // Mediciones: las dos tienen que rechazarlas.
+      'El 70 % de los desconfiados digitales abandonaría',
+      '100% de acuerdo con lo que dijo',
+      'el margen del 12,5% que midieron',
+      '6 de cada 10 abandonan aquí',
+      // Y NO mediciones: identificadores y códigos con un número pegado. Las dos las aceptan.
+      'La versión v2r100% del prototipo',
+      'La norma ISO9001% del proveedor',
+      'Sin un solo número en toda la frase',
+      'id3de cada4 no es una proporción',
+    ];
+    const enLaBase = await Promise.all(
+      casos.map(async (t) => {
+        const [r] = await admin`select sin_agregado_sintetico(${t}) as ok`;
+        return r!.ok as boolean;
+      }),
+    );
+    /*
+     * El lado del contrato se mide POR EL CONTRATO, no por la regex: es el rechazo que ve quien
+     * llama. Un texto que la base acepta tiene que poder ser la síntesis de una sesión.
+     */
+    const parsea = (valor: unknown) => {
+      try {
+        parsearContenido('C4', valor);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const enElContrato = casos.map((t) =>
+      parsea({
+        arquetipoId: '11111111-1111-4111-8111-111111111111',
+        sintesis: t,
+        hallazgos: [
+          {
+            titulo: 'Un hallazgo cualquiera',
+            descripcion: 'Lo que se sigue del perfil.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Y aquí qué harías?', escenario: '' }],
+        confianzaPropuesta: 'baja',
+      }),
+    );
+    expect(enElContrato).toEqual(enLaBase);
+    // Y que la sonda mida algo: los cuatro primeros se rechazan, los cuatro últimos no.
+    expect(enLaBase).toEqual([false, false, false, false, true, true, true, true]);
   });
 
   /**

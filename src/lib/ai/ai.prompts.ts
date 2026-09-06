@@ -1,5 +1,10 @@
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
-import { CAPACIDADES, CAPACIDADES_ACTIVAS, MAX_REMEDIACIONES } from './ai.schemas';
+import {
+  CAPACIDADES,
+  CAPACIDADES_ACTIVAS,
+  MAX_REMEDIACIONES,
+  MAX_REVISIONES_POR_LOTE,
+} from './ai.schemas';
 import type { CapacidadActiva } from './ai.schemas';
 
 /**
@@ -26,7 +31,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-06.18';
+export const PROMPT_VERSION = 'ai-2026-09-06.19';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -421,11 +426,50 @@ export type ConceptoARevisar = {
   arquetipos: ArquetipoQueRevisa[];
 };
 
+/**
+ * Las LENTES de un lote: los arquetipos que pueden mirar de verdad, y como mucho los que caben.
+ *
+ * Dos cortes, y los dos contestan la misma pregunta —qué se le puede PEDIR al modelo—:
+ *
+ *  · Sin evidencia citable enlazada no hay lente. Pedir una sesión desde un arquetipo vacío es
+ *    pedir un perfil inventado hablando en primera persona, que es la avería exacta que SYS-20
+ *    nombra. `PREPARAR` ya lo miraba para no llamar en vano; lo que faltaba era que el material
+ *    no lo enseñara y que el prompt no lo contara entre los que hay que revisar.
+ *
+ *  · Y como mucho `MAX_REVISIONES_POR_LOTE`, porque el lote tiene ese techo y el esquema del
+ *    proveedor lo copia en su `maxItems`. Con siete arquetipos, pedir «una sesión por CADA uno»
+ *    era pedir una respuesta que el contrato rechaza al llegar: el modelo tenía que desobedecer
+ *    una de las dos instrucciones, y cuál desobedece no lo decidía nadie. Lo que queda fuera se
+ *    dice en el material en vez de desaparecer.
+ *
+ * El corte va DENTRO del cuerpo, que es el único sitio donde vale: el panel recompone el
+ * material desde las columnas de su ancla para comparar la huella, así que un recorte hecho
+ * solo en el servicio daría dos textos distintos y toda propuesta de C4 nacería marcada como
+ * «material movido». Ya costó una vuelta al escribir esta capacidad; el sitio es éste.
+ */
+export function lentesDelLote(arquetipos: ArquetipoQueRevisa[]): {
+  lentes: ArquetipoQueRevisa[];
+  sinEvidencia: number;
+  sobreElTope: number;
+} {
+  const conLente = arquetipos.filter((a) => a.evidencia.length > 0);
+  return {
+    lentes: conLente.slice(0, MAX_REVISIONES_POR_LOTE),
+    sinEvidencia: arquetipos.length - conLente.length,
+    sobreElTope: Math.max(0, conLente.length - MAX_REVISIONES_POR_LOTE),
+  };
+}
+
 export function materialDeRevision(c: ConceptoARevisar): MaterialDelimitado {
   return bloqueConFicha(
     [
       ['Concepto que se revisa', c.titulo],
-      ['Arquetipos que lo revisan', c.arquetipos.map((a) => a.nombre).join(' · ')],
+      [
+        'Arquetipos que lo revisan',
+        lentesDelLote(c.arquetipos)
+          .lentes.map((a) => a.nombre)
+          .join(' · '),
+      ],
     ],
     cuerpoDeRevision(c).texto,
   );
@@ -434,7 +478,15 @@ export function materialDeRevision(c: ConceptoARevisar): MaterialDelimitado {
 function cuerpoDeRevision(c: ConceptoARevisar): {
   texto: string;
   tramos: Map<string, [number, number]>;
+  finalDeLaLente: Map<string, number>;
 } {
+  const { lentes, sinEvidencia, sobreElTope } = lentesDelLote(c.arquetipos);
+  // Lo que queda fuera, DICHO. Un material que enseña cuatro lentes de siete sin mencionar las
+  // otras tres se lee como el reto entero, y quien revisa daría por cubierto lo que no se miró.
+  const aparte = [
+    sinEvidencia > 0 ? `${sinEvidencia} sin evidencia citable enlazada` : '',
+    sobreElTope > 0 ? `${sobreElTope} por encima del tope de ${MAX_REVISIONES_POR_LOTE} por lote` : '',
+  ].filter(Boolean);
   const partes = [
     'CONCEPTO QUE SE REVISA',
     c.descripcion,
@@ -443,10 +495,16 @@ function cuerpoDeRevision(c: ConceptoARevisar): {
     // servir. Sin él, «propón preguntas para el test» no dice para qué test.
     ...(c.umbralTest.trim() ? ['UMBRAL DE TEST YA DEFINIDO', c.umbralTest, ''] : []),
     'ARQUETIPOS DESDE LOS QUE SE REVISA (uno por sesión; cada uno cita SOLO su evidencia)',
+    ...(aparte.length > 0
+      ? [`(El reto tiene otros arquetipos que no se revisan aquí: ${aparte.join('; ')}.)`]
+      : []),
   ];
   const tramos = new Map<string, [number, number]>();
+  // Dónde ACABA la aportación de cada lente: su cabecera y toda su evidencia. Es lo que permite
+  // saber cuáles llegaron enteras, que no es lo mismo que qué documentos llegaron.
+  const finalDeLaLente = new Map<string, number>();
   let largo = partes.join('\n').length;
-  for (const a of c.arquetipos) {
+  for (const a of lentes) {
     // La cabecera del arquetipo y su evidencia DEBAJO, en el mismo bloque: es lo que hace
     // legible de quién es cada documento. Con una lista de evidencia aparte, la pertenencia
     // habría que deducirla, y deducirla es como se cita el testimonio del perfil de al lado.
@@ -460,8 +518,9 @@ function cuerpoDeRevision(c: ConceptoARevisar): {
       partes.push(linea);
       largo = inicio + linea.length;
     }
+    finalDeLaLente.set(a.id, largo);
   }
-  return { texto: partes.join('\n'), tramos };
+  return { texto: partes.join('\n'), tramos, finalDeLaLente };
 }
 
 /** El tramo de UNA evidencia dentro del material de C4, para medir su presencia literal
@@ -488,6 +547,30 @@ export function evidenciaQueLlegoAlRevisor(c: ConceptoARevisar): { ids: string[]
   const { texto, tramos } = cuerpoDeRevision(c);
   const cabe = materialQueVeElModelo(texto).length;
   return { ids: [...tramos].filter(([, [, fin]]) => fin <= cabe).map(([id]) => id) };
+}
+
+/**
+ * Y qué LENTES llegaron ENTERAS: la cabecera del arquetipo y TODA su evidencia dentro del corte.
+ *
+ * Hermana de la de arriba y NO la misma pregunta, aunque se parezcan. Aquélla dice qué
+ * documentos se enseñaron; ésta dice de qué arquetipos se puede pedir una sesión. La diferencia
+ * está en el único caso que importa: un arquetipo cuya cabecera cupo y cuya evidencia no.
+ *
+ * Ese arquetipo puede devolver una sesión ENTERA DE HIPÓTESIS —sin una sola cita— y pasar todas
+ * las puertas del contrato, porque donde no hay citas no hay nada que comprobar. Se guarda,
+ * llega al panel, alguien la lee entera… y aceptarla falla SIEMPRE, en el guard diferido que
+ * exige que la revisión haya visto toda la evidencia que su arquetipo tiene ahora. Una
+ * propuesta que nace imposible de aceptar es una llamada pagada y un rato de revisión humana
+ * tirados, y el motivo no lo dice nadie: el mensaje habla de evidencia enlazada DESPUÉS, que es
+ * justo lo que no pasó.
+ *
+ * Por eso se mide aquí, sobre el texto recortado, y no sobre el objeto que salió de la base: lo
+ * que el modelo puede revisar es lo que el modelo vio.
+ */
+export function arquetiposQueLlegaronEnteros(c: ConceptoARevisar): { ids: string[] } {
+  const { texto, finalDeLaLente } = cuerpoDeRevision(c);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { ids: [...finalDeLaLente].filter(([, fin]) => fin <= cabe).map(([id]) => id) };
 }
 
 /**
@@ -1406,10 +1489,21 @@ export function promptRevision(c: ConceptoARevisar): {
   alcanceResumen: string;
 } {
   const material = materialDeRevision(c);
-  const evidencias = c.arquetipos.reduce((n, a) => n + a.evidencia.length, 0);
+  /*
+   * Las lentes se NOMBRAN, y son las que llegaron enteras. «Cada uno de sus N arquetipos» era
+   * una cuenta del objeto de la base, no del material: contaba los que no tienen evidencia
+   * —desde los que no se puede revisar—, los que no caben en el lote, y los que el recorte
+   * dejó a medias. Con siete arquetipos pedía siete sesiones contra un `maxItems` de seis: una
+   * instrucción imposible, y cuál de las dos desobedecer no lo decidía nadie.
+   */
+  const lentes = arquetiposQueLlegaronEnteros(c).ids;
+  const enLote = new Set(lentes);
+  const evidencias = lentesDelLote(c.arquetipos)
+    .lentes.filter((a) => enLote.has(a.id))
+    .reduce((n, a) => n + a.evidencia.length, 0);
   return {
     usuario: [
-      `Revisa el concepto del material desde CADA UNO de sus ${c.arquetipos.length} arquetipos: una sesión por arquetipo, mirando la solución con sus ojos.`,
+      `Revisa el concepto del material desde ESTOS ${lentes.length} arquetipos y solo desde ellos, una sesión por cada uno, mirando la solución con sus ojos: ${lentes.map((id) => `[${id}]`).join(' ')}.`,
       material.bloque,
       'Cada sesión nombra su arquetipo por el id EXACTO entre corchetes, y sus hallazgos citan SOLO la evidencia de ESE arquetipo: lo que hace de un hallazgo la lectura de esa lente es que se apoye en lo que constituyó a esa lente. Citar el testimonio del perfil de al lado fabrica una voz.',
       'Cada hallazgo que no marques como hipótesis cita al menos un fragmento LITERAL, copiado carácter a carácter. Lo que extrapoles, márcalo como hipótesis: las dos cosas son legítimas, confundirlas no.',
@@ -1419,12 +1513,12 @@ export function promptRevision(c: ConceptoARevisar): {
       // propia puerta —un test real y una decisión con su razón escrita—.
       'NO decidas el concepto ni digas si debería pasar o morir: tu revisión no es evidencia y no cuenta para el gate.',
       material.truncado
-        ? `(El material se truncó a ${MAX_MATERIAL} caracteres: no cites nada de una evidencia que no ves entera, y no inventes una sesión para un arquetipo que no ves.)`
+        ? `(El material se truncó a ${MAX_MATERIAL} caracteres: no cites nada de una evidencia que no ves entera. Los arquetipos que hay que revisar son los ${lentes.length} nombrados arriba, ni uno más.)`
         : '',
     ]
       .filter(Boolean)
       .join('\n\n'),
-    alcanceResumen: `concepto «${c.titulo}» × ${c.arquetipos.length} arquetipos · ${evidencias} evidencias enlazadas (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+    alcanceResumen: `concepto «${c.titulo}» × ${lentes.length} arquetipos revisables de ${c.arquetipos.length} · ${evidencias} evidencias enlazadas (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 

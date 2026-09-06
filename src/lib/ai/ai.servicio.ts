@@ -52,7 +52,9 @@ import {
   materialDeRevision,
   promptRevision,
   tramoDeEvidenciaEnRevision,
+  arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
+  lentesDelLote,
   SISTEMA_REVISION,
   type ArquetipoQueRevisa,
   type ConceptoARevisar,
@@ -4061,10 +4063,22 @@ const PREPARAR: Record<
      * derechos: sin esto, la llamada saldría cara y volvería con un perfil inventado hablando
      * en primera persona, que es la avería exacta que SYS-20 nombra.
      */
-    const conLente = material.arquetipos.filter((a) => a.evidencia.length > 0);
-    if (conLente.length === 0) {
+    const { lentes } = lentesDelLote(material.arquetipos);
+    if (lentes.length === 0) {
       throw new ErrorAI(
         'El reto de ese concepto no tiene ningún arquetipo con evidencia citable enlazada: sin lentes no hay revisión que simular, y pedirla devolvería un perfil inventado hablando en primera persona. Enlaza evidencia a sus arquetipos en la etapa 2, o escribe la revisión a mano.',
+      );
+    }
+    /*
+     * Y la segunda puerta: que alguna lente llegue ENTERA al modelo. Hay lentes —lo dice la de
+     * arriba— y aun así el corte puede dejarlas todas a medias, y entonces lo único que el
+     * modelo puede devolver son sesiones de hipótesis pura sobre arquetipos que no vio enteros:
+     * caras, imposibles de aceptar, y con un motivo que solo se entiende leyendo el recorte.
+     * Mejor decirlo antes de pagar la llamada, y decir qué acortar.
+     */
+    if (arquetiposQueLlegaronEnteros(material).ids.length === 0) {
+      throw new ErrorAI(
+        'El material de este concepto se trunca antes de que ninguna lente llegue entera: el modelo no vería la evidencia de ningún arquetipo y solo podría escribir hipótesis. Acorta la descripción del concepto, o los resúmenes de la evidencia enlazada a sus arquetipos, y vuelve a pedirlo.',
       );
     }
     const llegado = evidenciaQueLlegoAlRevisor(material);
@@ -4551,8 +4565,20 @@ const COMPROBAR: Record<
      * lo puede decidir esta función.
      */
     const llegados = new Set(evidenciaQueLlegoAlRevisor(material).ids);
+    /*
+     * Y el mapa se arma con las lentes QUE LLEGARON ENTERAS, no con `material.arquetipos`, que
+     * es el objeto que salió de la base. La diferencia la paga el caso raro: si el corte cayó
+     * después de la cabecera de un arquetipo y antes de su evidencia, esa lente seguía contando
+     * como disponible, y una sesión suya SIN NINGUNA CITA —toda de hipótesis— pasaba las dos
+     * puertas de abajo, porque donde no hay citas no hay nada que comprobar. Se guardaba, y
+     * aceptarla fallaba SIEMPRE en el guard diferido con un mensaje que habla de evidencia
+     * enlazada después: una propuesta que nace imposible de aceptar, con la llamada pagada.
+     */
+    const enteras = new Set(arquetiposQueLlegaronEnteros(material).ids);
     const porArquetipo = new Map(
-      material.arquetipos.map((a) => [a.id, new Set(a.evidencia.map((e) => e.id))]),
+      material.arquetipos
+        .filter((a) => enteras.has(a.id))
+        .map((a) => [a.id, new Set(a.evidencia.map((e) => e.id))]),
     );
     for (const contenido of contenidos) {
       const c = contenido as ContenidoRevisionSimulada;

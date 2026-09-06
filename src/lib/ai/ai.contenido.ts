@@ -648,7 +648,13 @@ export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
  *    del test)»—. Al menos una: una revisión que no deja ninguna pregunta que hacerle a una
  *    persona real no ha servido para lo que existe.
  */
-const AGREGADO_SINTETICO = /\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b/;
+/*
+ * La MISMA regla que `sin_agregado_sintetico()` en la base, frontera de palabra incluida. Sin el
+ * `\b` de delante, el contrato rechazaba lo que el CHECK acepta —«v2r100%», «ISO9001%»: un
+ * identificador, no una medición— y el motivo que se leía era el de SYS-20, que ahí no aplica.
+ * Medido contra la función viva: divergían en tres de diez casos, todos en esa dirección.
+ */
+const AGREGADO_SINTETICO = /\b\d+([.,]\d+)?\s*%|\b\d+\s+de\s+cada\s+\d+\b/;
 const SIN_AGREGADO =
   'sin porcentajes ni proporciones inventadas: una revisión simulada no mide nada, y un número con forma de dato de campo se lee como investigación (SYS-20)';
 

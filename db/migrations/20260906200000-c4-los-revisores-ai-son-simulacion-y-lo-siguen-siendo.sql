@@ -400,7 +400,16 @@ create policy hallazgo_simulado_evidencia_select on hallazgo_simulado_evidencia
 create policy pregunta_de_test_select on pregunta_de_test
   for select using (is_workspace_member(app_user_id(), workspace_id));
 
--- Escribe quien hace método, y solo mientras la etapa 4 siga abierta para este reto.
+-- Escribe quien hace método, mientras la etapa 4 siga abierta para este reto Y mientras el
+-- concepto siga siendo CANDIDATO.
+--
+-- Las dos condiciones y no una. La etapa abierta es del reto; el estado es de ESTE concepto, y
+-- se decide antes: `reto_admite_conceptos` sigue diciendo que sí durante todo el tiempo en que
+-- los demás conceptos del reto se exploran. Sin la segunda, una revisión podía entrar después
+-- del pasa/muere que existía para informar, y quedarse en el expediente con aspecto de haberlo
+-- informado. La aceptación por la vía AI ya no llega ahí —`huellaDelMaterialDeRevision` no
+-- devuelve material para un concepto decidido—, pero un insert directo por la superficie
+-- concedida sí, y ésa es la que esta política guarda.
 create policy revision_simulada_insert on revision_simulada
   for insert with check (
     workspace_role(app_user_id(), workspace_id) in ('lead-boutique', 'disenador')
@@ -408,6 +417,7 @@ create policy revision_simulada_insert on revision_simulada
     and exists (select 1 from concepto c
       where c.id = revision_simulada.concepto_id
         and c.workspace_id = revision_simulada.workspace_id
+        and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );
 
@@ -604,7 +614,14 @@ alter table propuesta_ai add constraint propuesta_ai_objeto_materializado
       when estado not in ('aceptada', 'corregida')
         then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
                           oportunidad_id, revision_simulada_id) = 0
-      when destino = 'entrada-kpi'
+      /*
+       * `<= 1` y no `= 1` para las dos capacidades cuyo objeto SE PUEDE BORRAR después de
+       * aceptarlo: la entrada de KPI de C6 y la revisión simulada de C4. Al borrarlo, un
+       * trigger suelta el puntero —abajo, y en la migración de C6 el suyo—, y con `= 1` esa
+       * suelta violaría el CHECK. El hecho «esta propuesta se aceptó y creó un objeto» no se
+       * pierde: vive en `evento_dominio`, que es append-only. La columna es el enlace VIVO.
+       */
+      when destino in ('entrada-kpi', 'revision-simulada')
         then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
                           oportunidad_id, revision_simulada_id) <= 1
       else num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
@@ -648,6 +665,42 @@ grant insert (concepto_id) on reserva_ai to designio_app;
 grant insert (concepto_id) on llamada_ai to designio_app;
 grant insert (concepto_id) on propuesta_ai to designio_app;
 grant update (revision_simulada_id) on propuesta_ai to designio_app;
+
+-- ── Y BORRAR UNA REVISIÓN ACEPTADA SUELTA SU PROPUESTA ──
+--
+-- «Corregir una revisión es borrarla y escribir la buena», dice la política de DELETE de arriba,
+-- y con el enlace del sello puesto esa salida se cerraba justo para las revisiones que propuso
+-- la AI: `propuesta_ai.revision_simulada_id` las referencia sin acción en cascada, así que lo
+-- que llegaba a quien revisa era una violación de clave ajena en vez de la corrección que la
+-- política le concede. Y es el caso que más va a pasar —una cita cuyos derechos se retiran, un
+-- hallazgo que al leerlo no se sostiene—, porque la revisión AI es la que alguien lee entera.
+--
+-- El puntero se va con el objeto porque ya no hay a qué apuntar. Lo que NO se va es el hecho:
+-- «esta propuesta se aceptó y creó una revisión» vive en `evento_dominio`, que es append-only.
+-- La columna es el enlace VIVO; el archivo es el registro.
+--
+-- Todo esto es literalmente lo que ya hizo C6 con `entrada_kpi`, hasta el `security definer` y
+-- el prefijo: un trigger y no `on delete set null` porque la clave ajena es compuesta y anular
+-- la pareja entera es imposible —`workspace_id` es NOT NULL—; `security definer` porque la
+-- política de UPDATE de `propuesta_ai` exige `estado = 'propuesta'` en su `using` y una ya
+-- aceptada es intocable para el rol de aplicación; BEFORE porque la comprobación de la clave
+-- ajena corre al final de la sentencia y con AFTER llegaría tarde.
+create function revision_simulada_suelta_su_propuesta() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  update propuesta_ai set revision_simulada_id = null
+   where revision_simulada_id = old.id and workspace_id = old.workspace_id;
+  return old;
+end;
+$fn$;
+
+revoke execute on function revision_simulada_suelta_su_propuesta() from public;
+
+-- `b_` por detrás de `a_congelacion_por_disposicion` —con el workspace dispuesto aquí no se
+-- borra nada— y por detrás de `b_candado_del_reto`, que toma el candado antes de tocar nada.
+create trigger b_revision_simulada_suelta_su_propuesta
+  before delete on revision_simulada
+  for each row execute function revision_simulada_suelta_su_propuesta();
 
 -- ── Y el aislamiento de escritura, por el mismo camino ──
 --

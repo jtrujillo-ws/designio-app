@@ -159,6 +159,7 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         arquetipos: [],
         reaperturas: [],
         segmentosDisponibles: [],
+        conceptos: [],
       },
       insightsValidados: insights.insights,
       seguimiento,

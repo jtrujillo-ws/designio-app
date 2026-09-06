@@ -576,10 +576,15 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       'arquetipo_evidencia',
       'checklist_item',
       'cita',
+      // La quinta, con la etapa 4: la evidencia de test de un concepto es respaldo
+      // PROBATORIO por el mismo argumento que la del arquetipo —su enlace decide si un gate
+      // pasa (allí G2 con los confirmados, aquí G4 con SYS-13) y su título se lee en el
+      // tablero de gobernanza—, así que entra con guard y no con motivo.
+      'concepto_evidencia',
       'journey_nodo_evidencia',
     ]);
 
-    // La otra mitad del inventario: de las DIEZ tablas con `evidencia_id`, las cuatro de
+    // La otra mitad del inventario: de las ONCE tablas con `evidencia_id`, las cinco de
     // arriba llevan guard y las seis restantes quedan fuera con motivo. Se comprueba
     // contra las columnas REALES para que una tabla nueva con `evidencia_id` obligue a
     // decidir en vez de heredar el silencio.

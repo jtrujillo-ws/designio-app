@@ -9565,9 +9565,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
             values (${wsC}, ${r!.id as string}, 0, 'Lo que el segundo pide',
                     'Sale de su testimonio.', false)
             returning id`;
+          /*
+           * El pasaje, EL DE LA PROPUESTA. Aquí decía «Si tarda más de un café» mientras el
+           * contenido de esa sesión dice «No entrego la cédula», y pasaba porque nada comparaba
+           * el texto del enlace: el hueco que la ronda 48 cerró estaba también en esta sonda,
+           * escrito a mano. Con la comparación puesta, dejarlo así mediría el guard del pasaje
+           * en vez del alcance de la lente, que es lo que este caso existe para medir.
+           */
           await tx`insert into hallazgo_simulado_evidencia
             (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
-            values (${h!.id as string}, ${evB}, ${wsC}, 'Si tarda más de un café', 'resumen')`;
+            values (${h!.id as string}, ${evB}, ${wsC}, 'No entrego la cédula', 'resumen')`;
           await tx`insert into pregunta_de_test
             (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
             values (${wsC}, ${r!.id as string}, null, 0, '¿Y si no?', '')`;
@@ -12652,6 +12659,152 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         ],
       });
       expect(revisionId, 'la corrección de textos no entró').toBeTruthy();
+    });
+  });
+
+  /**
+   * Y EL PASAJE QUE SE ESCRIBE EN EL ENLACE tiene que ser el que la propuesta dice.
+   *
+   * La sonda de arriba mide el camino contrario —cambiar el `contenido` y escribir las hojas
+   * que cuadran—, y eso lo para el guard del testimonio. Éste es el otro: dejar el contenido
+   * INTACTO y escribir en `hallazgo_simulado_evidencia` un fragmento distinto. El guard del
+   * sello contaba las citas y comparaba `evidencia_id`, nada más, así que el enlace se sellaba
+   * con un texto que la propuesta inmutable no dice — y ese texto es el que se lee y el que
+   * viaja en la exportación.
+   *
+   * La comparación es «el pasaje guardado es UNO de los que la propuesta trae para ESE
+   * documento», y no «es el de la cita i», porque el enlace tiene clave primaria
+   * `(hallazgo, evidencia)`: dos citas del mismo documento colapsan en una fila y cuál de las
+   * dos queda es cosa de quien escribe. Exigir la primera habría pedido un orden que la tabla
+   * no guarda, y habría roto la materialización que ya funciona.
+   *
+   * Las DOS columnas, que es la mitad que se olvida: cerrar sólo el fragmento deja la avería
+   * idéntica una columna a la derecha, y eso ya está escrito en la tabla desde la ronda 29.
+   */
+  it('C4: el pasaje del enlace materializado es uno de los que la propuesta dice', async () => {
+    await enWorkspaceLimpio('c4-pasaje-sello', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const citaUna = {
+        evidenciaId: evA,
+        fragmento: 'No entrego la cédula',
+        localizacion: 'resumen',
+      };
+      /*
+       * El caso del colapso va por la SEGUNDA lente y su documento, no por la primera. No es
+       * cosmético: hay un único parcial que impide dos propuestas pendientes de la misma lente
+       * sobre el mismo concepto, y `revision_simulada` es única por `(concepto, arquetipo)`, así
+       * que reutilizar la primera medía esas dos claves en vez de esta regla. Lo cazó la propia
+       * sonda al fallar por «duplicate key», que es el fallo de la MEDICIÓN y no del arreglo.
+       */
+      const citaDos = { evidenciaId: evB, fragmento: 'Si tarda más de un café', localizacion: 'resumen' };
+      // Segunda cita del MISMO documento: es la que hace medible el colapso de la clave.
+      const citaDosBis = { evidenciaId: evB, fragmento: 'lo dejo', localizacion: 'cierre' };
+      const hacerPropuesta = (lente: string, citas: (typeof citaUna)[]) =>
+        conUsuario(curadorId, async (tx) => {
+          const contenido = {
+            arquetipoId: lente,
+            sintesis: 'Una lectura del primero.',
+            hallazgos: [
+              {
+                titulo: 'Pide saber para qué',
+                descripcion: 'No entrega el documento sin motivo.',
+                esHipotesis: false,
+                citas,
+              },
+            ],
+            preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+            confianzaPropuesta: 'media',
+          };
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente',
+                    ${citas.map((c) => c.evidenciaId)},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          return p!.id as string;
+        });
+
+      /* Materializar A MANO por la superficie concedida, con el contenido INTACTO y el pasaje
+       * que se le pase — que es exactamente lo que la avería describe. */
+      const sellarCon = (
+        propuestaId: string,
+        lente: string,
+        evidenciaId: string,
+        fragmento: string,
+        localizacion: string,
+      ) =>
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lente}, 'Una lectura del primero.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Pide saber para qué',
+                    'No entrega el documento sin motivo.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id, fragmento, localizacion)
+            values (${h!.id as string}, ${evidenciaId}, ${wsC}, ${fragmento}, ${localizacion})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+        });
+
+      // UNA sola propuesta para los tres primeros casos: los dos que se rechazan tumban la
+      // transacción del sello y la dejan pendiente otra vez, así que el tercero la reutiliza.
+      const propuesta = await hacerPropuesta(lenteA, [citaUna]);
+
+      // 1. El FRAGMENTO cambiado: el documento es el que la propuesta nombra, el texto no.
+      await expect(
+        sellarCon(propuesta, lenteA, evA, 'Entrego la cédula sin problema', 'resumen'),
+        'el enlace se selló con un pasaje que la propuesta no dice',
+      ).rejects.toThrow(/no dicen lo que dice la propuesta/i);
+
+      // 2. Y la LOCALIZACIÓN, que es la columna de al lado y la mitad que se olvida.
+      await expect(
+        sellarCon(propuesta, lenteA, evA, 'No entrego la cédula', 'anexo inventado'),
+        'la localización del enlace no se compara contra la de la propuesta',
+      ).rejects.toThrow(/no dicen lo que dice la propuesta/i);
+
+      // 3. El pasaje EXACTO entra, que es lo que separa esto de «no se puede materializar».
+      await expect(
+        sellarCon(propuesta, lenteA, evA, 'No entrego la cédula', 'resumen'),
+      ).resolves.toBeUndefined();
+
+      /*
+       * 4. Y con dos citas del mismo documento, vale CUALQUIERA de las dos: el enlace es uno
+       *    solo por la clave primaria, así que la comparación pregunta por pertenencia y no por
+       *    posición. Sin esto, el arreglo habría cerrado una puerta abriendo otra: la
+       *    materialización real —que guarda la primera— seguiría entrando, y esta de aquí no,
+       *    sin que nada distinga una de otra en la tabla.
+       */
+      await expect(
+        sellarCon(
+          await hacerPropuesta(lenteB, [citaDos, citaDosBis]),
+          lenteB,
+          evB,
+          'lo dejo',
+          'cierre',
+        ),
+      ).resolves.toBeUndefined();
     });
   });
 

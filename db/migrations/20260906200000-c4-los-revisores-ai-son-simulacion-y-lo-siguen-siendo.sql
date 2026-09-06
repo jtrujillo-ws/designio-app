@@ -1868,11 +1868,16 @@ begin
           and h.titulo = p.ha->>'titulo'
           and h.descripcion = p.ha->>'descripcion'
           and h.es_hipotesis = (p.ha->>'esHipotesis')::boolean
-          -- Y sus citas, en los dos sentidos. La cita de C4 se materializa como ENLACE y no
-          -- como fila con fragmento —igual que la traza de la oportunidad—: el fragmento vive
-          -- en el `contenido`, que es inmutable por SYS-17 y es donde se lee de dónde salió la
-          -- frase. Lo que la base guarda es a qué documento se agarra, que es lo que hay que
-          -- poder contar y comprobar contra los derechos.
+          -- Y sus citas, en los TRES sentidos: cuántas, a qué documento, y CON QUÉ PASAJE.
+          --
+          -- El tercero llegó tarde y por eso está dicho: esta comparación nació cuando el
+          -- enlace sólo guardaba el id del documento —«el fragmento vive en el `contenido`,
+          -- que es inmutable por SYS-17»— y eso dejó de ser cierto dos rondas después, cuando
+          -- `fragmento` y `localizacion` bajaron a la tabla para que la ruta MANUAL, que no
+          -- tiene propuesta que leer, no perdiera el pasaje. La nota se quedó, y con ella el
+          -- hueco: por la superficie SQL concedida se materializaba con los documentos
+          -- correctos y el texto cambiado, el sello pasaba, y lo que se lee y lo que viaja en
+          -- la exportación es el enlace, no el contenido.
           --
           -- `distinct` sobre el id porque dos citas del mismo documento —dos fragmentos
           -- distintos de la misma entrevista— son un solo enlace, y contarlas dos veces
@@ -1893,8 +1898,44 @@ begin
                 -- `lower`, por la lección que costó la cita del insight: un uuid en mayúscula
                 -- es el MISMO uuid, Postgres lo guarda en minúscula, y comparado verbatim una
                 -- propuesta que el guard del insert admitió no se podía aceptar nunca.
-                and he.evidencia_id::text = lower(q.ci->>'evidenciaId')))))) then
-    raise exception 'los hallazgos de la revisión materializada no dicen lo que dice la propuesta: el texto, LA MARCA DE HIPÓTESIS y las citas se copian tal cual de la propuesta aceptada — un hallazgo propuesto como extrapolación no se materializa como afirmación (SYS-19/SYS-20)';
+                and he.evidencia_id::text = lower(q.ci->>'evidenciaId')))
+          -- Y AL REVÉS: todo enlace guardado tiene que ser UNO de los que la propuesta dice.
+          --
+          -- Por PERTENENCIA y no por posición, que es lo que la clave primaria obliga: dos
+          -- citas del mismo documento bajo el mismo hallazgo colapsan en una fila, y cuál de
+          -- las dos queda es cosa de quien escribe —el servicio guarda la primera—. Exigir «la
+          -- de la cita i» habría pedido un orden que la tabla no guarda y habría roto la
+          -- materialización que ya funciona: un arreglo que cierra una puerta abriendo otra.
+          --
+          -- Las DOS columnas. Cerrar sólo el fragmento deja la avería idéntica una columna a la
+          -- derecha, que es exactamente lo que la propia tabla dejó escrito cuando las hizo
+          -- obligatorias. Y es lo que la rama GEMELA de este mismo guard —la de las citas del
+          -- insight— ya hace desde el principio: compara `fragmento` y `localizacion` además
+          -- del id.
+          --
+          -- Fallar cerrado sale gratis: `he.fragmento` es `not null` y `q.ci->>'fragmento'` es
+          -- NULL si la clave no está, así que un contenido al que le falta el pasaje no
+          -- encuentra pareja y el sello se niega, en vez de dar por buena una comparación que
+          -- no comparó nada.
+          --
+          -- Y POR QUÉ la gemela no necesita esta vuelta, que si no la asimetría se lee como un
+          -- descuido: `cita` no colapsa. Su recuento es de citas y no de documentos distintos,
+          -- así que una fila con el pasaje cambiado o bien sobra —y falla el recuento— o bien
+          -- ocupa el sitio de otra que entonces no encuentra pareja en la ida. Aquí el
+          -- recuento es `count(distinct evidenciaId)` justamente por la clave primaria, y eso
+          -- es lo que dejaba pasar la fila con el documento bueno y el texto cambiado: las dos
+          -- comprobaciones de la ida se cumplían y ninguna miraba el texto.
+          and not exists (
+            select 1 from hallazgo_simulado_evidencia he
+            where he.hallazgo_id = h.id and he.workspace_id = h.workspace_id
+              and not exists (
+                select 1 from jsonb_array_elements(
+                  case when jsonb_typeof(p.ha->'citas') = 'array'
+                       then p.ha->'citas' else '[]'::jsonb end) as q(ci)
+                where he.evidencia_id::text = lower(q.ci->>'evidenciaId')
+                  and he.fragmento = q.ci->>'fragmento'
+                  and he.localizacion = q.ci->>'localizacion'))))) then
+    raise exception 'los hallazgos de la revisión materializada no dicen lo que dice la propuesta: el texto, LA MARCA DE HIPÓTESIS y las citas —con su pasaje— se copian tal cual de la propuesta aceptada — un hallazgo propuesto como extrapolación no se materializa como afirmación (SYS-19/SYS-20)';
   end if;
   -- Las preguntas de test, igual de posicionales, y con el hallazgo del que nacen. Es la única
   -- salida legítima de una simulación —«origina una pregunta del test», dice el journey—, así

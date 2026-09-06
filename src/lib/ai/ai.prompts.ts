@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.15';
+export const PROMPT_VERSION = 'ai-2026-09-06.17';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -471,12 +471,126 @@ export type CriteriosDelReto = {
   lineaBasePlan: string;
 }[];
 
+/**
+ * El expediente que C7 lee: el reto, sus lecturas por criterio y su tablero de conciliación.
+ *
+ * Los tipos son los de las dos lecturas que lo componen, no una copia suya: `lecturas` viene
+ * de `resultado_criterio` unido a su criterio, y `conciliacion` de `conciliacion_del_reto`, que
+ * compone `filas_de_conciliacion`. Escribir aquí una forma propia sería la segunda redacción de
+ * un contrato que la base ya tiene, y las dos se separan en cuanto una de ellas cambie.
+ */
+export type ExpedienteDePostMortem = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  metricaObjetivo: string;
+  lecturas: {
+    criterioId: string;
+    kpi: string;
+    objetivo: string;
+    ventanaDias: number;
+    lectura: string;
+    sinDatosMotivo: string;
+  }[];
+  conciliacion: {
+    proyectoCodigo: string;
+    designVersionCodigo: string;
+    elementos: {
+      elementoId: string;
+      elementoTitulo: string;
+      tipo: string;
+      operacion: string;
+      estado: string;
+      releaseCodigo: string | null;
+      releaseResponsable: string | null;
+      releaseFecha: string | null;
+      queQuedoDistinto: string;
+      razonDesviacion: string;
+    }[];
+  }[];
+};
+
 type RetoConCriterios = {
   codigo: string;
   titulo: string;
   descripcion: string;
   criterios: CriteriosDelReto;
 };
+
+/**
+ * El material de C7: el EXPEDIENTE del post mortem, que son dos lecturas deterministas.
+ *
+ * ── QUÉ ENTRA, Y POR QUÉ SOLO ESO ──
+ *
+ * SPEC-08 dice «DV vs. constataciones; snapshots». Traducido a lo que este esquema tiene:
+ *
+ *   · el TABLERO DE CONCILIACIÓN del reto —elemento a elemento, dónde quedó cada uno en la
+ *     cadena aprobado → release → despliegue → constatación, con el «qué quedó distinto» y la
+ *     razón que el lead registró—, que sale de `conciliacion_del_reto`, que compone
+ *     `filas_de_conciliacion`, que es LA MISMA que dibuja el tablero de G7. Que el material del
+ *     modelo y el tablero del humano sean la misma lectura es la mitad de lo que hace
+ *     determinista a esta capacidad.
+ *   · las LECTURAS POR CRITERIO: qué prometía cada uno, en qué ventana, y qué dio (o por qué no
+ *     hay dato). Eso es `resultado_criterio`, cuyo XOR garantiza que una fila nunca traiga las
+ *     dos cosas.
+ *
+ * Lo que NO entra: los snapshots crudos. La serie completa de un KPI son cientos de filas que
+ * el modelo no puede leer con provecho y que ya están resumidas en la lectura final que el lead
+ * registró — meterlas sería pagar contexto por ruido y, peor, invitar al modelo a recalcular
+ * un resultado que un humano ya constató.
+ */
+export function materialDePostMortem(expediente: ExpedienteDePostMortem): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', expediente.codigo],
+      ['Título del reto', expediente.titulo],
+      ['Métrica objetivo', expediente.metricaObjetivo],
+    ],
+    cuerpoDePostMortem(expediente).texto,
+  );
+}
+
+function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): { texto: string } {
+  const partes = [expediente.descripcion, '', 'LECTURA DE CADA CRITERIO DE ÉXITO'];
+  if (expediente.lecturas.length === 0) {
+    partes.push('(ninguna registrada todavía)');
+  }
+  for (const l of expediente.lecturas) {
+    partes.push(
+      `- [${l.criterioId}] ${l.kpi}`,
+      `  Objetivo: ${l.objetivo}`,
+      `  Ventana: ${l.ventanaDias} días`,
+      /*
+       * O la lectura, O el motivo por el que no hay dato — nunca las dos, que es lo que el
+       * XOR de `resultado_criterio` garantiza. Se escribe con la misma forma para que el
+       * modelo no tenga que adivinar cuál de los dos está viendo.
+       */
+      l.lectura.trim() !== ''
+        ? `  Resultado: ${l.lectura}`
+        : `  Sin dato: ${l.sinDatosMotivo}`,
+    );
+  }
+  partes.push('', 'CONCILIACIÓN: QUÉ SE APROBÓ Y QUÉ QUEDÓ');
+  if (expediente.conciliacion.length === 0) {
+    partes.push('(este reto no tiene design versions a cargo de sus proyectos)');
+  }
+  for (const bloque of expediente.conciliacion) {
+    partes.push(`${bloque.proyectoCodigo} · ${bloque.designVersionCodigo}`);
+    for (const e of bloque.elementos) {
+      partes.push(
+        `- [${e.elementoId}] ${e.elementoTitulo} (${e.tipo}/${e.operacion}) → ${e.estado}`,
+      );
+      if (e.releaseCodigo) {
+        partes.push(`  Release: ${e.releaseCodigo} · ${e.releaseResponsable} · ${e.releaseFecha}`);
+      }
+      /* La desviación registrada, que es el hecho del que el modelo puede hablar. Su ausencia
+       * también dice algo —el elemento quedó como se aprobó— y por eso no se rellena. */
+      if (e.queQuedoDistinto) partes.push(`  Quedó distinto: ${e.queQuedoDistinto}`);
+      if (e.razonDesviacion) partes.push(`  Razón registrada: ${e.razonDesviacion}`);
+    }
+  }
+  return { texto: partes.join('\n') };
+}
 
 export function materialDeRegistry(reto: RetoConCriterios): MaterialDelimitado {
   return bloqueConFicha(
@@ -806,6 +920,26 @@ export const SISTEMA_OPORTUNIDADES = [
  * compromete. Sin decírselo, un modelo al que se le enseña una ficha con campos vacíos los
  * rellena, y los mete dentro de la definición si el esquema no se los admite.
  */
+/**
+ * El sistema de C7.
+ *
+ * Tres cosas que no se piden, dichas donde el modelo las lee: el veredicto, la casilla del
+ * diseño experimental, y el lenguaje causal. Las tres son la misma decisión de fondo —SYS-24
+ * separa contribución de causalidad, y el único sitio donde lo causal se habilita es una
+ * casilla que una persona firma justificándola—, y las tres se repiten en el prompt de usuario
+ * porque un modelo al que solo se le prohíbe en el sistema encuentra la manera de decirlo en
+ * el cuerpo.
+ */
+export const SISTEMA_POST_MORTEM = [
+  'Eres una capacidad de análisis de resultados de una plataforma de service design. Propones un BORRADOR; una persona lo lee, lo corrige y lo firma.',
+  'Redactas la narrativa de un post mortem sobre DATOS DETERMINISTAS que se te dan: las lecturas de cada criterio de éxito y el tablero de conciliación —qué se aprobó, qué se desplegó, qué se constató y qué quedó distinto—. No tienes más datos que esos, y no hay ninguno que puedas suponer.',
+  'CONTRIBUCIÓN, nunca causa. Está prohibido escribir «provocó», «causó», «gracias a», «se debe a», «el impacto de X fue» o cualquier forma equivalente. Di qué se movió, en qué ventana, y junto a qué se movió. El lenguaje causal lo habilita una casilla que una persona firma justificando el diseño experimental, y no se propone en su nombre.',
+  'NO dictamines si el reto se logró. El veredicto —logrado, parcialmente logrado, no logrado, no concluyente— lo firma quien cierra el post mortem, y proponerlo sería proponer la conclusión con el documento todavía sin leer.',
+  'Las desviaciones que señales salen del tablero, nombrando el elemento por el id EXACTO entre corchetes. No inventes ids, ni elementos, ni constataciones: lo que quedó distinto ya lo escribió quien lo miró, y lo tuyo es por qué importa para el resultado.',
+  'Un criterio sin dato se cuenta como lo que es —sin dato, con el motivo registrado—, nunca se estima.',
+  'Cada afirmación se apoya en una cita: un fragmento LITERAL del material, copiado carácter a carácter, con su localización. Sin eso, la narrativa es prosa sobre datos que nadie puede comprobar.',
+].join(' ');
+
 export const SISTEMA_REGISTRY = [
   'Eres una capacidad de medición de una plataforma de service design. Propones; una persona decide.',
   'Propones ENTRADAS del Metric Registry: qué indicadores hay que leer para saber si el reto se logró. Cada entrada responde a UN criterio de éxito del material, por su id EXACTO entre corchetes. No inventes ids.',
@@ -1007,6 +1141,39 @@ function bloqueDeEntradas(entradas: EntradasDelRegistry): {
  * mortem son compromisos y hechos, no redacción. Un modelo al que no se le dice esto los
  * rellena —son campos que «faltan»— y quien revisa acepta un contrato que nadie firmó.
  */
+/**
+ * El prompt de C7.
+ *
+ * Lo que más pesa aquí no es lo que se pide sino lo que se PROHÍBE, y por una invariante con
+ * nombre: SYS-24 separa contribución de causalidad, y el único sitio donde el lenguaje causal
+ * se habilita es una casilla que firma un humano justificándola. Un borrador que llegue
+ * escrito en causal deja a quien revisa la tarea de reescribirlo entero o —lo que de verdad
+ * pasa— la tentación de aceptarlo como está, con la casilla sin marcar y la prosa diciendo lo
+ * contrario. Así que la prohibición va en el prompt Y en la descripción del campo.
+ *
+ * Y el veredicto no se pide en ninguna de las dos: no está en el esquema, no está en el texto,
+ * y esta nota existe para que la próxima vuelta no lo añada «para que quede completo».
+ */
+export function promptPostMortem(expediente: ExpedienteDePostMortem): {
+  usuario: string;
+  alcanceResumen: string;
+} {
+  const material = materialDePostMortem(expediente);
+  const elementos = expediente.conciliacion.reduce((n, b) => n + b.elementos.length, 0);
+  return {
+    usuario: [
+      'Redacta el BORRADOR del post mortem del reto descrito en el material. Lo escribe una persona después de leerlo y corregirlo: tu trabajo es que tenga delante lo que los datos dicen, no ahorrarle el juicio.',
+      material.bloque,
+      'Habla de CONTRIBUCIÓN, nunca de causa. No escribas «provocó», «causó», «gracias a», «se debe a» ni ninguna forma equivalente: di qué se movió, en qué ventana, y junto a qué se movió. Lo que habilita el lenguaje causal es una casilla que firma una persona justificando el diseño experimental, y no se propone en su nombre.',
+      'No dictamines si el reto se logró. El veredicto lo firma quien cierra el post mortem.',
+      'Las desviaciones salen del tablero de conciliación y nombran el elemento por el id que va entre corchetes, copiado. No inventes elementos ni constataciones: lo que quedó distinto ya lo escribió quien lo miró, y tu lectura es por qué importa.',
+      'Si un criterio no tiene dato, dilo así —con el motivo registrado— en vez de estimarlo.',
+      'Cita literal del material lo que afirmes. Sin citas, la narrativa es prosa sobre datos que nadie puede comprobar.',
+    ].join('\n\n'),
+    alcanceResumen: `Post mortem de ${expediente.codigo}: ${expediente.lecturas.length} lecturas de criterio y ${elementos} elementos conciliados`,
+  };
+}
+
 export function promptRegistry(reto: {
   codigo: string;
   titulo: string;
@@ -1544,6 +1711,93 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
         type: 'string',
         enum: ['alta', 'media', 'baja'],
         description: 'Cómo de seguro estás de que ESTE KPI mide lo que el criterio promete',
+      },
+    },
+  },
+  C7: {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'contribucion',
+      'factoresExternos',
+      'hipotesisAbiertas',
+      'aprendizajes',
+      'desviaciones',
+      'citas',
+      'confianzaPropuesta',
+    ],
+    properties: {
+      contribucion: {
+        type: 'string',
+        description:
+          'Qué CONTRIBUYÓ el trabajo del reto a la métrica objetivo, leído de las lecturas por criterio. Habla de contribución, NUNCA de causa: no digas «provocó», «causó» ni «gracias a»; di qué se movió, en qué ventana y junto a qué se movió',
+      },
+      factoresExternos: {
+        type: 'string',
+        description:
+          'Qué pasó fuera del control del equipo y pudo mover las mismas lecturas. Vacío si no hay ninguno que el material nombre: inventarlos para rellenar es peor que dejarlo vacío',
+      },
+      hipotesisAbiertas: {
+        type: 'string',
+        description:
+          'Qué quedó sin contestar y valdría la pena mirar. Vacío si el material no deja ninguna abierta',
+      },
+      aprendizajes: {
+        type: 'string',
+        description:
+          'Qué se aprendió, del método o del servicio, que sirva para el siguiente reto. Sale de la conciliación tanto como de las lecturas: lo que se aprobó y no llegó a implementarse enseña algo',
+      },
+      desviaciones: {
+        type: 'array',
+        maxItems: 50,
+        description:
+          'Las discrepancias que el TABLERO DE CONCILIACIÓN muestra, una por elemento que merezca comentario. Lista vacía si todos quedaron como se aprobaron: es un resultado legítimo y además el bueno',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['elementoId', 'lectura'],
+          properties: {
+            elementoId: {
+              type: 'string',
+              description:
+                'El id del elemento de cambio, COPIADO del material entre corchetes. Único en la lista: un elemento se lee UNA vez, y dos lecturas del mismo se rechazan enteras. Un id que no esté en el tablero de ESTE reto también',
+            },
+            lectura: {
+              type: 'string',
+              description:
+                'Qué dice ese elemento sobre el resultado: por qué importa que quedara así, no la constatación (esa ya está registrada y la escribió quien miró)',
+            },
+          },
+        },
+      },
+      citas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        description:
+          'De dónde sale lo que afirmas, copiado LITERAL del material. Sin citas, la narrativa es prosa sobre datos que nadie puede comprobar',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['fragmento', 'localizacion'],
+          properties: {
+            fragmento: {
+              type: 'string',
+              description: 'El texto copiado literalmente del material, sin reescribir',
+            },
+            localizacion: {
+              type: 'string',
+              description:
+                'Dónde está en el material: el código del criterio, o el del release, o el del elemento',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description:
+          'Cuánta confianza tienes en este borrador. Baja si el material trae pocas lecturas o muchos elementos sin constatar: quien revisa ordena su cola por esto',
       },
     },
   },

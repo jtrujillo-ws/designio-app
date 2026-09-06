@@ -442,10 +442,15 @@ panel filtra propuestas por texto: cambiar el escapado de la búsqueda cambia es
 C4 y valida con `ContenidoRevisionSimuladaSchema` de `ai.contenido`; `entrega` llama a
 `bloquearReto` de `metodo`; y `loop` lee las aprobaciones pendientes con `gatesAbiertos`,
 `gatesDelRol`, `conteoDeOtrosPendientes` y `rolEnWorkspace` de `aprobaciones` (los dos van en la
-misma caja del diagrama). Además, todos los servicios llaman a `exigirCuentaActiva` de `auth`, dos módulos
-reutilizan la sanitización de `evidencia`, y los esquemas Zod se importan libremente entre módulos
-como contratos compartidos. El detalle de tablas por contexto está en `21` y el de la capa AI en
-`22`.
+misma caja del diagrama). Además, todos los servicios llaman a `exigirCuentaActiva` de `auth`; dos módulos
+reutilizan la sanitización de `evidencia` (`segmento` y `exportacion`); y las **constantes de rol**
+viajan entre módulos como comportamiento, no solo como tipo: `ROLES_CURADORES` (definida en
+`evidencia`) decide en `ai` quién pide una generación y en `loop` a quién se le promueve la bandeja;
+`ROLES_DERECHOS` (`evidencia`) fija en `aprobaciones` quién decide derechos pendientes; y
+`ROLES_AUDITORIA` (`portal`) y `ROLES_DISPOSICION` (`disposicion`) deciden en `loop` qué destinos
+ve cada rol y con qué rótulo. Cambiar una de esas listas cambia esos módulos. El resto de esquemas
+Zod y tipos se importan libremente entre módulos como contratos compartidos. El detalle de tablas por
+contexto está en `21` y el de la capa AI en `22`.
 
 ### Componentes funcionales, de la pantalla a la tabla
 
@@ -1885,7 +1890,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | Estrato | Dónde | Qué cubre |
 |---|---|---|
 | Unit puro (sin base) | `src/__tests__/*.test.ts`, `src/lib/**/__tests__/` | Estado del loop y destinos, diff de entrega, Mermaid, sanitización, esquemas, números de formulario, degradación AI, proveedor (no lanza), sesión, password, limitador, memoria, segmentos, búsqueda, configuración de entrada |
-| **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (un archivo por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai, concepto) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
+| **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (24 archivos, uno por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, oportunidad, concepto, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
 Recuento al último PR fusionado (#48): **973 pruebas** en verde. La suite de

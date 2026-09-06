@@ -506,11 +506,19 @@ create policy revision_simulada_insert on revision_simulada
     -- curador puede colgar la lente del reto B de un concepto del reto A, y a partir de ahí
     -- todos los guards de evidencia le dan la razón —comprueban contra la evidencia de SU
     -- arquetipo, que es la de B—. Sale una revisión bien formada y sin sentido.
+    --
+    -- Y NI REFUTADO. El veredicto de SPEC-04.11 dice que ese perfil no describe a nadie; el
+    -- grafo ya lo cierra por su lado («un arquetipo refutado no entra al journey: dibujarlo lo
+    -- resucitaría como si el veredicto no se hubiera dado») y aquí es peor, porque no se dibuja
+    -- sino que se le hace HABLAR. El material lo excluye desde la generación, pero el servicio
+    -- no es el único camino a la tabla y esto es el suelo. Refutar no desenlaza su evidencia,
+    -- así que sin este predicado la lente seguía pasando todas las demás puertas.
     and exists (select 1 from concepto c
       join arquetipo a on a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
       where c.id = revision_simulada.concepto_id
         and c.workspace_id = revision_simulada.workspace_id
         and a.id = revision_simulada.arquetipo_id
+        and a.estado <> 'refutado'
         and c.estado = 'candidato'
         and reto_admite_conceptos(c.reto_id, c.workspace_id))
   );

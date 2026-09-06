@@ -9893,6 +9893,98 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * UN ARQUETIPO REFUTADO NO REVISA A NADIE.
+   *
+   * El veredicto de SPEC-04.11 dice que ese perfil NO DESCRIBE A NADIE. El repositorio ya sacó
+   * la consecuencia una vez, para el grafo: «un arquetipo REFUTADO no entra al journey —
+   * dibujarlo lo resucitaría como si el veredicto no se hubiera dado». Aquí es peor que
+   * dibujarlo: es hacerlo HABLAR. Una sesión suya escribe fricciones y preguntas de test en
+   * primera persona, y esas preguntas son lo único que la simulación entrega a la etapa 4 — la
+   * voz inventada que SYS-20 nombra, pero con procedencia y con un arquetipo real detrás.
+   *
+   * Y el estado es alcanzable sin nada raro: refutar no desenlaza su evidencia —los enlaces son
+   * aditivos y `arquetipo_evidencia` no tiene DELETE concedido—, así que la lente sigue teniendo
+   * documentos utilizables y pasaba todas las puertas.
+   *
+   * Se mide en los TRES sitios donde la regla tiene que estar, que es lo que impide que un
+   * cuarto se olvide: el material que se manda, el selector que ofrece el concepto, y la
+   * política de inserción de la base. Y en los dos sentidos: con una lente sana el concepto
+   * sigue ofreciéndose y su revisión entra.
+   */
+  it('C4 no usa como lente un arquetipo refutado', async () => {
+    await enWorkspaceLimpio('c4-lente-refutada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const refutar = (id: string) =>
+        admin`update arquetipo set estado = 'refutado',
+          veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
+          where id = ${id} and workspace_id = ${wsC}`;
+      const lentesDelMaterial = () =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return (material?.arquetipos ?? []).map((a) => a.id);
+        });
+      const seOfrece = async () => {
+        const panel = await panelPropuestas(curadorId, wsC);
+        return panel.candidatas.C4.lista.some((i) => i.id === conceptoId);
+      };
+
+      expect((await lentesDelMaterial()).sort()).toEqual([lenteA, lenteB].sort());
+      expect(await seOfrece()).toBe(true);
+
+      // 1. EL MATERIAL: la refutada deja de ser lente, y la sana se queda.
+      await refutar(lenteB);
+      expect(
+        await lentesDelMaterial(),
+        'el material sigue mandando como lente un arquetipo refutado',
+      ).toEqual([lenteA]);
+      // El concepto se sigue ofreciendo: le queda una lente que sí mira.
+      expect(await seOfrece()).toBe(true);
+
+      /*
+       * 2. LA POLÍTICA: ni siquiera escrita a mano entra una revisión de la refutada.
+       *
+       * Va COMPLETA —hallazgo, cita y pregunta— y no como una fila suelta, porque una suelta
+       * la para el trigger de completitud y la sonda mediría esa puerta. Medido: con el
+       * predicado neutralizado, la fila suelta respondía «esa revisión simulada se queda sin
+       * hallazgos», o sea que se movía sin medir lo que dice medir.
+       */
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          revisionAMano(tx, wsC, conceptoId, lenteB, curadorId, 'Lo que diría quien no existe'),
+        ),
+      ).rejects.toThrow(/row-level security|violates row-level/i);
+      // Y la sana entra, que es lo que separa «no revisa la refutada» de «no revisa nadie».
+      await expect(
+        conUsuario(curadorId, (tx) =>
+          revisionAMano(tx, wsC, conceptoId, lenteA, curadorId, 'Escrita a mano'),
+        ),
+      ).resolves.toBeTruthy();
+      await admin`delete from revision_simulada where concepto_id = ${conceptoId}`;
+
+      // 3. EL SELECTOR: refutadas las dos, el concepto deja de ofrecerse — ofrecerlo sería
+      //    ofrecer un callejón, porque PREPARAR moriría con «sin lentes».
+      await refutar(lenteA);
+      expect(await lentesDelMaterial()).toEqual([]);
+      expect(
+        await seOfrece(),
+        'se ofrece un concepto cuyas lentes están todas refutadas: un callejón',
+      ).toBe(false);
+      await expect(
+        conProveedor(
+          { ok: true, datos: { revisiones: [] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        ),
+      ).rejects.toThrow(/ningún arquetipo con evidencia citable/);
+    });
+  });
+
+  /**
    * Y una sesión escrita a mano no entra vacía.
    *
    * El contrato pide al menos un hallazgo y al menos una pregunta de test —y las preguntas son

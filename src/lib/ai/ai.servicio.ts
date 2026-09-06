@@ -1774,6 +1774,10 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
             join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
             where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id
               and evidencia_usable(e.id, e.workspace_id, 'cliente')
+              -- Sin las REFUTADAS, la misma regla que el material: ofrecer un concepto cuyas
+              -- únicas lentes están refutadas es ofrecer un callejón, porque preparar moriría
+              -- con «ningún arquetipo con evidencia citable».
+              and a.estado <> 'refutado'
               /*
                * Y con alguna lente SIN REVISAR todavía: con todas revisadas, la ventana del
                * lector está vacía y PREPARAR fallaría con «no hay lentes». Ofrecerlo sería
@@ -3484,6 +3488,18 @@ function lentesDelConcepto(
                   a.nombre, a.id), '[]'::json)
        from arquetipo a
        where a.reto_id = ${alias.reto} and a.workspace_id = ${alias.concepto}.workspace_id
+         /*
+          * Y SIN LAS REFUTADAS. El veredicto de SPEC-04.11 dice que ese perfil no describe a
+          * nadie, y el repositorio ya sacó la consecuencia para el grafo: «un arquetipo
+          * refutado no entra al journey — dibujarlo lo resucitaría como si el veredicto no se
+          * hubiera dado». Aquí es peor que dibujarlo: es hacerlo HABLAR, en primera persona y
+          * con preguntas de test que van a la etapa 4.
+          *
+          * El estado es alcanzable sin nada raro: refutar no desenlaza su evidencia —los
+          * enlaces son aditivos y «arquetipo_evidencia» no tiene DELETE concedido—, así que la
+          * lente sigue teniendo documentos utilizables y pasaba todas las demás puertas.
+          */
+         and a.estado <> 'refutado'
          /*
           * Y sin las lentes YA REVISADAS de este concepto, que es lo que hace que la ventana
           * AVANCE al aceptar. «unique (concepto_id, arquetipo_id)» sale de SYS-20 y no se toca.

@@ -248,152 +248,185 @@ server function. El scheduler in-app y el object storage están diseñados pero 
 
 ## Mapa de módulos y componentes funcionales
 
-Las cuatro capas de la solución y cómo se conectan: **pantallas** (rutas de TanStack Router),
-**componentes funcionales** (módulos de `src/lib/`, cada uno con su frontera de server functions),
-**datos** (grupos de tablas bajo RLS) y **externos**. Las flechas siguen la dirección de la llamada;
-la AI solo escribe en el dominio a través de `propuesta_ai` y de la aceptación humana.
+Dos mapas, para dos lectores. El **funcional** dice qué hace la plataforma y en qué orden, con el
+vocabulario del método y sin nombres de código; el **técnico** dice con qué piezas está construida y
+cómo se llaman entre sí. La tabla que los sigue lleva cada componente a su capítulo.
+
+### Mapa funcional: qué hace Designio, siguiendo el loop
+
+Cada fila es un journey del loop, de arriba abajo; dentro de cada fila, lo que esa etapa produce.
+Las flechas son el flujo del trabajo entre etapas, con el gate que hay que aprobar para pasar. Las
+capacidades AI van anotadas en la pieza sobre la que **proponen** (una persona acepta, corrige o
+rechaza; la AI nunca decide). La fila final son las capacidades que acompañan a todo el loop.
 
 ```mermaid
 flowchart TB
-  subgraph UI["Pantallas (src/routes) y componentes de UI (src/components)"]
+  subgraph J1["J1 · Arranque en frío"]
     direction LR
-    P_APP["/app<br/>Loop J1–J7"]
-    P_IMP["/importacion"]
-    P_EVI["/evidencia"]
-    P_INS["/insights"]
-    P_PRO["/proyecto/$id<br/>gates · gobernanza · medición"]
-    P_OPO["/oportunidades"]
-    P_JOU["/journeys<br/>/journey/$id"]
-    P_DV["/design-versions<br/>/design-version/$id"]
-    P_AI["/propuestas"]
-    P_APR["/aprobaciones"]
-    P_BIB["/biblioteca"]
-    P_SEG["/segmentos"]
-    P_PER["/personas · /login<br/>/invitacion/$token"]
-    P_EXP["/exportacion"]
-    P_DIS["/disposicion"]
-    P_AUD["/auditoria"]
+    F_IMP["Bandeja de importación<br/>material previo y nuevo"]
+    F_CUR["Curaduría de evidencia<br/>cinco dimensiones · AI: CI"]
+    F_DER["Derechos de uso<br/>consentimiento y ámbito"]
+    F_IMP --> F_CUR --> F_DER
   end
-
-  subgraph LIB["Componentes funcionales (src/lib, server functions + servicios)"]
+  subgraph J2["J2 · Formulación del reto"]
     direction LR
-    subgraph C01["CTX-01 Workspace e identidad"]
-      M_AUTH["auth"]
-      M_ARB["arbol · loop · busqueda"]
-      M_SEG["segmento"]
-      M_APR["aprobaciones"]
-      M_MEM["memoria"]
-      M_POR["portal"]
-      M_EXP["exportacion"]
-      M_DIS["disposicion"]
-    end
-    subgraph C02["CTX-02 Evidencia"]
-      M_EVI["evidencia"]
-      M_INS["insight"]
-    end
-    subgraph C03["CTX-03 Método"]
-      M_MET["metodo · gobernanza"]
-    end
-    subgraph C04["CTX-04 Diseño del servicio"]
-      M_OPO["servicio / oportunidad"]
-      M_JOU["journey"]
-    end
-    subgraph C05["CTX-05 Entrega"]
-      M_ENT["entrega"]
-    end
-    subgraph C06["CTX-06 Medición"]
-      M_MED["medicion"]
-    end
-    subgraph C08["CTX-08 Capacidades AI"]
-      M_AI["ai<br/>pipeline PropuestaAI"]
-    end
+    F_RET["Reto y criterios de éxito<br/>línea base y ventana · AI: C0"]
   end
-
-  subgraph DB["PostgreSQL · RLS activa · guards SECURITY DEFINER · evento_dominio"]
+  subgraph J3["J3 · Investigación y entendimiento"]
     direction LR
-    T_WS["workspace · usuario · miembro<br/>segmento · hilo · comentario<br/>exportacion_registro · acuerdo y<br/>constancia_disposicion"]
-    T_ARB["servicio · reto · proyecto<br/>reto_servicio_afectado · catalogo_journey"]
-    T_EVI["fuente · evidencia · item_importacion<br/>archivo_importado · derecho_uso<br/>consentimiento_item"]
-    T_INS["insight · afirmacion · cita<br/>contradiccion"]
-    T_MET["criterio_exito · etapa · gate<br/>checklist_item · decision · arquetipo<br/>reapertura · oportunidad · concepto"]
-    T_JOU["journey · journey_nodo<br/>journey_arista · journey_snapshot"]
-    T_ENT["design_version · elemento_cambio<br/>release · effective_state · constatacion"]
-    T_MED["metric_registry · entrada_kpi<br/>snapshot · outcome_review"]
-    T_AI["llamada_ai · reserva_ai<br/>propuesta_ai"]
+    F_INS["Insights con afirmaciones,<br/>citas y contradicciones · AI: C2"]
+    F_ARQ["Arquetipos<br/>confirmados o refutados"]
+    F_ASIS["Journey as-is"]
+    F_INS ~~~ F_ARQ ~~~ F_ASIS
+  end
+  subgraph J4["J4 · Conceptualización y exploración"]
+    direction LR
+    F_HMW["Oportunidades HMW<br/>trazadas a insights · AI: C3"]
+    F_CON["Conceptos y tests<br/>con umbral"]
+    F_DEC["Decisiones pasa/muere"]
+    F_HMW --> F_CON --> F_DEC
+  end
+  subgraph J5["J5 · Detalle y plan"]
+    direction LR
+    F_TOBE["Journey to-be y blueprint<br/>AI: C5 sobre sus señales"]
+    F_DV["Design version<br/>con diff y elementos"]
+    F_REL["Plan de releases"]
+    F_REG["Metric Registry<br/>firmado en G6 · AI: C6"]
+    F_TOBE --> F_DV --> F_REL
+    F_REL ~~~ F_REG
+  end
+  subgraph J6["J6 · Implementación y medición"]
+    direction LR
+    F_DEP["Despliegue y<br/>effective state"]
+    F_CONC["Conciliación<br/>elemento a elemento"]
+    F_SNAP["Snapshots por criterio<br/>en su ventana"]
+    F_DEP --> F_CONC
+    F_CONC ~~~ F_SNAP
+  end
+  subgraph J7["J7 · Post mortem y continuidad"]
+    direction LR
+    F_PM["Outcome review<br/>resultado por criterio y veredicto · AI: C7"]
+    F_CAND["Retos candidatos<br/>para el siguiente ciclo"]
+    F_PM --> F_CAND
+  end
+  subgraph TR["Transversales a todo el loop"]
+    direction LR
+    F_GOB["Gates G0–G7, checklists,<br/>reaperturas y aprobaciones<br/>pendientes · AI: CT informa"]
+    F_AI["Propuestas AI<br/>un solo panel para revisar<br/>todo lo que la AI propuso"]
+    F_POR["Portal del cliente:<br/>hilos, seguimiento y auditoría"]
+    F_BIB["Biblioteca del cliente<br/>y segmentos"]
+    F_WS["Workspace: personas, acceso,<br/>exportación y disposición"]
+    F_GOB ~~~ F_AI ~~~ F_POR ~~~ F_BIB ~~~ F_WS
   end
 
-  subgraph EXT["Externos"]
-    LLM["SDK Anthropic<br/>claude-sonnet-5 → claude-sonnet-4-6"]
+  J1 -->|evidencia citable| J2
+  J2 -->|G0| J3
+  J3 -->|G1 · G2| J4
+  J4 -->|G3 · G4| J5
+  J5 -->|G5 · G6| J6
+  J6 -->|G7 y ventanas cerradas| J7
+  J7 ~~~ TR
+
+  classDef etapa fill:#f6f6f4,stroke:#898781,color:#1d1e24
+  classDef tr fill:#dbe9fb,stroke:#2a78d6,color:#0b0b0b
+  classDef ai fill:#fdeee6,stroke:#eb6834,color:#0b0b0b
+  class F_IMP,F_CUR,F_DER,F_RET,F_INS,F_ARQ,F_ASIS,F_HMW,F_CON,F_DEC,F_TOBE,F_DV,F_REL,F_REG,F_DEP,F_CONC,F_SNAP,F_PM,F_CAND etapa
+  class F_GOB,F_POR,F_BIB,F_WS tr
+  class F_AI ai
+```
+
+Lo que el mapa funcional no dibuja y conviene saber: el post mortem cierra el reto y sus retos
+candidatos reabren el ciclo en J2; los criterios de éxito de J2 son el contrato que el Metric
+Registry de J5 promete medir y el post mortem de J7 lee; los conceptos y tests de J4 existen en la
+base pero todavía sin pantalla (ver `05`); el asistente de gates **CT** informa sobre cualquier gate
+y no aprueba ninguno; y el veredicto del post mortem lo dicta el lead, el sponsor lo recibe.
+
+### Mapa de componentes técnicos: con qué está construido
+
+Las capas de la solución, de izquierda a derecha en el sentido de un request. Las flechas sólidas
+son llamadas; las punteadas, las tres dependencias en tiempo de ejecución entre módulos de dominio.
+Cada módulo escribe solo en sus tablas; la AI solo llega al dominio a través de `propuesta_ai` y de
+la aceptación humana.
+
+```mermaid
+flowchart LR
+  subgraph CLI["Navegador"]
+    direction TB
+    R["React 19 · TanStack Router<br/>16 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
+    UI["Design system y componentes<br/>src/components"]
+  end
+  subgraph SRV["Servidor · Bun 1.3 · TanStack Start"]
+    direction TB
+    SF["Server functions<br/>*.functions.ts<br/>validación Zod<br/>sesión JWT en cookie HttpOnly"]
+    SV["Servicios<br/>*.servicio.ts<br/>conUsuario abre la transacción<br/>y fija app.user_id"]
+    SF --> SV
+  end
+  subgraph MODS["Módulos de dominio · src/lib"]
+    direction TB
+    M_WS["auth · arbol · loop · busqueda<br/>segmento · portal · aprobaciones<br/>memoria · exportacion · disposicion"]
+    M_EVI["evidencia · insight"]
+    M_MET["metodo · gobernanza<br/>servicio / oportunidad"]
+    M_JOU["journey"]
+    M_ENT["entrega · medicion"]
+    M_AI["ai · pipeline PropuestaAI<br/>reserva · libro · prompt · revisión"]
+  end
+  subgraph DB["PostgreSQL 15"]
+    direction TB
+    T_WS["Tablas de workspace, acceso,<br/>portal, exportación y disposición"]
+    T_EVI["Tablas de evidencia<br/>e insights"]
+    T_MET["Tablas de método, gobernanza,<br/>oportunidades y conceptos"]
+    T_JOU["Tablas de journeys"]
+    T_ENT["Tablas de entrega<br/>y medición"]
+    T_AI["propuesta_ai · llamada_ai · reserva_ai<br/>lo aceptado se materializa<br/>en las tablas de destino"]
+    RLS["RLS en toda tabla · rol sin bypass<br/>guards SECURITY DEFINER<br/>evento_dominio append-only<br/>dos conexiones: admin y designio_app<br/>55 migraciones forward-only"]
+  end
+  subgraph EXT["Externos y operación"]
+    direction TB
+    LLM["SDK Anthropic<br/>claude-sonnet-5 → claude-sonnet-4-6<br/>timeout 25 s · sin reintentos"]
+    RW["Railway<br/>despliegue y /healthz"]
+    CI["GitHub Actions<br/>seis checks contra Postgres real"]
   end
 
-  P_APP --> M_ARB
-  P_PER --> M_AUTH
-  P_IMP --> M_EVI
-  P_EVI --> M_EVI
-  P_INS --> M_INS
-  P_PRO --> M_MET
-  P_PRO --> M_MED
-  P_PRO --> M_POR
-  P_OPO --> M_OPO
-  P_JOU --> M_JOU
-  P_DV --> M_ENT
-  P_DV --> M_POR
-  P_AI --> M_AI
-  P_APR --> M_APR
-  P_BIB --> M_MEM
-  P_SEG --> M_SEG
-  P_EXP --> M_EXP
-  P_DIS --> M_DIS
-  P_AUD --> M_POR
-
-  M_AUTH --> T_WS
-  M_ARB --> T_ARB
-  M_SEG --> T_WS
-  M_APR -.->|lee| T_MET
-  M_APR -.->|lee| T_EVI
-  M_APR -.->|lee| T_ENT
-  M_MEM -.->|lee| T_MET
-  M_MEM -.->|lee| T_INS
-  M_POR --> T_WS
-  M_EXP -.->|lee todo bajo RLS| DB
-  M_DIS --> T_WS
+  R --> SF
+  SV --> M_WS
+  SV --> M_EVI
+  SV --> M_MET
+  SV --> M_JOU
+  SV --> M_ENT
+  SV --> M_AI
+  M_WS --> T_WS
   M_EVI --> T_EVI
-  M_INS --> T_INS
   M_MET --> T_MET
-  M_OPO --> T_MET
   M_JOU --> T_JOU
   M_ENT --> T_ENT
-  M_MED --> T_MED
   M_AI --> T_AI
   M_AI --> LLM
   M_AI -.->|bloquearReto| M_MET
   M_AI -.->|lee y valida journeys| M_JOU
   M_ENT -.->|bloquearReto| M_MET
-  T_AI -.->|aceptación humana<br/>materializa| T_EVI
-  T_AI -.->|aceptación humana<br/>materializa| T_MET
-  T_AI -.->|aceptación humana<br/>materializa| T_INS
-  T_AI -.->|aceptación humana<br/>materializa| T_MED
+  T_AI ~~~ LLM
 
-  classDef ui fill:#f6f6f4,stroke:#d2d2cc,color:#1d1e24
-  classDef lib fill:#dbe9fb,stroke:#2a78d6,color:#0b0b0b
+  classDef cli fill:#f6f6f4,stroke:#d2d2cc,color:#1d1e24
+  classDef srv fill:#dbe9fb,stroke:#2a78d6,color:#0b0b0b
   classDef db fill:#efefec,stroke:#898781,color:#1d1e24
   classDef ai fill:#fdeee6,stroke:#eb6834,color:#0b0b0b
-  class P_APP,P_IMP,P_EVI,P_INS,P_PRO,P_OPO,P_JOU,P_DV,P_AI,P_APR,P_BIB,P_SEG,P_PER,P_EXP,P_DIS,P_AUD ui
-  class M_AUTH,M_ARB,M_SEG,M_APR,M_MEM,M_POR,M_EXP,M_DIS,M_EVI,M_INS,M_MET,M_OPO,M_JOU,M_ENT,M_MED lib
-  class T_WS,T_ARB,T_EVI,T_INS,T_MET,T_JOU,T_ENT,T_MED,T_AI db
-  class M_AI,LLM ai
+  classDef ops fill:#f6f6f4,stroke:#898781,color:#1d1e24
+  class R,UI cli
+  class SF,SV,M_WS,M_EVI,M_MET,M_JOU,M_ENT srv
+  class RLS,T_WS,T_EVI,T_MET,T_JOU,T_ENT db
+  class M_AI,T_AI,LLM ai
+  class RW,CI ops
 ```
 
-Guía de lectura: las flechas sólidas son escritura y lectura del módulo dueño sobre sus tablas; las
-punteadas son **proyecciones de solo lectura** (Aprobaciones y Biblioteca leen lo que otros módulos
-poseen; la exportación lee el catálogo entero bajo RLS) y la **materialización** de propuestas AI, que
-solo ocurre cuando una persona acepta. La **propiedad de las tablas** es por módulo y los datos se
+Guía de lectura del mapa técnico: la **propiedad de las tablas** es por módulo y los datos se
 relacionan por identidad (ids y FKs compuestas con `workspace_id`), nunca por composición de objetos
-ajenos; en **tiempo de ejecución** sí hay tres dependencias entre servicios de dominio, dibujadas
-como flechas punteadas entre módulos: `ai` llama a `bloquearReto` de `metodo` y a
-`leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`; `entrega` llama a
-`bloquearReto` de `metodo`; y todos los servicios llaman a `exigirCuentaActiva` de `auth` (esta
-última no se dibuja para no cruzar el diagrama entero).
+ajenos. En **tiempo de ejecución** hay tres dependencias entre servicios de dominio: `ai` llama a
+`bloquearReto` de `metodo` y a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de
+`journey`; `entrega` llama a `bloquearReto` de `metodo`; y todos los servicios llaman a
+`exigirCuentaActiva` de `auth` (no se dibuja para no cruzar el diagrama entero). Aprobaciones y
+Biblioteca son proyecciones que leen lo que otros módulos poseen, y la exportación lee el catálogo
+entero bajo RLS. La AI solo escribe en el dominio a través de `propuesta_ai` y de la aceptación
+humana; el detalle de tablas por contexto está en `21` y el de la capa AI en `22`.
 
 ### Componentes funcionales, de la pantalla a la tabla
 

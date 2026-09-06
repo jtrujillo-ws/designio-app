@@ -8736,6 +8736,44 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         segundas.some((id) => primeras.includes(id)),
         'las lentes rechazadas quedaron excluidas: no se podrían reintentar nunca',
       ).toBe(true);
+
+      /*
+       * Y LA OTRA MITAD, que la rotación se llevó por delante: el PANEL tiene que reconstruir
+       * el mismo material que leyó la generación, porque es contra él contra lo que mide la
+       * presencia literal de cada cita y de ahí sale su «disponible».
+       *
+       * La ventana estaba escrita DOS veces —una en la consulta de generación, otra en la
+       * proyección del panel— y al rotar sólo la primera, el segundo lote se reconstruía con
+       * las lentes en otro orden: huella distinta, «material-de-revision-movido», y el panel
+       * bloqueaba un Aceptar que el servidor sí habría admitido, porque la relectura de la
+       * aceptación usa la consulta rotada. La avería sólo aparece en el SEGUNDO lote: en el
+       * primero no hay ninguna propuesta decidida y la rotación no mueve nada.
+       *
+       * Se arregló dejando UNA escritura de la regla, no copiando el arreglo al segundo sitio.
+       */
+      await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: segundas.map((id) => sesion(lentes.find((l) => l.arq === id)!)) },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const segundoPanel = (await panelPropuestas(curadorId, wsC)).pendientes.filter(
+        (x) => x.capacidad === 'C4',
+      );
+      expect(segundoPanel.length).toBe(MAX_REVISIONES_POR_LOTE);
+      expect(
+        segundoPanel.map((x) => x.anclaEstado),
+        'el panel reconstruyó el material del segundo lote con otra ventana que la generación',
+      ).toEqual(Array(MAX_REVISIONES_POR_LOTE).fill('disponible'));
+      // Y con el material bien reconstruido, la presencia literal de la cita se puede medir.
+      expect(segundoPanel.every((x) => x.citas.every((c) => c.presenteLiteral))).toBe(true);
     });
   });
 

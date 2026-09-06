@@ -744,37 +744,16 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
     columnas: (tx) => tx`cpt.estado as concepto_estado, cpt.titulo as concepto_titulo,
       cpt.descripcion as concepto_descripcion, cpt.umbral_test as concepto_umbral,
       rcp.codigo as concepto_reto_codigo, rcp.estado as concepto_reto_estado,
-      (select coalesce(json_agg(json_build_object(
-                'id', a.id, 'nombre', a.nombre, 'definicion', a.definicion, 'estado', a.estado,
-                'evidencia', (
-                  select coalesce(json_agg(json_build_object(
-                            'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen)
-                            order by e.titulo, e.id), '[]'::json)
-                  from arquetipo_evidencia ae
-                  join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
-                  where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-                    and evidencia_usable(e.id, e.workspace_id, 'cliente')))
-                order by a.nombre, a.id), '[]'::json)
-       from arquetipo a
-       where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id
-         /*
-          * La MISMA ventana que usó la generación, y con el mismo criterio que la aceptación:
-          * descuenta toda revisión de la lente SALVO las hermanas de este lote.
-          *
-          * Al generar no había ninguna revisión de estas lentes, así que las del lote —creadas
-          * al aceptar, después— no pueden descontarse aquí: si lo hicieran, aceptar la primera
-          * sesión de un lote de seis dejaría a las otras cinco marcadas «material movido», con
-          * su presencia literal sin poder medirse, que es la única señal contrastable que tiene
-          * quien revisa. Y al revés: una revisión escrita A MANO mientras la propuesta esperaba
-          * sí toma la lente, y el panel tiene que decirlo en vez de ofrecer un Aceptar que
-          * reventaría contra la clave única.
-          */
-         and not exists (select 1 from revision_simulada rs
-           where rs.concepto_id = cpt.id and rs.arquetipo_id = a.id
-             and rs.workspace_id = cpt.workspace_id
-             and not exists (select 1 from propuesta_ai ph
-               where ph.id = rs.propuesta_ai_id and ph.workspace_id = rs.workspace_id
-                 and ph.llamada_id = p.llamada_id))) as concepto_arquetipos`,
+      /*
+       * La MISMA ventana que usó la generación, escrita UNA vez: el orden de las lentes y
+       * el descuento de las ya revisadas viven en «lentesDelConcepto». El panel las pide
+       * con el lote de ESTA fila, que es lo único que cambia entre los dos sitios.
+       */
+      ${lentesDelConcepto(tx, {
+        concepto: tx`cpt`,
+        reto: tx`rcp.id`,
+        lote: tx`p.llamada_id`,
+      })} as concepto_arquetipos`,
   },
   outcome_review_id: {
     // DOS joins, como el registry: el post mortem y su RETO. El reto no es adorno — el
@@ -3448,6 +3427,80 @@ export const MOTIVO_MATERIAL_REVISION_MOVIDO =
  * lote las separa exactamente: la hermana lleva el sello de una propuesta de esta misma llamada;
  * la escrita a mano no lleva sello, y la de otra generación lleva el de otra llamada.
  */
+/**
+ * LAS LENTES DE UN CONCEPTO, en UNA sola escritura.
+ *
+ * Este fragmento lo necesitan dos sitios que no comparten forma: la generación —y con ella la
+ * relectura de la aceptación, que llama a la misma función— y la proyección del PANEL, que
+ * recompone el material desde las columnas de la fila para comparar la huella. Estaban escritos
+ * dos veces, y la segunda se quedó atrás en cuanto la primera aprendió a rotar: la propuesta
+ * del segundo lote nacía con las lentes rotadas y el panel la recomponía por orden alfabético,
+ * así que la marcaba «material-de-revision-movido» y apagaba el Aceptar de algo que el servidor
+ * sí habría aceptado.
+ *
+ * Es la avería que este fichero ya conoce —dos escrituras de una regla y nada que las obligue a
+ * decir lo mismo— así que no se arregla copiando el arreglo: se arregla dejando UNA.
+ *
+ * Los tres huecos son los que de verdad cambian entre los dos sitios: de qué concepto, de qué
+ * reto, y cuál es el lote cuyas hermanas no cuentan.
+ */
+function lentesDelConcepto(
+  tx: TransactionSql,
+  alias: { concepto: PendingQuery<Row[]>; reto: PendingQuery<Row[]>; lote: PendingQuery<Row[]> },
+): PendingQuery<Row[]> {
+  return tx`(select coalesce(json_agg(json_build_object(
+                'id', a.id, 'nombre', a.nombre, 'definicion', a.definicion, 'estado', a.estado,
+                'evidencia', (
+                  select coalesce(json_agg(json_build_object(
+                            'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen)
+                            order by e.titulo, e.id), '[]'::json)
+                  from arquetipo_evidencia ae
+                  join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+                  where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+                    and evidencia_usable(e.id, e.workspace_id, 'cliente')))
+                /*
+                 * ROTANDO: las lentes que ya tuvieron una propuesta DECIDIDA sobre este concepto
+                 * van al final, las que nunca se propusieron van delante.
+                 *
+                 * Descontar por «revision_simulada» hace avanzar la ventana al ACEPTAR, y sólo
+                 * al aceptar: rechazar no escribe esa fila, así que con siete arquetipos se
+                 * pedían los seis primeros por nombre, se rechazaban los seis, y el lote
+                 * siguiente pedía otra vez exactamente los mismos.
+                 *
+                 * Se ROTA y no se excluye porque una lente se rechaza cuando su salida no
+                 * valía, y volver a pedirla tiene que seguir siendo posible.
+                 *
+                 * Sin contar las HERMANAS de este mismo lote, por el mismo motivo que la
+                 * exclusión de abajo: si rechazar una moviera el orden, el material de sus
+                 * hermanas cambiaría y aceptarlas fallaría con «material movido».
+                 */
+                order by (exists (select 1 from propuesta_ai pd
+                  where pd.concepto_id = ${alias.concepto}.id
+                    and pd.workspace_id = ${alias.concepto}.workspace_id
+                    and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
+                    and pd.contenido ->> 'arquetipoId' = a.id::text
+                    and pd.llamada_id is distinct from ${alias.lote})),
+                  a.nombre, a.id), '[]'::json)
+       from arquetipo a
+       where a.reto_id = ${alias.reto} and a.workspace_id = ${alias.concepto}.workspace_id
+         /*
+          * Y sin las lentes YA REVISADAS de este concepto, que es lo que hace que la ventana
+          * AVANCE al aceptar. «unique (concepto_id, arquetipo_id)» sale de SYS-20 y no se toca.
+          *
+          * Salvo las HERMANAS de este mismo lote, que llevan el sello de una propuesta de la
+          * misma llamada: al generar no había ninguna revisión de estas lentes, así que las del
+          * lote —creadas al aceptar, después— no pueden descontarse, o aceptar la primera de
+          * seis dejaría a las otras cinco marcadas «material movido». Una escrita a mano no
+          * lleva sello; una de otra generación lleva el de otra llamada: las dos toman la lente.
+          */
+         and not exists (select 1 from revision_simulada rs
+           where rs.concepto_id = ${alias.concepto}.id and rs.arquetipo_id = a.id
+             and rs.workspace_id = ${alias.concepto}.workspace_id
+             and not exists (select 1 from propuesta_ai ph
+               where ph.id = rs.propuesta_ai_id and ph.workspace_id = rs.workspace_id
+                 and ph.llamada_id = ${alias.lote})))`;
+}
+
 export async function huellaDelMaterialDeRevision(
   tx: TransactionSql,
   workspaceId: string,
@@ -3467,59 +3520,11 @@ export async function huellaDelMaterialDeRevision(
   const [fila] = await tx`select
       c.estado = 'candidato' and reto_admite_conceptos(c.reto_id, c.workspace_id) as revisable,
       c.titulo, c.descripcion, c.umbral_test,
-      (select coalesce(json_agg(json_build_object(
-                'id', a.id, 'nombre', a.nombre, 'definicion', a.definicion, 'estado', a.estado,
-                'evidencia', (
-                  select coalesce(json_agg(json_build_object(
-                            'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen)
-                            order by e.titulo, e.id), '[]'::json)
-                  from arquetipo_evidencia ae
-                  join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
-                  where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
-                    and evidencia_usable(e.id, e.workspace_id, 'cliente')))
-                /*
-                 * Y ROTANDO: las lentes que ya tuvieron una propuesta DECIDIDA sobre este
-                 * concepto van al final, las que nunca se propusieron van delante.
-                 *
-                 * Descontar por «revision_simulada» hace avanzar la ventana al ACEPTAR, y sólo
-                 * al aceptar: rechazar no escribe esa fila, así que con siete arquetipos se
-                 * pedían los seis primeros por nombre, se rechazaban los seis, y el lote
-                 * siguiente pedía otra vez exactamente los mismos. Del séptimo en adelante no
-                 * se revisaba ninguno nunca — que es la avería que descontar las revisadas
-                 * arregló, entrando por la otra puerta.
-                 *
-                 * Se ROTA y no se excluye porque una lente se rechaza cuando su salida no
-                 * valía, y volver a pedirla tiene que seguir siendo posible: primero las que
-                 * nadie ha intentado, después las intentadas.
-                 *
-                 * Sin contar las HERMANAS de este mismo lote, por el mismo motivo que la
-                 * exclusión de abajo: si rechazar una moviera el orden, el material de sus
-                 * hermanas cambiaría y aceptarlas fallaría con «material movido».
-                 */
-                order by (exists (select 1 from propuesta_ai pd
-                  where pd.concepto_id = c.id and pd.workspace_id = c.workspace_id
-                    and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
-                    and pd.contenido ->> 'arquetipoId' = a.id::text
-                    and pd.llamada_id is distinct from ${loteId ?? null}::uuid)),
-                  a.nombre, a.id), '[]'::json)
-       from arquetipo a
-       where a.reto_id = c.reto_id and a.workspace_id = c.workspace_id
-         /*
-          * Y sin las lentes YA REVISADAS de este concepto, que es lo que hace que la ventana
-          * AVANCE. «unique (concepto_id, arquetipo_id)» sale de SYS-20 y no se toca; lo que
-          * no puede pasar es que con siete arquetipos el lote pida siempre los seis primeros
-          * y del séptimo en adelante no se revise ninguno nunca. Con esto, aceptar un lote
-          * mueve la ventana y el siguiente recoge lo que falta.
-          */
-         and not exists (select 1 from revision_simulada rs
-           where rs.concepto_id = c.id and rs.arquetipo_id = a.id
-             and rs.workspace_id = c.workspace_id
-             -- salvo las HERMANAS de este mismo lote, que llevan el sello de una propuesta de
-             -- la misma llamada. Una escrita a mano no lleva sello; una de otra generación
-             -- lleva el de otra llamada: las dos toman la lente, que es lo correcto.
-             and not exists (select 1 from propuesta_ai ph
-               where ph.id = rs.propuesta_ai_id and ph.workspace_id = rs.workspace_id
-                 and ph.llamada_id = ${loteId ?? null}::uuid))) as arquetipos
+      ${lentesDelConcepto(tx, {
+        concepto: tx`c`,
+        reto: tx`c.reto_id`,
+        lote: tx`${loteId ?? null}::uuid`,
+      })} as arquetipos
     from concepto c
     where c.id = ${anclaId} and c.workspace_id = ${workspaceId}`;
   if (!fila || !(fila.revisable as boolean)) return { huella: '', material: null, caducada: null };

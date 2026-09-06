@@ -190,6 +190,14 @@ export type GobernanzaDeProyecto = {
      */
     revisiones: RevisionSimuladaDeConcepto[];
   }[];
+  /**
+   * Si la etapa 4 del reto sigue admitiendo trabajo de método.
+   *
+   * Un concepto se queda `candidato` cuando G4 se aprueba o el reto se archiva: nada lo mueve.
+   * Las políticas de la revisión simulada piden las DOS cosas —candidato y etapa abierta—, así
+   * que con sólo el estado la pantalla ofrecía escribir y borrar donde la base ya decía que no.
+   */
+  etapaAdmiteConceptos: boolean;
 };
 
 /**

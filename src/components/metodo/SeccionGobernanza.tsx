@@ -118,6 +118,7 @@ export function SeccionGobernanza({
         conceptos={gobernanza.conceptos}
         arquetipos={gobernanza.arquetipos}
         esCurador={esCurador}
+        etapaAbierta={gobernanza.etapaAdmiteConceptos}
         onCambio={onCambio}
         onError={onError}
       />
@@ -845,6 +846,7 @@ function BloqueRevisionesSimuladas({
   conceptos,
   arquetipos,
   esCurador,
+  etapaAbierta,
   onCambio,
   onError,
 }: {
@@ -852,6 +854,7 @@ function BloqueRevisionesSimuladas({
   conceptos: GobernanzaDeProyecto['conceptos'];
   arquetipos: ArquetipoDeReto[];
   esCurador: boolean;
+  etapaAbierta: boolean;
   onCambio: () => Promise<void>;
   onError: (m: string | null) => void;
 }) {
@@ -881,7 +884,7 @@ function BloqueRevisionesSimuladas({
    * algo escrito.
    */
   if (conceptos.length === 0) return null;
-  if (conRevisiones.length === 0 && !esCurador) return null;
+  if (conRevisiones.length === 0 && !(esCurador && etapaAbierta)) return null;
   return (
     <Card>
       <h3 style={{ font: '600 13px var(--font-sans)', margin: 0 }}>
@@ -905,13 +908,15 @@ function BloqueRevisionesSimuladas({
             mano era irreversible desde la aplicación, y la clave única por lente impedía además
             escribir la sustituta.
 
-            Sólo mientras el concepto es CANDIDATO: firmado el pasa/muere, lo que se leyó para
-            decidir se queda. Y sólo para un CURADOR, que es a quien la política concede el
-            borrado — y la de escritura, igual. La base exige las dos cosas; esto es no ofrecer
-            lo que va a fallar. Leer sigue siendo de todo el equipo: el bloque entero está fuera
-            del formulario del pasa/muere justo por eso.
+            Sólo mientras el concepto es CANDIDATO y la ETAPA 4 sigue abierta: firmado el
+            pasa/muere, lo que se leyó para decidir se queda; y aprobado G4 —o archivado el
+            reto— el concepto se queda candidato sin que nada lo mueva, así que el estado solo
+            no basta. Y sólo para un CURADOR, que es a quien la política concede el borrado — y
+            la de escritura, igual. La base exige las TRES cosas; esto es no ofrecer lo que va a
+            fallar. Leer sigue siendo de todo el equipo: el bloque entero está fuera del
+            formulario del pasa/muere justo por eso.
           */}
-          {esCurador && c.estado === 'candidato' && (
+          {esCurador && etapaAbierta && c.estado === 'candidato' && (
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               {c.revisiones.map((r) => (
                 <Button
@@ -927,7 +932,7 @@ function BloqueRevisionesSimuladas({
           )}
         </div>
       ))}
-      {esCurador && (
+      {esCurador && etapaAbierta && (
         <FormularioRevisionAMano
           workspaceId={workspaceId}
           conceptos={conceptos}

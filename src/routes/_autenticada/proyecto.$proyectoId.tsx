@@ -160,6 +160,9 @@ export const Route = createFileRoute('/_autenticada/proyecto/$proyectoId')({
         reaperturas: [],
         segmentosDisponibles: [],
         conceptos: [],
+        // Sin proyecto que leer no hay etapa que esté abierta: el respaldo dice que no, que es
+        // el lado en el que un dato ausente no ofrece nada que la base fuera a rechazar.
+        etapaAdmiteConceptos: false,
       },
       insightsValidados: insights.insights,
       seguimiento,

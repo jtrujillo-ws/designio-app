@@ -11040,6 +11040,79 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y LA VENTANA DE LA ETAPA ES LA TERCERA PUERTA, que la pantalla no llevaba.
+   *
+   * Las políticas de `revision_simulada` piden concepto «candidato» Y `reto_admite_conceptos`.
+   * El formulario filtraba por el estado y los botones de borrar igual, así que faltaba la
+   * mitad — y no es una mitad teórica: nada mueve el estado de un concepto cuando G4 se aprueba
+   * o el reto se archiva, así que se queda `candidato` con la etapa cerrada. La pantalla lo
+   * ofrecía, y las dos operaciones morían DESPUÉS de que alguien lo hubiera escrito todo.
+   *
+   * Es la misma frase que ya está escrita al lado de la proyección de conceptos —«el formulario
+   * que los ofrece y la validación que los exige tienen que mirar la misma foto»— aplicada a un
+   * campo que no estaba en la foto.
+   *
+   * La sonda mide las tres cosas: que el estado sigue siendo candidato (o sea que el caso es
+   * alcanzable y no una hipótesis), que la base rechaza escribir y borrar, y que la proyección
+   * lo dice — porque lo que la pantalla esconde tiene que poder leerlo de algún sitio.
+   */
+  it('C4 a mano no escribe ni borra con la etapa 4 cerrada, y la proyección lo dice', async () => {
+    await enWorkspaceLimpio('c4-etapa-cerrada', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4E', 'Proyecto de la etapa cerrada', ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      // Una escrita ANTES de cerrar, para poder medir también el borrado.
+      const { revisionId } = await escribirRevisionAMano(curadorId, {
+        workspaceId: wsC,
+        conceptoId,
+        contenido,
+      });
+      const abierta = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      expect(abierta!.etapaAdmiteConceptos).toBe(true);
+
+      // Y se cierra la etapa por el ciclo de vida del reto, que es una de sus dos ramas.
+      await admin`update reto set estado = 'archivado' where id = ${retoC} and workspace_id = ${wsC}`;
+
+      const cerrada = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      // El concepto SIGUE siendo candidato: nada lo mueve, y por eso el estado solo no basta.
+      expect(cerrada!.conceptos.find((c) => c.id === conceptoId)!.estado).toBe('candidato');
+      expect(
+        cerrada!.etapaAdmiteConceptos,
+        'la proyección no dice que la etapa cerró: la pantalla no tiene con qué esconder',
+      ).toBe(false);
+
+      // Y la base rechaza las DOS, que es lo que la pantalla estaba ofreciendo.
+      await expect(
+        escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido }),
+      ).rejects.toThrow();
+      await expect(
+        borrarRevisionAMano(curadorId, { workspaceId: wsC, revisionId }),
+      ).rejects.toThrow();
+      const [quedan] = await admin`select count(*)::int as n from revision_simulada
+        where id = ${revisionId}`;
+      expect(quedan!.n).toBe(1);
+    });
+  });
+
+  /**
    * Y NI LA ESCRIBE NI LA BORRA QUIEN NO ES CURADOR.
    *
    * `revision_simulada_insert` y `_delete` piden `workspace_role(...) in ('lead-boutique',

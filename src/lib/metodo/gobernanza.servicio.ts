@@ -695,7 +695,19 @@ export async function gobernanzaDeProyecto(
                    order by c.titulo)
           from concepto c
           where c.reto_id = p.reto_id and c.workspace_id = p.workspace_id
-        ), '[]'::jsonb) as conceptos
+        ), '[]'::jsonb) as conceptos,
+        -- Y SI LA ETAPA 4 SIGUE ADMITIENDO TRABAJO, que es la otra mitad de la misma foto.
+        --
+        -- Las políticas de la revisión simulada piden concepto «candidato» Y
+        -- «reto_admite_conceptos(...)»: son dos puertas, y la pantalla sólo llevaba una. Con G4
+        -- aprobado —o el reto archivado— un concepto se queda candidato sin que nada lo mueva,
+        -- así que el formulario lo ofrecía y el borrado también, y las dos operaciones morían
+        -- después de que alguien lo hubiera escrito todo.
+        --
+        -- Va aquí y en la MISMA sentencia por lo que ya dice la nota de los conceptos: el
+        -- formulario que los ofrece y la validación que los exige tienen que mirar la misma
+        -- foto. Es del reto y no del concepto, así que es un campo del proyecto y no de cada uno.
+        reto_admite_conceptos(p.reto_id, p.workspace_id) as etapa_admite_conceptos
       from proyecto p
       where p.id = ${proyectoId} and p.workspace_id = ${workspaceId}`;
     if (!fila) return null;
@@ -705,6 +717,7 @@ export async function gobernanzaDeProyecto(
       reaperturas: fila.reaperturas as GobernanzaDeProyecto['reaperturas'],
       segmentosDisponibles: fila.segmentos_disponibles as GobernanzaDeProyecto['segmentosDisponibles'],
       conceptos: fila.conceptos as GobernanzaDeProyecto['conceptos'],
+      etapaAdmiteConceptos: fila.etapa_admite_conceptos as boolean,
     };
   });
 }

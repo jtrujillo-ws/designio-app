@@ -1260,7 +1260,7 @@ Dos ámbitos con dos reglas distintas, ambas correctas:
 | Ámbito | Qué lleva | Para qué |
 |---|---|---|
 | **archivo** | **Todo** el catálogo de objetos del workspace (tablas del dominio, auditoría, adjuntos), verificado contra un manifiesto. Los adjuntos viajan embebidos hasta un presupuesto de **25 MiB por paquete**; los que no caben quedan listados con sus metadatos, su `sha256` y el motivo de omisión, y se descargan aparte desde la bandeja | La copia del propietario (SYS-04, RF-01.8) |
-| **entregable** | Solo la evidencia con **derechos vigentes** para ámbito cliente y sus derivados; lo excluido sale **listado con el motivo** | El paquete que se entrega al cliente (RF-03.10) |
+| **entregable** | **Solo evidencia**: la que tiene **derechos vigentes** para ámbito cliente, con su fuente, los segmentos del workspace, sus registros de derecho de uso, la propuesta AI de la que nació y los adjuntos originales de su ítem (`CATALOGO_EXPORT`: modos `porEvidencia`, `porFuente`, `porItem` y `todo`). **No lleva** el razonamiento ni lo derivado: insights, decisiones, arquetipos, oportunidades, conceptos, journeys, design versions, releases, medición, hilos y auditoría van `fuera` en el catálogo, tabla por tabla y con justificación. La evidencia excluida por derechos sale **listada con el motivo** | El paquete que se entrega al cliente (RF-03.10) |
 
 - Exportar es una acción explícita (POST) que **deja auditoría**; la base registra permiso y evento
   en `registrar_exportacion` y **confirma** la entrega en `exportacion_registro`, que la disposición
@@ -1847,7 +1847,7 @@ base.
 | **Degradación segura** | Sin AI disponible, todo flujo sigue operable a mano y la pantalla dice por qué; excepción vigente: los criterios de éxito de un reto nuevo, que solo entran desde la interfaz por C0 hasta que exista la pantalla de J2 |
 | **Portal** | Los hilos de comentarios y aprobaciones dentro del workspace, auditados |
 | **Evento de dominio** | Fila append-only de auditoría con tipo, payload, actor y rol |
-| **Exportación** | Paquete JSON del workspace en ámbito archivo (todo) o entregable (con derechos vigentes) |
+| **Exportación** | Paquete JSON del workspace en ámbito archivo (todo el catálogo) o entregable (solo la evidencia con derechos vigentes, con su fuente, derechos, segmentos y originales; sin razonamiento ni objetos derivados) |
 | **Disposición acordada** | Archivo o borrado del workspace tras el engagement, con acuerdo versionado, doble firma para borrar y constancia sellada |
 | **Lápida** | La fila `workspace` que sobrevive al borrado como ancla de la constancia |
 | **Biblioteca del cliente** | Proyección de la memoria del workspace: arquetipos por segmento, insights validados, decisiones vigentes, retos cerrados |

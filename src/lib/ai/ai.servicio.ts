@@ -3472,16 +3472,37 @@ function lentesDelConcepto(
                  * pedían los seis primeros por nombre, se rechazaban los seis, y el lote
                  * siguiente pedía otra vez exactamente los mismos.
                  *
-                 * Y se ordena por el ÚLTIMO INTENTO, no por si lo hubo. Con un booleano
-                 * —«¿se propuso alguna vez?»— la rueda gira dos vueltas y se para sola: tras el
-                 * segundo lote las siete lentes tienen ya alguna propuesta decidida, el
-                 * predicado vale lo mismo para todas, el desempate vuelve a ser el nombre, y del
-                 * tercer lote en adelante se piden otra vez las seis primeras. La séptima no
-                 * vuelve NUNCA — la misma avería que este párrafo describe, dos lotes más tarde.
-                 * Medido sobre cuatro lotes con siete lentes: (4,4,4,4,4,3,1).
+                 * Y se ordena por CUÁNTAS VECES se ha pedido cada una, la MENOS pedida delante.
+                 * Este orden lleva tres redacciones y las dos primeras se agotaban solas:
                  *
-                 * Con «nulls first» las que nunca se propusieron siguen yendo delante, y el
-                 * resto por antigüedad de su último intento, así que el turno rota de verdad.
+                 *   - Con un BOOLEANO —«¿se propuso alguna vez?»— la rueda gira dos vueltas y se
+                 *     para: tras el segundo lote las siete lentes tienen ya alguna propuesta
+                 *     decidida, el predicado vale lo mismo para todas, el desempate vuelve a ser
+                 *     el nombre, y del tercer lote en adelante se piden otra vez las seis
+                 *     primeras. La séptima no vuelve NUNCA. Medido: (4,4,4,4,4,3,1).
+                 *
+                 *   - Con el ÚLTIMO INTENTO —«max(creado_en)»— gira, pero cojeando, y por una
+                 *     razón que no se ve leyendo la consulta: «creado_en» es «now()», que es
+                 *     ESTABLE DENTRO DE LA TRANSACCIÓN, así que las seis propuestas de una misma
+                 *     generación llevan el instante idéntico y empatan. Entre las empatadas
+                 *     manda otra vez el nombre, así que las cinco primeras entran en todos los
+                 *     lotes y las dos últimas se turnan la plaza que sobra. Medido sobre cuatro
+                 *     lotes: (4,4,4,4,4,2,2) — nadie se queda fuera, pero el reparto es el doble
+                 *     para unas que para otras, y no converge por más lotes que pasen.
+                 *
+                 * Contar los intentos no empata donde el reloj empataba: dos lentes del mismo
+                 * lote suben las dos, así que la de al lado adelanta en el siguiente. Es el
+                 * reparto por «la menos servida primero», y su propiedad es que la diferencia
+                 * entre la más pedida y la menos pedida no pasa de una — que es lo que la sonda
+                 * mide ahora, en vez de un suelo que la cojera cumplía.
+                 *
+                 * El instante sigue detrás como PRIMER desempate, que es lo que la redacción
+                 * anterior quería decir: entre dos con los mismos intentos, la que lleva más sin
+                 * pedirse. Y el nombre y el id detrás, porque el orden dentro de un lote tiene
+                 * que ser TOTAL y determinista o la huella del material no se puede reconstruir.
+                 *
+                 * Va en un LATERAL y no en dos subconsultas correlacionadas: las dos preguntan
+                 * exactamente lo mismo y sólo cambia el agregado.
                  *
                  * Se ROTA y no se excluye porque una lente se rechaza cuando su salida no
                  * valía, y volver a pedirla tiene que seguir siendo posible.
@@ -3490,14 +3511,17 @@ function lentesDelConcepto(
                  * exclusión de abajo: si rechazar una moviera el orden, el material de sus
                  * hermanas cambiaría y aceptarlas fallaría con «material movido».
                  */
-                order by (select max(pd.creado_en) from propuesta_ai pd
-                  where pd.concepto_id = ${alias.concepto}.id
-                    and pd.workspace_id = ${alias.concepto}.workspace_id
-                    and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
-                    and lower(pd.contenido ->> 'arquetipoId') = a.id::text
-                    and pd.llamada_id is distinct from ${alias.lote}) asc nulls first,
-                  a.nombre, a.id), '[]'::json)
+                order by turno.veces asc, turno.ultimo asc nulls first, a.nombre, a.id), '[]'::json)
        from arquetipo a
+       left join lateral (
+         select count(*) as veces, max(pd.creado_en) as ultimo
+         from propuesta_ai pd
+         where pd.concepto_id = ${alias.concepto}.id
+           and pd.workspace_id = ${alias.concepto}.workspace_id
+           and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
+           and lower(pd.contenido ->> 'arquetipoId') = a.id::text
+           and pd.llamada_id is distinct from ${alias.lote}
+       ) turno on true
        where a.reto_id = ${alias.reto} and a.workspace_id = ${alias.concepto}.workspace_id
          /*
           * Y SIN LAS REFUTADAS. El veredicto de SPEC-04.11 dice que ese perfil no describe a

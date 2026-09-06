@@ -9086,21 +9086,32 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(segundoPanel.every((x) => x.citas.every((c) => c.presenteLiteral))).toBe(true);
 
       /*
-       * Y LA ROTACIÓN TIENE QUE SEGUIR ROTANDO PASADO EL SEGUNDO LOTE.
+       * Y LA ROTACIÓN TIENE QUE SEGUIR ROTANDO, Y REPARTIR PAREJO, LOTE TRAS LOTE.
        *
-       * Con «¿se intentó alguna vez?» —un booleano— la rotación se agota sola: tras los dos
-       * primeros lotes las siete lentes tienen ya alguna propuesta decidida, el predicado es
-       * cierto para todas, el desempate vuelve a ser alfabético y el tercer lote pide otra vez
-       * las seis primeras. La séptima no vuelve nunca — que es exactamente la avería que esta
-       * sonda arregló, dos lotes más tarde.
+       * Este orden se ha agotado DOS veces, y cada vez unos lotes más tarde que el anterior, así
+       * que lo que se mide aquí ya no es «¿vuelve alguna vez?» sino el reparto entero:
        *
-       * Se ordena por el ÚLTIMO intento y no por si lo hubo: las que nunca se propusieron van
-       * primero —«nulls first»— y el resto por antigüedad, así que la rueda gira sola. Se mide
-       * sobre CUATRO lotes porque el turno completo de siete lentes en lotes de seis tarda eso:
-       * con la avería la séptima sale una vez, y con el arreglo salen todas al menos dos.
+       *   - Con un BOOLEANO —«¿se intentó alguna vez?»— tras los dos primeros lotes las siete
+       *     lentes tienen alguna propuesta decidida, el predicado es cierto para todas, el
+       *     desempate vuelve a ser alfabético y del tercer lote en adelante se piden otra vez
+       *     las seis primeras. La séptima no vuelve nunca: (4,4,4,4,4,3,1).
+       *   - Con el ÚLTIMO INTENTO —«max(creado_en)»— gira, pero cojeando: «creado_en» es
+       *     «now()», estable dentro de la transacción, así que las seis de una generación
+       *     empatan al instante y entre las empatadas manda otra vez el nombre. Las cinco
+       *     primeras entran en TODOS los lotes y las dos últimas se turnan la plaza que sobra:
+       *     (4,4,4,4,4,2,2). Nadie se queda fuera, y por eso un suelo —«ninguna menos de dos»—
+       *     lo daba por bueno; el reparto era el doble para unas que para otras.
+       *
+       * Lo que se afirma ahora es la propiedad del reparto por «la menos servida primero»: la
+       * diferencia entre la más pedida y la menos pedida NO PASA DE UNA. Y se comprueba tras
+       * CADA lote y no sólo al final, porque las dos averías se ven un lote antes así — las dos
+       * rompen en el TERCERO.
+       *
+       * Siete lotes, que es el turno completo de siete lentes de seis en seis. Medir dos lotes
+       * antes de donde aparece la avería es la lección que este orden ya cobró dos veces.
        */
       const vueltas: string[][] = [primeras, segundas];
-      for (let i = 0; i < 2; i++) {
+      for (let i = 0; i < 5; i++) {
         for (const p of (await panelPropuestas(curadorId, wsC)).pendientes.filter(
           (x) => x.capacidad === 'C4',
         )) {
@@ -9123,13 +9134,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         );
       }
       const veces = new Map(lentes.map((l) => [l.arq, 0]));
-      for (const lote of vueltas) for (const id of lote) veces.set(id, veces.get(id)! + 1);
+      const desparejos = vueltas.flatMap((lote, i) => {
+        for (const id of lote) veces.set(id, veces.get(id)! + 1);
+        const n = [...veces.values()];
+        return Math.max(...n) - Math.min(...n) > 1 ? [`lote ${i + 1}: (${n.join(',')})`] : [];
+      });
       expect(
-        [...veces.values()].filter((n) => n < 2).length,
-        `en cuatro lotes hay lentes pedidas menos de dos veces: la rueda dejó de girar (${[
-          ...veces.values(),
-        ].join(',')})`,
-      ).toBe(0);
+        desparejos,
+        'la rueda reparte desparejo: hay lentes pedidas más del doble que otras, y eso no se corrige con más lotes',
+      ).toEqual([]);
+      // Y la mitad sin la cual esto lo cumpliría una rueda parada: las siete se piden de verdad.
+      expect([...veces.values()].every((n) => n > 0)).toBe(true);
     });
   });
 

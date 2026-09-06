@@ -1056,7 +1056,19 @@ function FormularioRevisionAMano({
     );
   };
 
+  /*
+   * Un borrador vacío es TAMBIÉN sin lente, y por eso `limpiar` la borra.
+   *
+   * Al guardar, la lente elegida deja de estar disponible —una lente lee un concepto una vez—,
+   * así que el selector se queda pintando su hueco mientras el estado sigue teniendo el id: se
+   * escribe el borrador siguiente, el botón se habilita porque el id no está vacío, y se manda
+   * una lente ya usada. Con esto el borrador siguiente tiene que elegirla otra vez, que es lo
+   * que la pantalla ya está diciendo.
+   *
+   * Quien cambia de lente la fija DESPUÉS de limpiar, por eso, y no antes.
+   */
   const limpiar = () => {
+    setArquetipoId('');
     setSintesis('');
     setHallazgos([HALLAZGO_VACIO]);
     setPreguntas([PREGUNTA_VACIA]);
@@ -1107,16 +1119,15 @@ function FormularioRevisionAMano({
    * Y se dice antes de que pase, junto a los selectores, porque perder lo escrito en silencio es
    * su propia avería.
    */
+  // La LENTE se vacía con el resto: qué lentes quedan libres depende del concepto —una lente lee
+  // un concepto UNA vez—, así que al cambiarlo la elegida puede haber dejado de estar disponible.
   const cambiarConcepto = (v: string) => {
-    setConceptoId(v);
-    // Y la LENTE también: qué lentes quedan libres depende del concepto —una lente lee un
-    // concepto UNA vez—, así que al cambiarlo la elegida puede haber dejado de estar disponible.
-    setArquetipoId('');
     limpiar();
+    setConceptoId(v);
   };
   const cambiarLente = (v: string) => {
-    setArquetipoId(v);
     limpiar();
+    setArquetipoId(v);
   };
 
   const hallazgoListo = (h: HallazgoAMano) =>

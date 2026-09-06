@@ -533,6 +533,12 @@ describe('el registro de capacidades', () => {
  * Se mide por la FORMA del registro y no contra una lista escrita a mano de «las que anidan»:
  * esa lista sería una segunda redacción de la regla, y la capacidad que llegue anidando y sin
  * `grupo` pasaría por no estar en ella. Un `flatMap` en la entrada ES el anidamiento.
+ *
+ * El registro que se lee es `CITAS_POR_CAPACIDAD`, que es donde vive el lector de cada una;
+ * `CITAS_DEL_CONTENIDO` se DERIVA de él para canonizar el `alcanceId`, y por eso ya no es un
+ * literal que se pueda recorrer. El censo se ancla a un nombre, así que se comprueba además
+ * que la exportación siga saliendo de ESTE registro: si mañana se derivara de otro, el censo
+ * se quedaría midiendo un literal muerto y pasaría en verde sobre la capacidad nueva.
  */
 it('las capacidades que anidan sus citas llevan el reparto en cada una', async () => {
   const ruta = `${RAIZ}/src/lib/ai/ai.contenido.ts`;
@@ -544,19 +550,17 @@ it('las capacidades que anidan sus citas llevan el reparto en cada una', async (
   );
 
   const entradas = new Map<string, string>();
+  let derivado = '';
   const recorrer = (n: ts.Node): void => {
-    if (
-      ts.isVariableDeclaration(n) &&
-      ts.isIdentifier(n.name) &&
-      n.name.text === 'CITAS_DEL_CONTENIDO' &&
-      n.initializer &&
-      ts.isObjectLiteralExpression(n.initializer)
-    ) {
-      for (const prop of n.initializer.properties) {
-        if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
-          entradas.set(prop.name.text, prop.initializer.getText(arbol));
+    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) {
+      if (n.name.text === 'CITAS_POR_CAPACIDAD' && ts.isObjectLiteralExpression(n.initializer)) {
+        for (const prop of n.initializer.properties) {
+          if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
+            entradas.set(prop.name.text, prop.initializer.getText(arbol));
+          }
         }
       }
+      if (n.name.text === 'CITAS_DEL_CONTENIDO') derivado = n.initializer.getText(arbol);
     }
     ts.forEachChild(n, recorrer);
   };
@@ -566,6 +570,12 @@ it('las capacidades que anidan sus citas llevan el reparto en cada una', async (
   expect([...entradas.keys()].sort(), 'el censo no leyó el registro de citas').toEqual(
     [...CAPACIDADES_ACTIVAS].sort(),
   );
+  // Y que lo que consume el resto del sistema sea ESTE registro y no otro: sin esto, el censo
+  // se ancla a un nombre que puede quedarse atrás sin que nada lo diga.
+  expect(
+    derivado,
+    '`CITAS_DEL_CONTENIDO` ya no se deriva de `CITAS_POR_CAPACIDAD`: el censo está midiendo un registro que nadie lee',
+  ).toMatch(/\bCITAS_POR_CAPACIDAD\b/);
 
   const anidan = [...entradas].filter(([, cuerpo]) => cuerpo.includes('.flatMap('));
   expect(anidan.length, 'ninguna capacidad anida sus citas: el censo no mide nada').toBeGreaterThan(

@@ -886,7 +886,7 @@ export type CitaDelContenido = {
    */
   grupo?: number;
 };
-export const CITAS_DEL_CONTENIDO: Record<
+const CITAS_POR_CAPACIDAD: Record<
   CapacidadActiva,
   (contenido: ContenidoPropuesta) => CitaDelContenido[]
 > = {
@@ -943,6 +943,33 @@ export const CITAS_DEL_CONTENIDO: Record<
   /* C7 cita contra un solo documento —el expediente del post mortem—, así que sin alcance. */
   C7: (c) => (c as ContenidoPostMortem).citas,
 };
+
+/**
+ * Y EL «alcanceId» SALE CANÓNICO DE AQUÍ, una vez y para las cuatro capacidades que lo tienen.
+ *
+ * Es la clave con la que el panel busca el TRAMO del documento que la cita nombra, y las claves
+ * de ese mapa salen de la base —minúsculas—. El contenido almacenado no tiene por qué estarlo:
+ * el contrato canoniza al PARSEAR, pero por la superficie concedida entra un uuid en mayúscula,
+ * y los guards lo admiten desde que comparan con «lower()». Con el id crudo la búsqueda falla
+ * en silencio y la cita se reporta AUSENTE —la única señal contrastable que quien revisa mira—
+ * y la etiqueta de al lado dice que el documento ya no está. Medido: «presenteLiteral» pasa de
+ * true a false sin tocar nada más que la caja del id.
+ *
+ * Va aquí, donde las citas se LEEN del contenido, y no en los cuatro consumidores: es una
+ * propiedad de cómo se lee, no de quién lee. Y se deriva del registro en vez de escribirse por
+ * capacidad, que es la lección que este fichero lleva cobrada cuatro veces.
+ */
+export const CITAS_DEL_CONTENIDO = Object.fromEntries(
+  Object.entries(CITAS_POR_CAPACIDAD).map(([capacidad, leer]) => [
+    capacidad,
+    (contenido: ContenidoPropuesta) =>
+      leer(contenido).map((cita) =>
+        cita.alcanceId === undefined
+          ? cita
+          : { ...cita, alcanceId: cita.alcanceId.toLowerCase() },
+      ),
+  ]),
+) as Record<CapacidadActiva, (contenido: ContenidoPropuesta) => CitaDelContenido[]>;
 
 /**
  * Qué MÁS, aparte de las citas, es testimonio del modelo y por tanto no se corrige.
@@ -1067,6 +1094,11 @@ export const TESTIMONIO_ADICIONAL: Record<
      * de cada cita, que la comparación de arriba SÍ compara: las dos reglas decían cosas
      * opuestas, y la que ganaba —el rechazo— lo hacía por accidente y con el mensaje
      * equivocado («las citas no se corrigen» sobre una corrección que no las tocaba).
+     *
+     * Escribir el blindaje no bastó para que ese mensaje dejara de salir: la comparación de
+     * las citas corría ANTES, y como reapuntar el criterio mueve también su `alcanceId`,
+     * seguía saltando ella. Medido. Por eso `aceptarPropuesta` comprueba ahora el testimonio
+     * adicional primero: la regla que nombra el campo va antes que la que habla del conjunto.
      *
      * Gana el blindaje, y no por resolver el empate hacia el lado estricto: `criterioId` es la
      * mitad CONTRASTABLE de lo que el modelo dijo. Los fragmentos se copiaron de UN criterio,

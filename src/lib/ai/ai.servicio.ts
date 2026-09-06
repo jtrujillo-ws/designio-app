@@ -5765,24 +5765,24 @@ async function aceptarPropuestaEnTransaccion(
       // `contenido.citas` funcionaba con tres capacidades que las tenían al final; con las de
       // C2 dentro de cada afirmación, esa lectura habría dado `undefined` en los dos lados y
       // la regla habría pasado EN VACÍO, dejando editables justo las citas que no se tocan.
-      if (
-        canonico(CITAS_DEL_CONTENIDO[p.capacidad](contenido)) !==
-        canonico(CITAS_DEL_CONTENIDO[p.capacidad](p.contenidoOriginal))
-      ) {
-        throw new ErrorAI(
-          'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
-        );
-      }
       /*
        * Y lo que cada capacidad declare intocable ADEMÁS de sus citas, por registro y no por
        * un `if` sobre la capacidad: el guardián de ramas binarias de este pipeline existe
        * justo para eso, y lo cazó cuando esto era un `if`.
        *
-       * Hoy solo C2, con sus contradicciones; el motivo lo escribe la capacidad, porque quien
-       * lo lee necesita saber QUÉ no se toca y no «algo». Cerraba además un agujero de
-       * alcance: `parsearContenido` admite cambiarlas y nada comprobaba que la evidencia nueva
-       * fuera del reto —`contradiccion` solo lleva la FK del tenant—, así que una corrección
-       * podía apuntar a cualquiera del workspace y la aceptación la materializaba.
+       * El motivo lo escribe la capacidad, porque quien lo lee necesita saber QUÉ no se toca y
+       * no «algo». Cerraba además un agujero de alcance en C2: `parsearContenido` admite
+       * cambiar sus contradicciones y nada comprobaba que la evidencia nueva fuera del reto
+       * —`contradiccion` solo lleva la FK del tenant—, así que una corrección podía apuntar a
+       * cualquiera del workspace y la aceptación la materializaba.
+       *
+       * VA ANTES QUE LAS CITAS, y no es cosmética. El `alcanceId` de las citas de C6 se DERIVA
+       * de su `criterioId`, que es justo lo que esta comprobación blinda: reapuntarlo movía
+       * las dos, la general saltaba primero y quien revisaba leía «las citas no se corrigen»
+       * sobre una corrección que no había tocado ni un fragmento. Medido: ese caso devolvía el
+       * mensaje de las citas hasta que este bloque subió aquí. La regla es la de siempre —la
+       * comprobación que NOMBRA el campo va antes que la que habla del conjunto—, y cuando una
+       * corrección viola las dos, el mensaje específico es el que dice qué deshacer.
        */
       const adicional = TESTIMONIO_ADICIONAL[p.capacidad];
       if (
@@ -5790,6 +5790,14 @@ async function aceptarPropuestaEnTransaccion(
         canonico(adicional.parte(contenido)) !== canonico(adicional.parte(p.contenidoOriginal))
       ) {
         throw new ErrorAI(adicional.motivo);
+      }
+      if (
+        canonico(CITAS_DEL_CONTENIDO[p.capacidad](contenido)) !==
+        canonico(CITAS_DEL_CONTENIDO[p.capacidad](p.contenidoOriginal))
+      ) {
+        throw new ErrorAI(
+          'Las citas de una propuesta no se corrigen: son el rastro de lo que el modelo dijo haber leído. Corrige el resto, o rechaza la propuesta si sus citas no se sostienen.',
+        );
       }
     }
     /*

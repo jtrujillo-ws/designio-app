@@ -10822,6 +10822,93 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y EL PANEL BUSCA EL TRAMO DEL DOCUMENTO CON EL ID TAL CUAL VINO, que es la misma superficie
+   * una puerta más allá.
+   *
+   * La ronda anterior admitió el `arquetipoId` en mayúscula comparándolo canónicamente. Esta es
+   * la factura: el `evidenciaId` de cada cita entra por la misma rendija —el contrato canoniza al
+   * PARSEAR, así que a la fila sólo llega en otra caja por fuera del servicio— y el panel lo usa
+   * como CLAVE contra un mapa cuyas claves salen de la base, en minúscula. La búsqueda falla en
+   * silencio: no hay error, la cita se reporta AUSENTE y la etiqueta de al lado dice que el
+   * documento ya no está.
+   *
+   * Y ausente es justo la señal que quien revisa mira para decidir. Una cita literal y correcta
+   * pasa por inventada porque alguien guardó el uuid gritado.
+   *
+   * Se mide donde duele —`presenteLiteral` pasa de `true` a `false` sin tocar NADA más que la
+   * caja del id— y el arreglo va donde las citas se LEEN del contenido, que es una costura y no
+   * cuatro: es una propiedad de cómo se leen, no de quién las lee.
+   */
+  it('C4: una cita con el id de evidencia en mayúscula sigue estando presente en el panel', async () => {
+    await enWorkspaceLimpio('c4-cita-id-mayuscula', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      // Por el camino real, igual que arriba: la huella del material tiene que ser la de verdad.
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const propuestaId = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.capacidad === 'C4',
+      )!.id;
+
+      // La mitad sin la cual esto no mediría nada: con el id en minúscula, PRESENTE.
+      const antes = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.id === propuestaId,
+      )!;
+      expect(antes.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      /*
+       * Y ahora se sube la caja del id, y sólo eso. En las DOS columnas: el guard de la base
+       * compara `contenido` contra `contenido_original` y con una sola responde «las citas de
+       * una revisión simulada no se corrigen» —el suelo funcionando—, que no es el caso que se
+       * quiere medir. Lo que se simula aquí es una fila que NACIÓ con el id gritado.
+       */
+      await admin`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{hallazgos,0,citas,0,evidenciaId}',
+                                    to_jsonb(upper(${evA}::text))),
+              contenido_original = jsonb_set(contenido_original,
+                                             '{hallazgos,0,citas,0,evidenciaId}',
+                                             to_jsonb(upper(${evA}::text)))
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+      const [guardada] = await admin`select contenido #>> '{hallazgos,0,citas,0,evidenciaId}' as id
+        from propuesta_ai where id = ${propuestaId}`;
+      expect(guardada!.id).toBe(evA.toUpperCase());
+
+      const despues = (await panelPropuestas(curadorId, wsC)).pendientes.find(
+        (x) => x.id === propuestaId,
+      )!;
+      expect(
+        despues.citas.map((c) => c.presenteLiteral),
+        'la cita se reporta ausente sólo porque el id venía en otra caja',
+      ).toEqual([true]);
+      // Y el tramo que la sostiene sigue siendo el suyo, no «el documento ya no está».
+      expect(despues.citas[0]!.fragmento).toBe('No entrego la cédula');
+    });
+  });
+
+  /**
    * Y LA REVISIÓN A MANO RELEE SU ARQUETIPO BAJO EL CANDADO, que es la OTRA puerta.
    *
    * La ronda anterior cerró esto para la PROPUESTA y me dejé la ruta que no pasa por
@@ -17920,6 +18007,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Gana el blindaje, y no por resolver el empate hacia el lado estricto: los fragmentos se
    * copiaron de UN criterio, y reapuntarlos a otro conservándolos es quedarse con el sostén de
    * A para afirmar sobre B. Es lo mismo que C2 hace con el `evidenciaId` de sus citas.
+   *
+   * Y se exige el mensaje EXACTO, no un `/no se corrige/i` que los dos cumplen: con el patrón
+   * laxo esta sonda pasó en verde durante rondas mientras el mensaje que salía seguía siendo
+   * el de las citas —el blindaje estaba escrito y su puerta tapada por la comparación general,
+   * que corría antes—. Un patrón que ninguna de las dos ramas distingue no mide cuál corrió.
    */
   it('C6: el criterio de una entrada no se reapunta al corregir, y el resto sí', async () => {
     const admin = sqlAdmin();
@@ -17949,7 +18041,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         propuestaId,
         correccion: { ...inicial, criterioId: otro!.id as string },
       }),
-    ).rejects.toThrow(/no se corrige/i);
+    ).rejects.toThrow(/El criterio al que responde una entrada KPI no se corrige/);
 
     // Y lo que SÍ es redacción se corrige, que es la otra mitad: sin ella, este caso pasaría
     // igual con la corrección entera tapiada.

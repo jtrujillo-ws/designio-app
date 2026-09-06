@@ -356,7 +356,7 @@ cruzados y la guía de abajo los enumera.
 flowchart LR
   subgraph CLI["Navegador"]
     direction TB
-    R["React 19 · TanStack Router<br/>16 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
+    R["React 19 · TanStack Router<br/>18 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
     UI["Design system y componentes<br/>src/components"]
   end
   subgraph SRV["Servidor · Bun 1.3 · TanStack Start"]
@@ -2119,7 +2119,7 @@ fuente o a un ADR de sucesión.
 | # | Documento | Lo que dice | Lo que hay | Acción sugerida |
 |---|---|---|---|---|
 | 1 | `docs/02-adr/README.md` | «Nombre del producto: sin nombre en clave aún» | El producto se llama Designio en README, package, UI y design system | Cerrar la decisión en el índice |
-| 2 | Diseño técnico · Módulos | Un módulo por contexto (`workspace`, `servicio`, `biblioteca`…) | CTX-01 está repartido en `auth`, `arbol`, `segmento`, `portal`, `exportacion`, `disposicion`, `memoria`, `aprobaciones`, `busqueda`; `servicio` y `biblioteca` solo tienen esquemas; journeys en `journey`, design versions en `entrega` | Actualizar la tabla de módulos |
+| 2 | Diseño técnico · Módulos | Un módulo por contexto (`workspace`, `servicio`, `biblioteca`…) | CTX-01 está repartido en `auth`, `arbol`, `segmento`, `portal`, `exportacion`, `disposicion`, `memoria`, `aprobaciones`, `busqueda`; `biblioteca` solo tiene esquemas; `servicio` guarda el esquema del servicio y aloja el **portafolio HMW** (`oportunidad.functions.ts`, `oportunidad.servicio.ts`), mientras el alta de servicios vive en `arbol`; journeys en `journey`, design versions en `entrega` | Actualizar la tabla de módulos |
 | 3 | Diseño técnico · Stack | react-hook-form, Radix UI, Playwright, nodemailer | No están en `package.json`; el correo no se envía; E2E pendiente | Marcar como «cuando lleguen» |
 | 4 | Diseño técnico · Observabilidad | «Cloud Logging» | El despliegue es Railway; los logs son los del servicio | Reescribir la sección |
 | 5 | Diseño técnico · Datos | Object storage S3 con proxy de bytes | Adjuntos en `bytea` dentro de Postgres con presupuesto por workspace; el proxy de bytes sí existe | Documentar la etapa intermedia |

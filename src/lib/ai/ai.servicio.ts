@@ -3506,17 +3506,24 @@ export async function huellaDelMaterialDeRevision(
     arquetipos: (fila.arquetipos as ArquetipoQueRevisa[] | null) ?? [],
   };
   /*
-   * Y el derecho que VENCE HOY, sobre la evidencia de las lentes de este lote y no sobre la del
-   * reto entero: la ventana ya recortó los arquetipos, y preguntar por todos bloquearía una
-   * llamada legítima por un permiso que este material ni siquiera enseña.
+   * Y el derecho que VENCE HOY, sobre la evidencia que este material ENSEÑA — no la del reto
+   * entero, y tampoco la de las lentes candidatas.
+   *
+   * Las dos acotaciones son la misma idea aplicada dos veces, y la segunda faltaba. La ventana
+   * recorta los arquetipos, sí, pero DESPUÉS el cuerpo se recorta a «MAX_MATERIAL» y de las
+   * lentes candidatas puede quedarse fuera una entera, o la cola de documentos de otra. Con la
+   * lista sin recortar, un permiso que vence hoy sobre un documento que el prompt no manda
+   * abortaba la llamada: exactamente el falso bloqueo que la primera acotación existe para
+   * evitar, un escalón más abajo.
+   *
+   * `evidenciaQueLlegoAlRevisor` mide sobre el texto ya compuesto y recortado, que es lo único
+   * que de verdad sale hacia el proveedor.
    *
    * La pregunta la contesta la BASE y no esta plantilla, como en C2: el calendario de las
    * garantías lo fija ella, y preguntarlo desde aquí lo dejaría dependiendo del huso de quien
    * llama. Hay un censo que lo vigila.
    */
-  const evidencias = lentesDelLote(material.arquetipos).lentes.flatMap((a) =>
-    a.evidencia.map((e) => e.id),
-  );
+  const evidencias = evidenciaQueLlegoAlRevisor(material).ids;
   const [caducada] = await tx`select derecho_que_vence_ya(
     ${evidencias}::uuid[], ${workspaceId}) as titulo`;
   return {

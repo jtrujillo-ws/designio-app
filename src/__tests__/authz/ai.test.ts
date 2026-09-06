@@ -34,6 +34,7 @@ import {
 import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   arquetiposQueLlegaronEnteros,
+  evidenciaQueLlegoAlRevisor,
   criteriosQueLlegaronConLasOportunidades,
   evidenciaQueLlegoAlModelo,
   elementosQueLlegaronAlModelo,
@@ -8409,6 +8410,173 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * EL ALCANCE NO DECLARA DE MÁS: contener no acota, hace falta la IGUALDAD.
+   *
+   * La comprobación del sello preguntaba solo «¿falta alguna?». Un alcance inflado —la
+   * evidencia de la lente MÁS un documento cualquiera del workspace— la satisface para
+   * siempre, y el día que ese documento se enlace al arquetipo la comprobación lo encuentra ya
+   * dentro: se sella una revisión que nunca lo vio, con el argumento de que estaba declarado.
+   *
+   * Es la misma lección que C3 pagó en su ronda 5, y aquí llega por la superficie concedida:
+   * el servicio escribe el alcance partido por lente, pero `propuesta_ai` tiene INSERT para el
+   * rol de la aplicación y nada obligaba a que ese array fuera el de la lente.
+   *
+   * Se mide en los dos sentidos: con el documento ajeno dentro no sella; sin él, la misma
+   * escritura entra entera.
+   */
+  it('C4 no sella una revisión cuyo alcance declara evidencia de otra lente', async () => {
+    await enWorkspaceLimpio('c4-alcance-inflado', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const contenido = {
+        arquetipoId: lenteB,
+        sintesis: 'Una lectura del segundo.',
+        hallazgos: [
+          {
+            titulo: 'Se va por el tiempo',
+            descripcion: 'Dice que abandona si tarda.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evB, fragmento: 'Si tarda más de un café', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Cuánto esperarías?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const sellar = (alcance: string[]) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteB}, 'Una lectura del segundo.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Se va por el tiempo',
+                    'Dice que abandona si tarda.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id)
+            values (${h!.id as string}, ${evB}, ${wsC})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Cuánto esperarías?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${p!.id as string} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // `evA` es de la PRIMERA lente y esta revisión firma con la segunda.
+      await expect(sellar([evB, evA])).rejects.toThrow(/no es de la lente que firma/i);
+      // Y con el alcance honesto —solo lo de su lente— la misma escritura entra entera.
+      await expect(sellar([evB])).resolves.toBeTruthy();
+      expect(lenteA, 'el fixture perdió la primera lente').toBeTruthy();
+    });
+  });
+
+  /**
+   * EL PERMISO QUE VENCE HOY se pregunta por lo que el prompt ENSEÑA, no por lo que se pensó
+   * enseñar.
+   *
+   * La puerta ya acotaba una vez —las lentes del lote y no las del reto entero— y ahí se quedó:
+   * la lista salía de `lentesDelLote`, que es la ventana ANTES del recorte. Pero el cuerpo se
+   * recorta después a `MAX_MATERIAL`, y de las candidatas puede quedarse fuera una lente
+   * entera. Un permiso que vence hoy sobre un documento que nadie manda abortaba la llamada:
+   * el mismo falso bloqueo que la primera acotación existe para evitar, un escalón más abajo.
+   *
+   * Se mide en los DOS sentidos, que es lo que separa «no bloquea de más» de «ya no bloquea»:
+   * con el permiso sobre el documento que el recorte dejó fuera, la llamada sale; movido al
+   * que sí llega, la puerta se cierra.
+   *
+   * El corte se calibra por bisección contra el material REAL, como su hermana de la lente a
+   * medias: lo que se busca es el punto exacto en que deja de caber una.
+   */
+  it('el permiso que vence hoy no bloquea C4 por un documento que el recorte dejó fuera', async () => {
+    await enWorkspaceLimpio('c4-vence-recortado', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const enterasCon = async (relleno: number) =>
+        conUsuario(curadorId, async (tx) => {
+          const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          if (relleno >= 0) {
+            const primera = material!.arquetipos[0]!;
+            await admin`update evidencia set resumen = ${primera.evidencia[0]!.resumen.split('·')[0]! + '·'.repeat(relleno)}
+              where id = ${primera.evidencia[0]!.id}`;
+          }
+          const { material: m2 } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+          return arquetiposQueLlegaronEnteros(m2!).ids;
+        });
+      let cabe = 0;
+      let noCabe = MAX_MATERIAL + 2_000;
+      expect((await enterasCon(cabe)).length).toBe(2);
+      expect((await enterasCon(noCabe)).length).toBeLessThan(2);
+      while (noCabe - cabe > 1) {
+        const medio = (cabe + noCabe) >> 1;
+        if ((await enterasCon(medio)).length === 2) cabe = medio;
+        else noCabe = medio;
+      }
+      expect((await enterasCon(noCabe)).length, 'no se logró cortar exactamente una lente').toBe(1);
+
+      // Quién llega y quién no, leído del material recortado y no de una cuenta a ojo.
+      const { llegan, fuera } = await conUsuario(curadorId, async (tx) => {
+        const { material } = await huellaDelMaterialDeRevision(tx, wsC, conceptoId);
+        const dentro = new Set(evidenciaQueLlegoAlRevisor(material!).ids);
+        const todas = material!.arquetipos.flatMap((a) => a.evidencia.map((e) => e.id));
+        return {
+          llegan: todas.filter((id) => dentro.has(id)),
+          fuera: todas.filter((id) => !dentro.has(id)),
+        };
+      });
+      expect(fuera.length, 'el recorte no dejó fuera ningún documento: la sonda no mide nada').toBeGreaterThan(0);
+      expect(llegan.length, 'no llegó ningún documento: la sonda tampoco mediría').toBeGreaterThan(0);
+
+      // El permiso del que NO llega vence hoy: la llamada no tiene por qué enterarse.
+      const hoy = await admin`select fecha_de_la_base() as d`;
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${fuera[0]!} and workspace_id = ${wsC}`;
+      const sinBloquear = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        sinBloquear.caducada,
+        'un permiso sobre un documento que el prompt no manda bloquea la llamada',
+      ).toBeNull();
+
+      // Y movido al que sí llega, la puerta se cierra: es la misma puerta, bien apuntada.
+      await admin`update derecho_uso set vence_en = null
+        where evidencia_id = ${fuera[0]!} and workspace_id = ${wsC}`;
+      await admin`update derecho_uso set vence_en = ${hoy[0]!.d as string}
+        where evidencia_id = ${llegan[0]!} and workspace_id = ${wsC}`;
+      const bloqueada = await conUsuario(curadorId, (tx) =>
+        huellaDelMaterialDeRevision(tx, wsC, conceptoId),
+      );
+      expect(
+        bloqueada.caducada,
+        'un permiso que vence hoy sobre un documento que SÍ se manda no bloquea',
+      ).not.toBeNull();
+    });
+  });
+
+  /**
    * EL ALCANCE ES DE LA LENTE, no del lote — y con el del lote una lente que CRECE pasa.
    *
    * `alcance_evidencia` se escribía con lo que llegó al modelo en TODO el material, y de una
@@ -9447,6 +9615,35 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         Object.fromEntries(revs.map((x) => [x.id, x.propuestaAiId])),
         'la procedencia no distingue lo que propuso la AI de lo que escribió una persona',
       ).toEqual({ [rev!.id]: propuestaId, [aMano]: null });
+
+      /*
+       * Y LO LEE QUIEN NO DECIDE, que es la mitad que faltaba.
+       *
+       * Las preguntas de test son para el equipo que va a correr el test, no para el lead en el
+       * momento de firmar: pintarlas sólo dentro del formulario del pasa/muere las dejaba fuera
+       * del alcance de quien no es lead —el control que abre ese formulario se pinta para él— y
+       * al alcance del lead sólo DESPUÉS de los tests que esas preguntas guían.
+       *
+       * Lo que se puede medir de eso es el lector, y aquí está: un diseñador del mismo
+       * workspace lo abre y recibe las revisiones enteras. Si algún día alguien le pone una
+       * puerta de rol, esto se cae.
+       */
+      const [otro] = await admin`insert into usuario (email, nombre, estado)
+        values (${`disenador-${wsC}@designio.test`}, 'Diseñador', 'activo') returning id`;
+      const disenadorId = otro!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${disenadorId}, 'Diseñador', ${`disenador-${wsC}@designio.test`},
+                'disenador')`;
+      const gob3 = await gobernanzaDeProyecto(disenadorId, wsC, proy!.id as string);
+      const revsDelDisenador = gob3!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      expect(
+        revsDelDisenador.length,
+        'quien no es lead no llega a leer las revisiones aceptadas',
+      ).toBe(2);
+      expect(
+        revsDelDisenador.flatMap((x) => x.preguntas.map((q) => q.pregunta)),
+        'las preguntas de test no llegan a quien va a correr el test',
+      ).toContain('¿Qué te haría entregar la cédula?');
     });
   });
 

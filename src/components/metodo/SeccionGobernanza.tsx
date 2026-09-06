@@ -91,6 +91,19 @@ export function SeccionGobernanza({
         onCambio={onCambio}
         onError={onError}
       />
+      {/*
+        * Las revisiones simuladas ACEPTADAS, fuera del formulario del pasa/muere.
+        *
+        * Estaban dentro, y dentro no las lee nadie a tiempo: el formulario solo se abre desde
+        * un control que se pinta para el lead, así que quien no es lead no las veía nunca, y el
+        * lead las veía sólo mientras registraba la decisión — después de los tests que esas
+        * preguntas existen para guiar. Lo que una simulación le entrega a la etapa 4 son
+        * justamente sus preguntas (RF-08.2): tienen que estar donde el equipo prepara el test,
+        * no detrás del acto de decidir.
+        *
+        * Sin puerta de rol: leer no es decidir. Escribir el pasa/muere sigue siendo del lead.
+        */}
+      <BloqueRevisionesSimuladas conceptos={gobernanza.conceptos} />
       <BloqueArquetipos
         workspaceId={workspaceId}
         retoId={proyecto.reto.id}
@@ -808,6 +821,35 @@ function BloqueReaperturas({
  * SYS-20 pide que esto no se pueda confundir con investigación, y donde se LEE es donde esa
  * confusión ocurriría.
  */
+function BloqueRevisionesSimuladas({
+  conceptos,
+}: {
+  conceptos: GobernanzaDeProyecto['conceptos'];
+}) {
+  const conRevisiones = conceptos.filter((c) => c.revisiones.length > 0);
+  if (conRevisiones.length === 0) return null;
+  return (
+    <Card>
+      <h3 style={{ font: '600 13px var(--font-sans)', margin: 0 }}>
+        Revisiones simuladas de los conceptos
+      </h3>
+      <p style={{ font: '400 11.5px var(--font-sans)', color: 'var(--texto-3)', margin: 0 }}>
+        No son evidencia y no cuentan en G4/G5 (SYS-20). Lo que sí entregan es qué ir a probar
+        con personas reales.
+      </p>
+      {conRevisiones.map((c) => (
+        <div key={c.id} style={{ display: 'grid', gap: 6 }}>
+          <span style={{ font: '600 12.5px var(--font-sans)' }}>
+            {c.titulo}
+            {c.estado === 'candidato' ? '' : ` · ${ETIQUETA_ESTADO_CONCEPTO[c.estado]}`}
+          </span>
+          <RevisionesDelConcepto revisiones={c.revisiones} />
+        </div>
+      ))}
+    </Card>
+  );
+}
+
 function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeConcepto[] }) {
   if (revisiones.length === 0) return null;
   return (

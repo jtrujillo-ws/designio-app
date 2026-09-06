@@ -1921,6 +1921,30 @@ begin
          and not (ae.evidencia_id = any (coalesce(new.alcance_evidencia, '{}'::uuid[])))) then
       raise exception 'ese arquetipo tiene evidencia que esta revisión no llegó a ver: se enlazó después de generarla, así que la propuesta quedó obsoleta y solo puede rechazarse. Vuelve a pedirla para que la tenga en cuenta';
     end if;
+    -- Y EL ALCANCE NO DECLARA DE MÁS, que es la misma pregunta cerrada por el otro lado.
+    --
+    -- La de arriba es una CONTENCIÓN: «no falta ninguna». Sola, un alcance inflado la satisface
+    -- para siempre — se declara la evidencia de la lente MÁS un documento cualquiera del
+    -- workspace, y el día que ese documento se enlace al arquetipo la comprobación lo encuentra
+    -- ya dentro y deja sellar una revisión que nunca lo vio. Las dos juntas son una IGUALDAD, y
+    -- es la misma lección que C3 pagó en su ronda 5: un alcance que solo contiene no acota.
+    --
+    -- Va en el SELLO y no al insertar, a propósito. Al insertar, el conjunto que el modelo vio
+    -- y el que el arquetipo tiene se separan legítimamente durante la llamada al proveedor: un
+    -- enlace nuevo en esos segundos haría fallar el INSERT, y entonces se pierde el lote entero
+    -- con la llamada ya pagada. Aquí no: lo que se rechaza es sellar, la propuesta sigue
+    -- pudiendo rechazarse, y quien la escribió con un alcance inflado nunca tuvo razón.
+    if exists (
+      select 1
+        from revision_simulada r
+        cross join unnest(coalesce(new.alcance_evidencia, '{}'::uuid[])) as declarado(evidencia_id)
+       where r.id = new.revision_simulada_id and r.workspace_id = new.workspace_id
+         and not exists (
+           select 1 from arquetipo_evidencia ae
+            where ae.arquetipo_id = r.arquetipo_id and ae.workspace_id = r.workspace_id
+              and ae.evidencia_id = declarado.evidencia_id)) then
+      raise exception 'ese alcance declara evidencia que no es de la lente que firma esta revisión: lo que se sella tiene que ser lo que esa lente enseñó, ni más ni menos';
+    end if;
     -- Y QUE LA LENTE SIGA SIENDO UNA LENTE, que es la misma pregunta por el otro lado.
     --
     -- La de arriba dice «no falta ninguna»: caza la evidencia que ENTRÓ después. No dice nada

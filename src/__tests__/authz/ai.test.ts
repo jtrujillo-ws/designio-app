@@ -8263,6 +8263,278 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Una revisión que no declara alcance no apaga el guard: lo enciende en contra.
+   *
+   * `alcance_evidencia` es lo que el guard diferido compara con la evidencia que el arquetipo
+   * tiene AHORA, y su rama estaba escrita «y el alcance no es nulo». Un nulo no comprueba
+   * menos: no comprueba NADA, y la columna es de las que `designio_app` puede escribir en el
+   * insert —el CHECK que la exige lo tenían C2 y C3, cada una la suya, y C4 ninguna—. O sea
+   * que por la superficie concedida se sellaba una revisión que no dice haber visto ni un
+   * documento de la lente que firma.
+   *
+   * Se mide con el suelo y no por el servicio a propósito: el servicio escribe el alcance
+   * SIEMPRE, así que esta avería no tiene camino por ahí. Vive donde el guard es lo único
+   * que queda.
+   */
+  it('C4 no sella una revisión cuyo alcance no dice nada', async () => {
+    await enWorkspaceLimpio('c4-alcance-nulo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      /**
+       * La propuesta y su sello, escritos POR LA SUPERFICIE CONCEDIDA y en una sola
+       * transacción — que es donde este guard vive: es un trigger diferido que se aparta si
+       * quien escribe no es miembro del workspace, así que medirlo con la conexión de
+       * administración no mide nada. Esa fue la primera versión de esta sonda, y «reproducía»
+       * la avería por el motivo equivocado.
+       */
+      const sellar = (alcance: string[] | null) =>
+        conUsuario(curadorId, async (tx) => {
+          const [ll] = await tx`insert into llamada_ai
+            (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+            values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                    'salida-valida', ${curadorId})
+            returning id`;
+          const [p] = await tx`insert into propuesta_ai
+            (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+             modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+             llamada_id, orden, es_simulacion, creado_por)
+            values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                    ${tx.json(contenido)}, ${tx.json(contenido)},
+                    'modelo-de-prueba', 'v-prueba', 'una lente', ${alcance},
+                    'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+            returning id`;
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura del primero.', ${curadorId})
+            returning id`;
+          const [h] = await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Pide saber para qué',
+                    'No entrega el documento sin motivo.', false)
+            returning id`;
+          await tx`insert into hallazgo_simulado_evidencia
+            (hallazgo_id, evidencia_id, workspace_id)
+            values (${h!.id as string}, ${evA}, ${wsC})`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${p!.id as string} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // Sin alcance no hay propuesta: el CHECK lo corta al escribirla, que es lo más pronto
+      // que se puede decir.
+      await expect(sellar(null)).rejects.toThrow(/alcance_evidencia/i);
+      // Y el otro sentido, que es lo que separa «el nulo no pasa» de «C4 no sella»: con el
+      // alcance honesto —la evidencia de la lente— la misma escritura entra entera.
+      await expect(sellar([evA])).resolves.toBeTruthy();
+    });
+  });
+
+  /**
+   * Y una lente que se quedó sin evidencia utilizable tampoco se sella.
+   *
+   * La avería que la señaló venía escrita como «evidencia desenlazada del arquetipo», y ESO no
+   * se reproduce: `designio_app` tiene INSERT y SELECT sobre `arquetipo_evidencia` y ninguna
+   * política de DELETE, así que por la superficie concedida un enlace no se quita. Lo que sí
+   * ocurre —y es la misma consecuencia por otra puerta— es que el enlace siga y la evidencia
+   * deje de ser utilizable: el derecho se revoca, caduca, o el documento se va.
+   *
+   * Entonces la lente se queda vacía, y sellar ahí contradice la puerta que la GENERACIÓN ya
+   * tiene: sin lentes no se pide la revisión, porque lo que volvería es «un perfil inventado
+   * hablando en primera persona». La misma regla, y hasta ahora solo en un extremo del camino.
+   *
+   * La sesión es de HIPÓTESIS PURA a propósito: con una cita, esto ya lo para DR001 unas
+   * líneas más arriba, y la sonda no mediría lo que dice medir.
+   */
+  it('C4 no sella una revisión cuya lente se quedó sin evidencia utilizable', async () => {
+    await enWorkspaceLimpio('c4-lente-vacia', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      // Primero, la medición que refuta el mecanismo tal como venía escrito.
+      const desenlazar = await conUsuario(curadorId, (tx) =>
+        tx`delete from arquetipo_evidencia
+            where arquetipo_id = ${lenteA} and workspace_id = ${wsC}`,
+      ).then(
+        () => 'pasó',
+        (e: unknown) => (e as Error).message,
+      );
+      expect(desenlazar, 'la superficie concedida deja desenlazar evidencia del arquetipo').toMatch(
+        /permission denied|denegado/i,
+      );
+
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura sin nada que citar.',
+        hallazgos: [
+          {
+            titulo: 'Probablemente dude',
+            descripcion: 'Extrapolando del perfil, dudaría antes de entregar nada.',
+            esHipotesis: true,
+            citas: [],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Dudarías?', escenario: '' }],
+        confianzaPropuesta: 'baja',
+      };
+      const propuestaId = await conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        const [p] = await tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(contenido)}, ${tx.json(contenido)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+          returning id`;
+        return p!.id as string;
+      });
+      // Y ahora la lente se vacía sin que nadie desenlace nada: se retira el derecho de cita.
+      // Va por administración porque `designio_app` no tiene UPDATE sobre `derecho_uso`.
+      await admin`update derecho_uso
+           set estado = 'denegado', ambito = 'interno', vence_en = null
+         where evidencia_id = ${evA} and workspace_id = ${wsC}`;
+
+      await expect(
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${lenteA}, 'Una lectura sin nada que citar.',
+                    ${curadorId})
+            returning id`;
+          await tx`insert into hallazgo_simulado
+            (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+            values (${wsC}, ${r!.id as string}, 0, 'Probablemente dude',
+                    'Extrapolando del perfil, dudaría antes de entregar nada.', true)`;
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Dudarías?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'aceptada', revisada_por = ${curadorId},
+                  revision_simulada_id = ${r!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+        }),
+      ).rejects.toThrow(/sin evidencia utilizable/i);
+    });
+  });
+
+  /**
+   * Y una corrección no reparte las citas entre los hallazgos.
+   *
+   * Las citas de C4 viven DENTRO de cada hallazgo, y `CITAS_DEL_CONTENIDO` las aplana para
+   * medirlas. Aplanadas, `[A], [B]` y `[A, B], []` son la misma lista: la comprobación de «las
+   * citas no se corrigen» las ve idénticas y deja pasar la corrección, y la materialización
+   * persiste el reparto NUEVO. O sea que se puede mover el documento que sostenía a una
+   * hipótesis debajo de una afirmación, que es la única relación contrastable que hay aquí:
+   * qué documento sostiene cuál lectura.
+   *
+   * La marca de hipótesis no lo estorba: la lista de marcas no se mueve, y un hallazgo que se
+   * queda sin citas ya venía marcado.
+   */
+  it('C4 no deja repartir las citas entre hallazgos al corregir, y sí reescribir sus textos', async () => {
+    await enWorkspaceLimpio('c4-reparto-citas', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const citaAfirmada = {
+        evidenciaId: evA,
+        fragmento: 'No entrego la cédula',
+        localizacion: 'resumen',
+      };
+      const citaHipotesis = {
+        evidenciaId: evA,
+        fragmento: 'sin saber para qué',
+        localizacion: 'resumen',
+      };
+      const original = {
+        arquetipoId: lenteA,
+        sintesis: 'Dos lecturas del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [citaAfirmada],
+          },
+          {
+            titulo: 'Quizá abandone el alta',
+            descripcion: 'Extrapolando, se iría antes de terminar.',
+            esHipotesis: true,
+            citas: [citaHipotesis],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      const pedir = async () => {
+        await conProveedor(
+          { ok: true, datos: { revisiones: [original] }, intentos: [intento({ uso: null })] },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        );
+        const panel = await panelPropuestas(curadorId, wsC);
+        return panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      };
+
+      const propuestaId = await pedir();
+      // La lista aplanada es la MISMA —dos citas, en el mismo orden— y las marcas también.
+      // Lo único que cambia es de quién cuelga cada una.
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId,
+          correccion: {
+            ...original,
+            hallazgos: [
+              { ...original.hallazgos[0]!, citas: [citaAfirmada, citaHipotesis] },
+              { ...original.hallazgos[1]!, citas: [] },
+            ],
+          },
+        }),
+      ).rejects.toThrow(/no se corrigen/i);
+
+      // Y el otro sentido: los TEXTOS sí se corrigen, que es para lo que está la revisión.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+        correccion: {
+          ...original,
+          hallazgos: [
+            { ...original.hallazgos[0]!, descripcion: 'No entrega el documento sin un motivo.' },
+            { ...original.hallazgos[1]!, titulo: 'Quizá abandone antes de terminar' },
+          ],
+        },
+      });
+      expect(objetoId).toBeTruthy();
+    });
+  });
+
+  /**
    * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
    *
    * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el

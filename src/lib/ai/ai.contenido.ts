@@ -817,6 +817,28 @@ export type CitaDelContenido = {
    * correcta y no una omisión.
    */
   alcanceId?: string;
+  /**
+   * Y DE QUIÉN CUELGA, en las capacidades que las anidan.
+   *
+   * Esta lista se aplana para dos cosas: medir la presencia literal —a la que el grupo le da
+   * igual— y comprobar que una corrección no toca las citas. Para lo segundo, aplanar PIERDE
+   * justo lo que hay que proteger: `[A], [B]` y `[A, B], []` son la misma lista, así que una
+   * corrección podía repartir las mismas citas entre otros hallazgos —mover el documento que
+   * sostenía a una hipótesis debajo de una afirmación— y la comprobación las veía idénticas.
+   * La materialización persiste después el reparto nuevo.
+   *
+   * Y eso es lo único contrastable que hay en una revisión simulada: qué documento sostiene
+   * cuál lectura. En C2 es la misma frase con otras palabras: qué cita sostiene qué afirmación.
+   *
+   * Va aquí y no en `TESTIMONIO_ADICIONAL` porque el reparto es una propiedad de las CITAS, y
+   * ahí se habría escrito una vez por capacidad —dos entradas para una regla— mientras que
+   * este campo lo pone quien declara el anidamiento, que es quien lo sabe. Hay un censo que
+   * exige `grupo` a toda entrada del registro que anide.
+   *
+   * `undefined` en las que no anidan, que es su respuesta correcta: una lista plana no tiene
+   * reparto que proteger.
+   */
+  grupo?: number;
 };
 export const CITAS_DEL_CONTENIDO: Record<
   CapacidadActiva,
@@ -826,22 +848,23 @@ export const CITAS_DEL_CONTENIDO: Record<
   C0: (c) => (c as ContenidoCriterio).citas,
   CT: (c) => (c as ContenidoAsistenteGate).citas,
   C2: (c) =>
-    (c as ContenidoInsight).afirmaciones.flatMap((a) =>
-      a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
+    (c as ContenidoInsight).afirmaciones.flatMap((a, i) =>
+      a.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId, grupo: i })),
     ),
   /*
    * C4 igual que C2, y por la misma razón exacta: sus citas viven DENTRO de cada hallazgo
-   * —una cita sostiene UN hallazgo concreto, y aplanarlas perdería cuál sostiene a cuál— y
-   * cada una nombra su documento, porque el material lleva varios (la evidencia que sostiene
-   * al arquetipo que revisa).
+   * —una cita sostiene UN hallazgo concreto, y por eso el aplanado se lleva el `grupo`: sin
+   * él, repartirlas de otra manera pasaba por «las citas no cambiaron»— y cada una nombra su
+   * documento, porque el material lleva varios (la evidencia que sostiene al arquetipo que
+   * revisa).
    *
    * Un hallazgo marcado como HIPÓTESIS puede no traer ninguna, y eso no rompe nada aquí: la
    * lista sale más corta, la presencia literal se mide sobre lo que hay, y el contrato ya
    * garantizó que la ausencia de citas viene con la marca puesta.
    */
   C4: (c) =>
-    (c as ContenidoRevisionSimulada).hallazgos.flatMap((h) =>
-      h.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId })),
+    (c as ContenidoRevisionSimulada).hallazgos.flatMap((h, i) =>
+      h.citas.map((x) => ({ ...x, alcanceId: x.evidenciaId, grupo: i })),
     ),
   // C5 las guarda arriba, como las tres primeras: sus remediaciones no son el sujeto de las
   // citas —lo es el grafo entero—, así que no hay nada que anidar.

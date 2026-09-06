@@ -677,6 +677,38 @@ alter table propuesta_ai add constraint propuesta_ai_destino_vocabulario
 alter table propuesta_ai add constraint propuesta_ai_destino_c4
   check (capacidad <> 'C4' or destino = 'revision-simulada');
 
+-- Y el ALCANCE, que C4 declara siempre y hasta ahora no estaba obligada a declarar.
+--
+-- `alcance_evidencia` es lo que el guard diferido compara con la evidencia que el arquetipo
+-- tiene al sellar, y su rama estaba escrita «y el alcance no es nulo». Un nulo ahí no comprueba
+-- menos: no comprueba nada. Y la columna la escribe quien inserta —hay `grant insert
+-- (alcance_evidencia)`— así que por la superficie concedida se sellaba una revisión que no dice
+-- haber visto ni un documento de la lente que firma.
+--
+-- Sus dos hermanas ya lo tenían, cada una la suya: `propuesta_ai_alcance_evidencia_c2` y
+-- `propuesta_ai_alcance_insights_c3`. Ésta es la de C4, con la misma forma, y no es la única
+-- mitad del arreglo: el guard perdió además la condición del nulo, porque cuelga de
+-- `revision_simulada_id` y no de `capacidad`, y una fila con otra etiqueta no la ve este CHECK.
+alter table propuesta_ai add constraint propuesta_ai_alcance_evidencia_c4
+  check (capacidad <> 'C4' or alcance_evidencia is not null);
+
+-- Y LA MISMA EXIGENCIA ESCRITA COMO LA LEE EL GUARD, que no es la misma frase.
+--
+-- El de arriba mira `capacidad` y salta lo más pronto posible —al escribir la propuesta—, que
+-- es donde el error se entiende. Pero el guard diferido no cuelga de `capacidad`: cuelga de
+-- `revision_simulada_id`, y ahí llega también una fila con OTRA etiqueta. `propuesta_ai_un_ancla`
+-- con los siete bicondicionales deja fuera a `C1` —se queda sin ancla posible, y el conteo
+-- exige exactamente una—, pero no cierra la rama `<= 1` de `propuesta_ai_objeto_materializado`:
+-- con `destino = 'entrada-kpi'`, la columna materializada que se rellene puede ser justamente
+-- `revision_simulada_id`.
+--
+-- Dos frases y no una porque protegen dos cosas distintas: la primera, que C4 declare; la
+-- segunda, que lo que el guard compara exista. Con las dos, la rama del nulo dentro del guard
+-- ya no se puede alcanzar — y el `coalesce` que lleva se queda igualmente, porque un valor por
+-- defecto que hace fallar no es una rama que haya que alcanzar: es hacia dónde cae la duda.
+alter table propuesta_ai add constraint propuesta_ai_alcance_de_lo_sellado
+  check (revision_simulada_id is null or alcance_evidencia is not null);
+
 -- Y la regla «aceptada ⇔ hay objeto», con la columna nueva dentro del conteo. Se reescribe
 -- entera por lo mismo que `propuesta_ai_un_ancla`: `num_nonnulls` enumera, y una propuesta de C4
 -- aceptada habría contado CERO objetos materializados contra un `= 1`.
@@ -1630,7 +1662,15 @@ begin
   -- arquetipo después de generar la propuesta es material que la sesión no leyó. Sellarla es
   -- firmar una lectura del «desconfiado digital» hecha sin el testimonio que acaba de
   -- entrar — y la corrección humana no lo compensa, porque los hallazgos no se reescriben.
-  if new.revision_simulada_id is not null and new.alcance_evidencia is not null then
+  --
+  -- Y SIN LA CONDICIÓN «y el alcance no es nulo», que era la puerta y no la llave. Un alcance
+  -- nulo no comprueba MENOS: apaga las dos comprobaciones enteras, porque `x = any (null)` es
+  -- nulo y `not null` no es verdadero. El CHECK de abajo lo exige para C4 —como C2 y C3 hacen
+  -- con los suyos—, así que por esa etiqueta ya no entra; el `coalesce` es para la fila que
+  -- llegue con OTRA, porque este guard cuelga de `revision_simulada_id` y no de `capacidad`.
+  -- Con el array vacío, una lente con evidencia falla en vez de pasar: el modo de fallo
+  -- apunta hacia donde tiene que apuntar.
+  if new.revision_simulada_id is not null then
     if exists (
       select 1
         from revision_simulada r
@@ -1638,8 +1678,37 @@ begin
          and ae.workspace_id = r.workspace_id
        where r.id = new.revision_simulada_id and r.workspace_id = new.workspace_id
          and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente')
-         and not (ae.evidencia_id = any (new.alcance_evidencia))) then
+         and not (ae.evidencia_id = any (coalesce(new.alcance_evidencia, '{}'::uuid[])))) then
       raise exception 'ese arquetipo tiene evidencia que esta revisión no llegó a ver: se enlazó después de generarla, así que la propuesta quedó obsoleta y solo puede rechazarse. Vuelve a pedirla para que la tenga en cuenta';
+    end if;
+    -- Y QUE LA LENTE SIGA SIENDO UNA LENTE, que es la misma pregunta por el otro lado.
+    --
+    -- La de arriba dice «no falta ninguna»: caza la evidencia que ENTRÓ después. No dice nada
+    -- de la que SALIÓ, y salir no es desenlazarla —«arquetipo_evidencia» no tiene política de
+    -- DELETE ni grant, así que por la superficie concedida un enlace no se quita— sino dejar
+    -- de ser utilizable: el derecho se revoca, caduca, o el documento se va.
+    --
+    -- Entonces la lente se queda vacía, y sellar ahí contradice la puerta que la GENERACIÓN ya
+    -- tiene puesta: sin lentes no se pide la revisión, porque lo que volvería es «un perfil
+    -- inventado hablando en primera persona» (SYS-20). La misma regla estaba escrita en un solo
+    -- extremo del camino, y el que faltaba es el que sella.
+    --
+    -- Se pide UNA que la revisión haya visto, no todas: el alcance es el del LOTE —la evidencia
+    -- de todas las lentes que llegaron al modelo— así que «todas las suyas» no se puede
+    -- preguntar desde aquí sin guardar el alcance por arquetipo. Una basta para lo que esto
+    -- protege: que lo que se sella siga siendo la lectura de una lente y no de un perfil vacío.
+    --
+    -- Y una sesión de hipótesis pura es justo la que llega hasta aquí: donde hay citas, la
+    -- comprobación de DR001 de más arriba ya para la revocación.
+    if not exists (
+      select 1
+        from revision_simulada r
+        join arquetipo_evidencia ae on ae.arquetipo_id = r.arquetipo_id
+         and ae.workspace_id = r.workspace_id
+       where r.id = new.revision_simulada_id and r.workspace_id = new.workspace_id
+         and evidencia_usable(ae.evidencia_id, ae.workspace_id, 'cliente')
+         and ae.evidencia_id = any (coalesce(new.alcance_evidencia, '{}'::uuid[]))) then
+      raise exception 'esa revisión se quedó sin evidencia utilizable de su arquetipo: el permiso de cita se retiró, caducó o el documento ya no está, así que lo que se sellaría es la lectura de un perfil sin nada detrás (SYS-20). Renueva el permiso y vuelve a pedirla, o recházala';
     end if;
   end if;
   -- Y que el insight haya VISTO toda la evidencia que el reto tiene ahora.

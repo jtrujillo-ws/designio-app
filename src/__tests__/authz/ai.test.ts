@@ -8863,6 +8863,188 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * El testimonio de C4 también está blindado EN LA BASE, no solo en el servicio.
+   *
+   * La comparación que la base ya hacía mira `contenido -> 'citas'`, y las de C4 viven dentro de
+   * cada hallazgo: null contra null, o sea que pasaba EN VACÍO. Es la lección que este
+   * repositorio ya tiene escrita —una regla contra una ruta fija del contenido no ve a quien lo
+   * guarda en otro sitio— y C2 la aprendió en su día: su guard compara
+   * `$.afirmaciones[*].citas`, que por ser un array DE ARRAYS conserva además el reparto.
+   *
+   * Y el reparto que arreglé en la ronda 8 vive en el servicio, así que por la superficie SQL
+   * —donde `contenido` sí se puede actualizar— no lo tapaba nadie: se podían repartir las citas
+   * entre hallazgos, cambiar de lente conservando las frases, o quitar una marca de hipótesis, y
+   * luego escribir las hojas que cuadran con lo corregido.
+   *
+   * Los cuatro casos, y el último es el que separa «el testimonio está blindado» de «C4 no
+   * admite correcciones».
+   */
+  it('C4 no deja tocar su testimonio por SQL, y sí corregir sus textos', async () => {
+    await enWorkspaceLimpio('c4-testimonio-sql', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      /*
+       * Un SEGUNDO documento en la misma lente, y hace falta: el enlace materializado tiene
+       * clave primaria (hallazgo, evidencia), así que dos citas del MISMO documento bajo un
+       * mismo hallazgo colapsan en una fila y el reparto ni siquiera se puede escribir. Esa es
+       * ya media protección, y la sonda mediría esa clave en vez de la regla si no lo separara.
+       */
+      const [fte2] = await admin`insert into fuente
+        (workspace_id, tipo, titulo, referencia, creado_por)
+        values (${wsC}, 'entrevista', 'Entrevistas de la etapa 1 (bis)', 'ref-e1b', ${curadorId})
+        returning id`;
+      const [ev2] = await admin`insert into evidencia
+        (workspace_id, fuente_id, titulo, resumen, dimensiones, creado_por)
+        values (${wsC}, ${fte2!.id as string}, 'Entrevista D-02',
+                'Prefiero que me digan para qué antes de dar nada.', '{}'::jsonb, ${curadorId})
+        returning id`;
+      const evA2 = ev2!.id as string;
+      await admin`insert into derecho_uso
+        (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
+        values (${wsC}, ${evA2}, 'concedido', 'cliente', 'Consentimiento del participante',
+                ${curadorId}, now(), ${curadorId})`;
+      await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
+        values (${wsC}, ${lenteA}, ${evA2})`;
+      const citaUna = {
+        evidenciaId: evA,
+        fragmento: 'No entrego la cédula',
+        localizacion: 'resumen',
+      };
+      const citaOtra = {
+        evidenciaId: evA2,
+        fragmento: 'Prefiero que me digan para qué',
+        localizacion: 'resumen',
+      };
+      const original = {
+        arquetipoId: lenteA,
+        sintesis: 'Dos lecturas del primero.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [citaUna],
+          },
+          {
+            titulo: 'Quizá abandone el alta',
+            descripcion: 'Extrapolando, se iría antes de terminar.',
+            esHipotesis: true,
+            citas: [citaOtra],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+      const propuestaId = await conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        const [p] = await tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(original)}, ${tx.json(original)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA, evA2]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})
+          returning id`;
+        return p!.id as string;
+      });
+
+      /**
+       * La corrección ENTERA por la superficie concedida: mover el estado, escribir las hojas
+       * que cuadran con lo corregido, y sellar. Es el camino que la avería describe — el guard
+       * diferido comprueba contra el `contenido` YA corregido, así que las hojas cuadran y pasa.
+       */
+      const corregirEntero = (contenido: typeof original) =>
+        conUsuario(curadorId, async (tx) => {
+          const [r] = await tx`insert into revision_simulada
+            (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+            values (${wsC}, ${conceptoId}, ${contenido.arquetipoId}, ${contenido.sintesis},
+                    ${curadorId})
+            returning id`;
+          for (const [i, h] of contenido.hallazgos.entries()) {
+            const [fila] = await tx`insert into hallazgo_simulado
+              (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+              values (${wsC}, ${r!.id as string}, ${i}, ${h!.titulo}, ${h!.descripcion},
+                      ${h!.esHipotesis})
+              returning id`;
+            for (const cita of h!.citas) {
+              await tx`insert into hallazgo_simulado_evidencia
+                (hallazgo_id, evidencia_id, workspace_id)
+                values (${fila!.id as string}, ${cita.evidenciaId}, ${wsC})`;
+            }
+          }
+          await tx`insert into pregunta_de_test
+            (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+            values (${wsC}, ${r!.id as string}, null, 0, '¿Qué te haría entregarla?', '')`;
+          await tx`update propuesta_ai
+              set estado = 'corregida', contenido = ${tx.json(contenido)},
+                  revisada_por = ${curadorId}, revision_simulada_id = ${r!.id as string}
+            where id = ${propuestaId} and workspace_id = ${wsC}`;
+          return r!.id as string;
+        });
+
+      // 1. EL REPARTO: la misma lista aplanada, colgada de otro hallazgo. Lo que se mueve es el
+      //    documento que sostenía a una hipótesis, ahora debajo de una afirmación.
+      await expect(
+        corregirEntero({
+          ...original,
+          hallazgos: [
+            { ...original.hallazgos[0]!, citas: [citaUna, citaOtra] },
+            { ...original.hallazgos[1]!, citas: [] },
+          ],
+        }),
+      ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
+
+      // 2. Una cita CAMBIADA. El enlace materializado solo guarda el id del documento, así que
+      //    las hojas cuadran igual y el fragmento —que es lo contrastable— se reescribe entero.
+      await expect(
+        corregirEntero({
+          ...original,
+          hallazgos: [
+            {
+              ...original.hallazgos[0]!,
+              citas: [{ ...citaUna, fragmento: 'No entrego la cédula sin saber' }],
+            },
+            original.hallazgos[1]!,
+          ],
+        }),
+      ).rejects.toThrow(/citas de una revisión simulada no se corrigen/i);
+
+      // 3. La marca de hipótesis, que convierte una extrapolación en investigación.
+      await expect(
+        corregirEntero({
+          ...original,
+          hallazgos: [original.hallazgos[0]!, { ...original.hallazgos[1]!, esHipotesis: false }],
+        }),
+      ).rejects.toThrow(/marca de hipótesis/i);
+
+      /*
+       * LA LENTE no lleva caso propio, y es una respuesta: cambiarla en el contenido obliga a
+       * cambiarla también en la fila —el guard diferido exige que el arquetipo materializado sea
+       * el que la propuesta nombra— y entonces las citas dejan de ser de su arquetipo y las para
+       * el guard de la voz prestada, que ya tiene su sonda. Añadir aquí un caso que cae por otra
+       * puerta mediría esa puerta, no ésta.
+       */
+
+      // 4. Y LOS TEXTOS SÍ, que es lo que separa «el testimonio está blindado» de «C4 no admite
+      //    correcciones». Va el último porque es el único que llega a escribir la revisión.
+      const revisionId = await corregirEntero({
+        ...original,
+        sintesis: 'Dos lecturas del primero, mejor dichas.',
+        hallazgos: [
+          { ...original.hallazgos[0]!, descripcion: 'No entrega el documento sin un motivo.' },
+          { ...original.hallazgos[1]!, titulo: 'Quizá abandone antes de terminar' },
+        ],
+      });
+      expect(revisionId, 'la corrección de textos no entró').toBeTruthy();
+    });
+  });
+
+  /**
    * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
    *
    * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el

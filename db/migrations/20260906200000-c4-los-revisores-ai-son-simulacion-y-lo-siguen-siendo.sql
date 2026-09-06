@@ -811,6 +811,56 @@ create trigger a_propuesta_ai_c4_linaje
   before insert on propuesta_ai
   for each row execute function propuesta_ai_c4_linaje_guard();
 
+-- ── Y EL TESTIMONIO DE C4, EN LA BASE Y NO SOLO EN EL SERVICIO ──
+--
+-- La comparación que la base ya hacía para las citas mira `contenido -> 'citas'`, y las de C4
+-- viven dentro de cada hallazgo: null contra null, o sea que pasaba EN VACÍO. Es exactamente la
+-- lección que este repositorio ya tiene escrita —una regla escrita contra una ruta fija del
+-- contenido no ve a quien lo guarda en otro sitio— y C2 la aprendió en su día: por eso su guard
+-- compara `$.afirmaciones[*].citas`.
+--
+-- Y el servicio no tapa este camino. `contenido` está en el grant de UPDATE porque la corrección
+-- humana es una escritura de la aplicación, así que quien no sea el formulario de la casa puede
+-- mandar la corrección directa: repartir las citas entre hallazgos, reescribir un fragmento, o
+-- quitar una marca de hipótesis, y escribir después las hojas que cuadran con lo corregido. El
+-- guard diferido no lo caza porque comprueba contra el `contenido` YA corregido — su trabajo es
+-- que lo materializado sea lo aceptado, no que lo aceptado sea lo propuesto.
+--
+-- `$.hallazgos[*].citas` y no `...citas[*]`: el primero devuelve un array DE ARRAYS, así que
+-- conserva el REPARTO —de qué hallazgo cuelga cada cita—, que es lo único contrastable que hay
+-- en una revisión simulada. Aplanado, `[A], [B]` y `[A, B], []` serían iguales.
+--
+-- Las tres partes son las mismas que el servicio declara intocables, escritas donde no hace
+-- falta pasar por él. Y solo en UPDATE: al insertar, el contenido ES el original.
+create function propuesta_ai_c4_testimonio_guard() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $fn$
+begin
+  if new.capacidad <> 'C4' then
+    return new;
+  end if;
+  if jsonb_path_query_array(new.contenido, '$.hallazgos[*].citas')
+     is distinct from jsonb_path_query_array(new.contenido_original, '$.hallazgos[*].citas')
+  then
+    raise exception 'las citas de una revisión simulada no se corrigen, ni se reparten entre sus hallazgos: son el rastro de lo que el modelo dijo haber leído, y qué documento sostiene cuál lectura es lo único contrastable que hay aquí';
+  end if;
+  if new.contenido -> 'arquetipoId' is distinct from new.contenido_original -> 'arquetipoId' then
+    raise exception 'el arquetipo que la firma no se corrige: la lente dice desde qué perfil se hizo la lectura, y cambiarla conservando las frases es fabricar una voz (SYS-20)';
+  end if;
+  if jsonb_path_query_array(new.contenido, '$.hallazgos[*].esHipotesis')
+     is distinct from jsonb_path_query_array(new.contenido_original, '$.hallazgos[*].esHipotesis')
+  then
+    raise exception 'la marca de hipótesis de un hallazgo no se corrige: separa lo que se apoya en evidencia de lo que se extrapola, y quitarla convierte una simulación en investigación (SYS-20)';
+  end if;
+  return new;
+end;
+$fn$;
+
+revoke execute on function propuesta_ai_c4_testimonio_guard() from public;
+
+create trigger a_propuesta_ai_c4_testimonio
+  before update of contenido on propuesta_ai
+  for each row execute function propuesta_ai_c4_testimonio_guard();
+
 grant insert (concepto_id) on reserva_ai to designio_app;
 grant insert (concepto_id) on llamada_ai to designio_app;
 grant insert (concepto_id) on propuesta_ai to designio_app;

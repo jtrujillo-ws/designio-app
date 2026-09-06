@@ -434,8 +434,10 @@ aceptar una propuesta, `ai.servicio.ts` inserta directamente en `evidencia` y `d
 `hallazgo_simulado_evidencia` y `pregunta_de_test` (C4, por `escribirRevisionSimulada`), y actualiza
 `outcome_review` (C7); todos los servicios insertan en `evento_dominio`; y las proyecciones
 (Aprobaciones, Biblioteca, la exportación bajo RLS) leen lo que otros poseen. En **tiempo de
-ejecución** hay cinco dependencias entre módulos de dominio: `ai` llama a `bloquearReto` de `metodo`
-y a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`; `metodo`
+ejecución** hay seis dependencias entre módulos de dominio: `ai` llama a `bloquearReto` de `metodo`,
+a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`, y a
+`patronDeBusqueda` de `busqueda` (una función exportada desde su archivo de esquemas, con la que el
+panel filtra propuestas por texto: cambiar el escapado de la búsqueda cambia ese filtro); `metodo`
 (gobernanza) llama en sentido contrario a `escribirRevisionSimulada` de `ai` para la ruta manual de
 C4 y valida con `ContenidoRevisionSimuladaSchema` de `ai.contenido`; `entrega` llama a
 `bloquearReto` de `metodo`; y `loop` lee las aprobaciones pendientes con `gatesAbiertos`,
@@ -1263,9 +1265,10 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 4. **Generación**: prompt versionado (`PROMPT_VERSION`, atado por huella del contrato), material
    delimitado como datos no confiables y acotado (`MAX_MATERIAL`), salida estructurada validada por
    Zod contra el esquema de la capacidad, ids copiados del material normalizados.
-5. **Revisión** en el panel. Para las capacidades que **materializan** (CI, C0, C2, C3, C6, y C7 escribiendo sobre su ancla): **aceptar**,
+5. **Revisión** en el panel. Para las capacidades que **materializan** (CI, C0, C2, C3, C4, C6, y C7 escribiendo sobre su ancla): **aceptar**,
    **corregir y aceptar** (las citas y las contradicciones no se corrigen: son testimonio del modelo;
-   el resto sí) o **rechazar**. Para las **informativas** (CT, C5) no hay nada que aceptar ni
+   en C4 tampoco se corrigen la lente ni las marcas de hipótesis de los hallazgos, ni se reparten
+   las citas entre hallazgos, por `propuesta_ai_c4_testimonio_guard`; el resto sí) o **rechazar**. Para las **informativas** (CT, C5) no hay nada que aceptar ni
    corregir: el informe se lee y se **marca como leído**; `aceptarPropuesta` las rechaza a
    propósito. El **contenido original se
    conserva** siempre (SYS-17). La **presencia literal** de cada cita en el material que vio el

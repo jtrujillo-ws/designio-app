@@ -1065,7 +1065,19 @@ function FormularioRevisionAMano({
   // Sólo los conceptos que todavía admiten revisión, y sólo las lentes que pueden mirar: un
   // arquetipo REFUTADO no describe a nadie (SPEC-04.11) y la base lo rechaza igualmente.
   const candidatos = conceptos.filter((c) => c.estado === 'candidato');
-  const lentes = arquetipos.filter((a) => a.estado !== 'refutado');
+  /*
+   * Y sin las que YA revisaron el concepto elegido. «unique (concepto_id, arquetipo_id)» dice
+   * que una lente lee un concepto una sola vez, así que ofrecerla otra vez es ofrecer un rechazo
+   * que llega cuando ya está todo escrito — la misma clase que la ventana de la etapa.
+   *
+   * Se filtra por el CONCEPTO seleccionado y no globalmente: la misma lente sigue estando
+   * disponible para los demás conceptos del reto, que es de lo que va la rotación.
+   */
+  const yaRevisaron = new Set(
+    (conceptos.find((c) => c.id === conceptoId)?.revisiones ?? []).map((r) => r.arquetipoId),
+  );
+  const lentesVigentes = arquetipos.filter((a) => a.estado !== 'refutado');
+  const lentes = lentesVigentes.filter((a) => !yaRevisaron.has(a.id));
   /*
    * Lo citable sale de LA LENTE y no del selector general del workspace. Aquél se corta en las
    * 200 más recientes, así que una lente sostenida por documentos más antiguos dejaba la lista
@@ -1097,6 +1109,9 @@ function FormularioRevisionAMano({
    */
   const cambiarConcepto = (v: string) => {
     setConceptoId(v);
+    // Y la LENTE también: qué lentes quedan libres depende del concepto —una lente lee un
+    // concepto UNA vez—, así que al cambiarlo la elegida puede haber dejado de estar disponible.
+    setArquetipoId('');
     limpiar();
   };
   const cambiarLente = (v: string) => {
@@ -1159,7 +1174,13 @@ function FormularioRevisionAMano({
     }
   }
 
-  if (candidatos.length === 0 || lentes.length === 0) return null;
+  /*
+   * El retorno mira las lentes VIGENTES y no las libres del concepto elegido: si no, elegir un
+   * concepto ya revisado por todas haría desaparecer el formulario ENTERO —con su selector
+   * dentro—, y quien lo elegió se quedaría sin manera de volver atrás. Cuando no queda ninguna
+   * libre se dice, que es distinto de esconderse.
+   */
+  if (candidatos.length === 0 || lentesVigentes.length === 0) return null;
   if (!abierto) {
     return (
       <Button variant="secondary" onClick={() => setAbierto(true)}>
@@ -1192,6 +1213,12 @@ function FormularioRevisionAMano({
         Cambiar de concepto o de lente vacía lo escrito: una revisión es lo que ESA lente ve en
         ESE concepto.
       </span>
+      {conceptoId !== '' && lentes.length === 0 && (
+        <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+          Todas las lentes vigentes del reto ya revisaron este concepto: una lente lo lee una
+          sola vez. Borra la que quieras rehacer, o elige otro concepto.
+        </span>
+      )}
       <Input
         placeholder="Lectura de conjunto"
         value={sintesis}

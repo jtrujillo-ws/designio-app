@@ -209,6 +209,8 @@ export type GobernanzaDeProyecto = {
  */
 export type RevisionSimuladaDeConcepto = {
   id: string;
+  /** La lente, por id: el formulario a mano no ofrece las que ya revisaron este concepto. */
+  arquetipoId: string;
   arquetipoNombre: string;
   arquetipoEstado: string;
   sintesis: string;

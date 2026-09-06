@@ -3472,6 +3472,17 @@ function lentesDelConcepto(
                  * pedían los seis primeros por nombre, se rechazaban los seis, y el lote
                  * siguiente pedía otra vez exactamente los mismos.
                  *
+                 * Y se ordena por el ÚLTIMO INTENTO, no por si lo hubo. Con un booleano
+                 * —«¿se propuso alguna vez?»— la rueda gira dos vueltas y se para sola: tras el
+                 * segundo lote las siete lentes tienen ya alguna propuesta decidida, el
+                 * predicado vale lo mismo para todas, el desempate vuelve a ser el nombre, y del
+                 * tercer lote en adelante se piden otra vez las seis primeras. La séptima no
+                 * vuelve NUNCA — la misma avería que este párrafo describe, dos lotes más tarde.
+                 * Medido sobre cuatro lotes con siete lentes: (4,4,4,4,4,3,1).
+                 *
+                 * Con «nulls first» las que nunca se propusieron siguen yendo delante, y el
+                 * resto por antigüedad de su último intento, así que el turno rota de verdad.
+                 *
                  * Se ROTA y no se excluye porque una lente se rechaza cuando su salida no
                  * valía, y volver a pedirla tiene que seguir siendo posible.
                  *
@@ -3479,12 +3490,12 @@ function lentesDelConcepto(
                  * exclusión de abajo: si rechazar una moviera el orden, el material de sus
                  * hermanas cambiaría y aceptarlas fallaría con «material movido».
                  */
-                order by (exists (select 1 from propuesta_ai pd
+                order by (select max(pd.creado_en) from propuesta_ai pd
                   where pd.concepto_id = ${alias.concepto}.id
                     and pd.workspace_id = ${alias.concepto}.workspace_id
                     and pd.capacidad = 'C4' and pd.estado <> 'propuesta'
                     and lower(pd.contenido ->> 'arquetipoId') = a.id::text
-                    and pd.llamada_id is distinct from ${alias.lote})),
+                    and pd.llamada_id is distinct from ${alias.lote}) asc nulls first,
                   a.nombre, a.id), '[]'::json)
        from arquetipo a
        where a.reto_id = ${alias.reto} and a.workspace_id = ${alias.concepto}.workspace_id

@@ -577,6 +577,11 @@ export async function gobernanzaDeProyecto(
                    'revisiones', coalesce((
                      select jsonb_agg(jsonb_build_object(
                               'id', r.id,
+                              -- El ID de la lente y no sólo su nombre: el formulario de a mano
+                              -- necesita saber cuáles ya revisaron ESTE concepto para no
+                              -- ofrecerlas, porque «unique (concepto_id, arquetipo_id)» las
+                              -- rechaza después de haberlo escrito todo.
+                              'arquetipoId', a.id,
                               'arquetipoNombre', a.nombre,
                               'arquetipoEstado', a.estado,
                               'sintesis', r.sintesis,

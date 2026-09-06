@@ -9084,6 +9084,52 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       ).toEqual(Array(MAX_REVISIONES_POR_LOTE).fill('disponible'));
       // Y con el material bien reconstruido, la presencia literal de la cita se puede medir.
       expect(segundoPanel.every((x) => x.citas.every((c) => c.presenteLiteral))).toBe(true);
+
+      /*
+       * Y LA ROTACIÓN TIENE QUE SEGUIR ROTANDO PASADO EL SEGUNDO LOTE.
+       *
+       * Con «¿se intentó alguna vez?» —un booleano— la rotación se agota sola: tras los dos
+       * primeros lotes las siete lentes tienen ya alguna propuesta decidida, el predicado es
+       * cierto para todas, el desempate vuelve a ser alfabético y el tercer lote pide otra vez
+       * las seis primeras. La séptima no vuelve nunca — que es exactamente la avería que esta
+       * sonda arregló, dos lotes más tarde.
+       *
+       * Se ordena por el ÚLTIMO intento y no por si lo hubo: las que nunca se propusieron van
+       * primero —«nulls first»— y el resto por antigüedad, así que la rueda gira sola. Se mide
+       * sobre CUATRO lotes porque el turno completo de siete lentes en lotes de seis tarda eso:
+       * con la avería la séptima sale una vez, y con el arreglo salen todas al menos dos.
+       */
+      const vueltas: string[][] = [primeras, segundas];
+      for (let i = 0; i < 2; i++) {
+        for (const p of (await panelPropuestas(curadorId, wsC)).pendientes.filter(
+          (x) => x.capacidad === 'C4',
+        )) {
+          await rechazarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p.id });
+        }
+        const lote = await pedidas();
+        vueltas.push(lote);
+        await conProveedor(
+          {
+            ok: true,
+            datos: { revisiones: lote.map((id) => sesion(lentes.find((l) => l.arq === id)!)) },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C4',
+              anclaId: conceptoId,
+            }),
+        );
+      }
+      const veces = new Map(lentes.map((l) => [l.arq, 0]));
+      for (const lote of vueltas) for (const id of lote) veces.set(id, veces.get(id)! + 1);
+      expect(
+        [...veces.values()].filter((n) => n < 2).length,
+        `en cuatro lotes hay lentes pedidas menos de dos veces: la rueda dejó de girar (${[
+          ...veces.values(),
+        ].join(',')})`,
+      ).toBe(0);
     });
   });
 
@@ -11109,6 +11155,58 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const [quedan] = await admin`select count(*)::int as n from revision_simulada
         where id = ${revisionId}`;
       expect(quedan!.n).toBe(1);
+    });
+  });
+
+  /**
+   * UNA LENTE LEE UN CONCEPTO UNA VEZ, y la pantalla tiene con qué saberlo.
+   *
+   * `unique (concepto_id, arquetipo_id)` es de la ronda 2, y el formulario a mano ofrecía las
+   * lentes filtrando sólo por su estado: elegir una que ya revisó ese concepto se rechazaba
+   * DESPUÉS de haberlo escrito todo. La misma clase que la ventana de la etapa, y con el mismo
+   * remedio — no esconder una regla, sino llevar a la pantalla el dato con el que la base
+   * decide.
+   *
+   * El dato es el ID de la lente en cada revisión ya escrita: la proyección llevaba su NOMBRE,
+   * que sirve para pintar y no para comparar. Se filtra por el concepto SELECCIONADO y no en
+   * global, porque la misma lente sigue libre para los demás conceptos del reto.
+   */
+  it('C4 a mano no repite lente sobre el mismo concepto, y la proyección trae con qué filtrar', async () => {
+    await enWorkspaceLimpio('c4-lente-repetida', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const [proy] = await admin`insert into proyecto
+        (workspace_id, reto_id, codigo, titulo, creado_por)
+        values (${wsC}, ${retoC}, 'P-C4R', 'Proyecto de la lente repetida', ${curadorId})
+        returning id`;
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Lo que leo yo con esta lente.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+      };
+      await escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido });
+
+      // La base lo rechaza, y con su motivo — que es lo que la pantalla no debería llegar a ver.
+      await expect(
+        escribirRevisionAMano(curadorId, { workspaceId: wsC, conceptoId, contenido }),
+      ).rejects.toThrow(/una sola lectura por concepto|ya tiene una revisión/i);
+
+      // Y la proyección trae el ID de la lente, que es con lo que el formulario la descuenta.
+      const gob = await gobernanzaDeProyecto(curadorId, wsC, proy!.id as string);
+      const rev = gob!.conceptos.find((c) => c.id === conceptoId)!.revisiones;
+      expect(rev.map((r) => r.arquetipoId), 'sin el id, la pantalla sólo tiene el nombre').toEqual([
+        lenteA,
+      ]);
     });
   });
 

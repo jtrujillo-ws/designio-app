@@ -2484,6 +2484,18 @@ begin
        where orv.id = new.outcome_review_id and orv.workspace_id = new.workspace_id;
     end if;
     if v_reto is not null then
+      -- LA CLAVE PRIMERO, y luego la fila. El `for share` sobre la fila del reto ordena esta
+      -- escritura contra quien ARCHIVA el reto —ése pide la fila en exclusiva— y contra nadie
+      -- más: quien firma un pasa/muere toma `designio:reto:` y luego pide esta MISMA fila en
+      -- compartido, así que los dos modos son compatibles y ninguno espera al otro. Está dicho
+      -- en el guard del concepto: «entre dos escrituras de conceptos no hay espera: las dos
+      -- piden compartido». Sin la clave, la comprobación del concepto de aquí abajo lee una
+      -- FOTO: el veredicto commitea después y queda una propuesta que no se podrá aceptar
+      -- nunca, bloqueando además el lote siguiente, con la llamada ya pagada.
+      --
+      -- El ORDEN es el del sistema y no es negociable —clave y después fila—: al revés se
+      -- interbloquea con quien archiva, que es como se manifestó en C2 y está escrito allí.
+      perform pg_advisory_xact_lock(hashtextextended('designio:reto:' || v_reto, 42));
       perform 1 from reto r
        where r.id = v_reto and r.workspace_id = new.workspace_id
        for share;
@@ -2499,8 +2511,12 @@ begin
     -- concepto ya decidido —o con la etapa 4 cerrada— no se podrá aceptar NUNCA: la política y
     -- el guard diferido la paran. Lo que queda es una fila pendiente que además bloquea pedir
     -- otra, porque el selector no ofrece un concepto con propuesta de C4 en curso, y la llamada
-    -- al proveedor ya está pagada. El candado del reto ya está en la mano, así que lo que se lee
-    -- aquí no es una foto.
+    -- al proveedor ya está pagada.
+    --
+    -- Y se lee CON LA CLAVE del reto en la mano, que es lo que hace que no sea una foto. Esta
+    -- nota decía antes «el candado del reto ya está en la mano» cuando lo único tomado era el
+    -- `for share` de la fila, y ése no serializa contra el veredicto: los dos piden compartido.
+    -- La clave se toma ahora arriba, con el resto del protocolo.
     if new.concepto_id is not null and session_user = 'designio_app' then
       if not exists (select 1 from concepto c
                       where c.id = new.concepto_id and c.workspace_id = new.workspace_id

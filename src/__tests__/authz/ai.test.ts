@@ -9798,6 +9798,101 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y LA PROPUESTA TAMPOCO, que es la otra puerta y no tenía candado.
+   *
+   * La de arriba mide la escritura de la REVISIÓN, que entra por `concepto_candado_del_reto_guard`
+   * y ahí sí se toma `designio:reto:` en exclusiva. La PROPUESTA de C4 entra por otro guard, y
+   * ese sólo tomaba `for share` sobre la fila del reto — y con eso no se serializa contra nada:
+   * quien firma el pasa/muere toma la clave y luego pide la MISMA fila en compartido, así que
+   * los dos modos son compatibles y ninguno espera al otro. Está escrito en el propio guard del
+   * concepto: «entre dos escrituras de conceptos no hay espera: las dos piden compartido».
+   *
+   * Corrección de una nota mía, otra vez: junto a esta comprobación dejé escrito «el candado del
+   * reto ya está en la mano, así que lo que se lee aquí no es una foto». El `for share` no es
+   * ese candado. La lectura SÍ era una foto, y el precio es una propuesta que nace imposible de
+   * aceptar —el guard diferido y la política la paran— y que además bloquea pedir otro lote,
+   * porque el selector no ofrece un concepto con propuesta de C4 en curso. Con la llamada al
+   * proveedor ya pagada.
+   *
+   * Se mide como su hermana y por el mismo motivo: leyendo `pg_locks` en vez de esperar un
+   * tiempo, que es lo que haría intermitente la prueba.
+   */
+  it('la PROPUESTA de C4 espera al candado del reto, no solo a su fila', { timeout: 30_000 }, async () => {
+    await enWorkspaceLimpio('c4-propuesta-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura que llegó tarde.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media',
+      };
+
+      let soltar!: () => void;
+      const puedeCerrar = new Promise<void>((r) => {
+        soltar = r;
+      });
+      let tomado!: () => void;
+      const yaTomado = new Promise<void>((r) => {
+        tomado = r;
+      });
+      const elOtro = admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(
+          hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
+        await tx`update concepto set estado = 'pasa',
+          decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
+        tomado();
+        await puedeCerrar;
+      });
+      await yaTomado;
+
+      const escritura = conUsuario(curadorId, async (tx) => {
+        const [ll] = await tx`insert into llamada_ai
+          (workspace_id, capacidad, concepto_id, modelo, origen_key, resultado, creado_por)
+          values (${wsC}, 'C4', ${conceptoId}, 'modelo-de-prueba', 'entorno',
+                  'salida-valida', ${curadorId})
+          returning id`;
+        return tx`insert into propuesta_ai
+          (workspace_id, capacidad, destino, concepto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, es_simulacion, creado_por)
+          values (${wsC}, 'C4', 'revision-simulada', ${conceptoId},
+                  ${tx.json(contenido)}, ${tx.json(contenido)},
+                  'modelo-de-prueba', 'v-prueba', 'una lente', ${[evA]},
+                  'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
+      });
+      try {
+        for (let i = 0; i < 100; i++) {
+          const [espera] = await admin`select count(*)::int as n from pg_locks
+            where locktype = 'advisory' and not granted`;
+          if ((espera!.n as number) > 0) break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        const [bloqueada] = await admin`select count(*)::int as n from pg_locks
+          where locktype = 'advisory' and not granted`;
+        expect(
+          bloqueada!.n,
+          'la propuesta no llegó a esperar el candado del reto: nace sobre una foto',
+        ).toBe(1);
+      } finally {
+        soltar();
+        await elOtro;
+      }
+      await expect(escritura).rejects.toThrow(/ya no es candidato/i);
+    });
+  });
+
+  /**
    * Y una sesión escrita a mano no entra vacía.
    *
    * El contrato pide al menos un hallazgo y al menos una pregunta de test —y las preguntas son

@@ -60,8 +60,12 @@ create function sin_agregado_sintetico(p_texto text) returns boolean
 language sql immutable as $fn$
   -- `\m` y `\M` marcan frontera de palabra: sin ellas, «100%» dentro de una URL o de un
   -- identificador daría un falso positivo, y el motivo del rechazo no se entendería.
+  --
+  -- Y `!~*`, insensible a mayúsculas: «6 DE CADA 10» es la misma proporción sintética que
+  -- «6 de cada 10», y con `!~` pasaba. Lo mismo en el contrato, que tenía la misma grieta: dos
+  -- capas de validación dejando entrar lo mismo no son dos capas.
   select p_texto !~ '\m\d+([.,]\d+)?\s*%'
-     and p_texto !~ '\m\d+\s+de\s+cada\s+\d+\M';
+     and p_texto !~* '\m\d+\s+de\s+cada\s+\d+\M';
 $fn$;
 
 revoke execute on function sin_agregado_sintetico(text) from public;

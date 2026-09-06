@@ -1158,7 +1158,9 @@ const PRESENTACION_POR_CAPACIDAD: Record<
   },
   C4: {
     rotulo: 'Revisión simulada por arquetipo',
-    ficha: (c) => <FichaRevision contenido={c as ContenidoRevisionSimulada} />,
+    ficha: (c, etiquetas) => (
+      <FichaRevision contenido={c as ContenidoRevisionSimulada} etiquetas={etiquetas} />
+    ),
     /*
      * C4 SÍ materializa: aceptar crea la revisión, sus hallazgos, sus citas y sus preguntas de
      * test. Lo que no hace —y es de lo que más importa que se lea en la tarjeta— es producir
@@ -2260,8 +2262,24 @@ function citasPorInsight(citas: ContenidoOportunidad['citas']) {
  * Y cada hallazgo dice si es hipótesis. La marca es lo que separa lo que se apoya en un
  * documento de lo que el modelo extrapoló, y esconderla en el detalle sería devolver por la
  * pantalla la confusión que el contrato y la base cortan por su lado.
+ *
+ * La LENTE va con nombre y arriba. Una fila de C4 es una sesión, pero su ancla es el concepto,
+ * así que todas las del lote llegan con el mismo título: sin esto, quien revisa tiene seis
+ * tarjetas idénticas por fuera y ninguna forma fiable de saber cuál está aceptando —la síntesis
+ * es texto libre y no está obligada a nombrar su arquetipo—.
+ *
+ * Y las citas van DEBAJO DE SU HALLAZGO, no en una lista aparte. La materialización las cuelga
+ * de cada hallazgo, así que enseñarlas juntas rompe justo la relación que se está aprobando: no
+ * se podría decir qué documento sostiene cuál lectura, que es lo único contrastable que hay
+ * aquí. Es la misma forma que usa C2 con sus afirmaciones, y por el mismo motivo.
  */
-function FichaRevision({ contenido }: { contenido: ContenidoRevisionSimulada }) {
+function FichaRevision({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoRevisionSimulada;
+  etiquetas: Record<string, string>;
+}) {
   return (
     <div
       style={{
@@ -2283,19 +2301,39 @@ function FichaRevision({ contenido }: { contenido: ContenidoRevisionSimulada }) 
       >
         Simulación AI · no es evidencia y no cuenta para G4/G5
       </span>
+      <Dato
+        rotulo="Arquetipo que revisa"
+        valor={
+          etiquetas[contenido.arquetipoId] ??
+          `arquetipo ${contenido.arquetipoId} (ya no está en el reto)`
+        }
+      />
       <Dato rotulo="Lectura del arquetipo" valor={contenido.sintesis} />
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 8 }}>
         <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
           Hallazgos
         </span>
         {contenido.hallazgos.map((h, i) => (
-          <Dato
+          <div
             /* El índice ES la identidad aquí: `hallazgo_simulado` tiene único
              * `(revision_id, orden)` y el orden es parte del objeto que se materializa. */
             key={i}
-            rotulo={h.esHipotesis ? `${h.titulo} · hipótesis` : h.titulo}
-            valor={h.descripcion}
-          />
+            style={{ display: 'flex', flexDirection: 'column', gap: 2 }}
+          >
+            <Dato
+              rotulo={h.esHipotesis ? `${h.titulo} · hipótesis` : h.titulo}
+              valor={h.descripcion}
+            />
+            {h.citas.map((c, j) => (
+              <Dato
+                key={String(j)}
+                rotulo="Cita"
+                valor={`«${c.fragmento}» · ${c.localizacion} · ${
+                  etiquetas[c.evidenciaId] ?? `evidencia ${c.evidenciaId} (ya no está)`
+                }`}
+              />
+            ))}
+          </div>
         ))}
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 8 }}>

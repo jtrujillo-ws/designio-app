@@ -7400,18 +7400,49 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const antes = await panelPropuestas(curadorId, wsC);
       const deC4 = antes.pendientes.filter((x) => x.capacidad === 'C4');
       expect(deC4).toHaveLength(2);
-      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: deC4[0]!.id });
+      /*
+       * Cuál es cuál se lee del CONTENIDO, no del orden del panel. La cola ordena por confianza
+       * y las dos sesiones la declaran igual, así que el orden entre ellas no está fijado: con
+       * el índice, la sonda escogía una u otra según el plan de la consulta y a veces escribía a
+       * mano una revisión de la lente que acababa de aceptar. Lo dijo el esquema recién creado,
+       * fallando con «duplicate key» donde la ejecución anterior había pasado.
+       */
+      const deLaLente = async (lente: string) => {
+        const [f] = await admin`select id from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C4'
+            and contenido->>'arquetipoId' = ${lente}`;
+        return f!.id as string;
+      };
+      const propuestaA = await deLaLente(lenteA);
+      const propuestaB = await deLaLente(lenteB);
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuestaA });
 
       // LA SEGUNDA MITAD: la hermana del lote sigue viva y su cita se sigue midiendo.
       const despues = await panelPropuestas(curadorId, wsC);
-      const hermana = despues.pendientes.find((x) => x.id === deC4[1]!.id);
+      const hermana = despues.pendientes.find((x) => x.id === propuestaB);
       expect(hermana, 'la hermana del lote desapareció del panel').toBeDefined();
       expect(hermana!.anclaEstado).toBe('disponible');
       expect(hermana!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
 
+      /*
+       * Y la otra cara: una revisión escrita A MANO mientras la propuesta esperaba SÍ toma la
+       * lente. Mi primera versión cortaba por instante —«todo lo posterior a la propuesta se
+       * ignora»— y no distinguía una hermana del lote de una escrita a mano: la propuesta
+       * seguía pareciendo aceptable y reventaba contra la clave única al insertar. El lote las
+       * separa: la hermana lleva el sello de una propuesta de esta llamada, la de a mano no.
+       */
+      const [aMano] = await conUsuario(curadorId, (tx) => tx`insert into revision_simulada
+        (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+        values (${wsC}, ${conceptoId}, ${lenteB}, 'Escrita a mano', ${curadorId}) returning id`);
+      const conAjena = await panelPropuestas(curadorId, wsC);
+      const tocada = conAjena.pendientes.find((x) => x.id === propuestaB);
+      expect(tocada, 'la propuesta desapareció del panel').toBeDefined();
+      expect(tocada!.anclaEstado).toBe('material-de-revision-movido');
+      await admin`delete from revision_simulada where id = ${aMano!.id as string}`;
+
       // LA PRIMERA: con las dos lentes ya revisadas, el concepto deja de ofrecerse y pedir otro
       // lote no encuentra nada que revisar. Que la ventana avanza se ve aquí llegando a cero.
-      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: deC4[1]!.id });
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuestaB });
       const [cuantas] = await admin`select count(*)::int as n from revision_simulada
         where concepto_id = ${conceptoId}`;
       expect(cuantas!.n).toBe(2);
@@ -7615,6 +7646,160 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+  /**
+   * Y la ventana del RETO, que se cierra por su cuenta.
+   *
+   * Un concepto puede seguir siendo `candidato` cuando G4 ya se firmó o la etapa 4 se completó:
+   * `reto_admite_conceptos` es del reto y el estado es del concepto, y las dos puertas se
+   * cierran por separado. Sin esta rama la tarjeta decía «disponible» y ofrecía Aceptar, y el
+   * Aceptar reventaba después con un motivo que quien revisa no había podido ver venir.
+   *
+   * Y la huella tampoco lo tapaba: el material de C4 no lleva dentro ni el gate ni la etapa, así
+   * que no se mueve cuando ellos se cierran. Hacían falta las dos comprobaciones.
+   */
+  it('C4 deja de ofrecer Aceptar cuando la ventana del reto se cierra, no al fallar', async () => {
+    await enWorkspaceLimpio('c4-ventana-reto', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: {
+            revisiones: [
+              {
+                arquetipoId: lenteA,
+                sintesis: 'Este perfil llega con la guardia alta.',
+                hallazgos: [
+                  {
+                    titulo: 'Pide confianza antes de darla',
+                    descripcion: 'Entrega el documento cuando entiende para qué.',
+                    esHipotesis: false,
+                    citas: [
+                      {
+                        evidenciaId: evA,
+                        fragmento: 'No entrego la cédula sin saber para qué.',
+                        localizacion: 'resumen',
+                      },
+                    ],
+                  },
+                ],
+                preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+                confianzaPropuesta: 'media' as const,
+              },
+            ],
+          },
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      const p = antes.pendientes.find((x) => x.capacidad === 'C4')!;
+      expect(p.anclaEstado).toBe('disponible');
+
+      // El reto deja de admitir conceptos —`candidato → archivado` es una transición legal— y
+      // el concepto sigue siendo CANDIDATO: es justo el caso en que las dos puertas discrepan.
+      await admin`update reto set estado = 'archivado' where id = ${retoC}`;
+      const [cpt] = await admin`select estado from concepto where id = ${conceptoId}`;
+      expect(cpt!.estado).toBe('candidato');
+
+      const despues = await panelPropuestas(curadorId, wsC);
+      const p2 = despues.pendientes.find((x) => x.id === p.id);
+      expect(p2, 'la propuesta desapareció del panel').toBeDefined();
+      expect(p2!.anclaEstado).toBe('reto-no-admite');
+    });
+  });
+
+  /**
+   * Y un lote que devuelve MENOS sesiones de las pedidas no se tira: se recupera solo.
+   *
+   * El sobre admite de 1 a `MAX_REVISIONES_POR_LOTE`, así que un subconjunto estricto se
+   * guarda. La alternativa —descartar el lote— tira sesiones válidas y obliga a repetir la
+   * llamada ENTERA; esto conserva las que llegaron y solo hace falta una llamada más para las
+   * que faltan, que es estrictamente más barato.
+   *
+   * Lo que hace que sea recuperación y no pérdida son dos piezas que ya están: el selector no
+   * ofrece un concepto con una propuesta de C4 pendiente —así que no se puede pedir otro lote
+   * hasta resolver éste—, y la ventana de lentes descuenta las ya revisadas —así que el lote
+   * siguiente pide exactamente las que faltan—. La sonda recorre el ciclo entero.
+   */
+  it('un lote de C4 incompleto se guarda, y el siguiente pide exactamente las lentes que faltan', async () => {
+    await enWorkspaceLimpio('c4-parcial', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(
+        wsC,
+        retoC,
+        curadorId,
+      );
+      const sesion = (arquetipoId: string, evidenciaId: string, fragmento: string) => ({
+        arquetipoId,
+        sintesis: 'Este perfil llega con la guardia alta.',
+        hallazgos: [
+          {
+            titulo: 'Pide confianza antes de darla',
+            descripcion: 'Entrega el documento cuando entiende para qué.',
+            esHipotesis: false,
+            citas: [{ evidenciaId, fragmento, localizacion: 'resumen' }],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué esperarías saber antes?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      });
+      const pedir = () =>
+        generarPropuestas(curadorId, {
+          workspaceId: wsC,
+          capacidad: 'C4',
+          anclaId: conceptoId,
+        });
+
+      // Se piden DOS lentes y el proveedor devuelve UNA. Se guarda.
+      const alcanceUltimo = async () => {
+        const [l] = await admin`select alcance_resumen from propuesta_ai
+          where workspace_id = ${wsC} and capacidad = 'C4' order by creado_en desc limit 1`;
+        return l!.alcance_resumen as string;
+      };
+      const primero = await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: [sesion(lenteA, evA, 'No entrego la cédula sin saber para qué.')] },
+          intentos: [intento({ uso: null })],
+        },
+        pedir,
+      );
+      expect(primero.generadas).toBe(1);
+      expect(await alcanceUltimo()).toContain('2 arquetipos revisables');
+      const conUna = await panelPropuestas(curadorId, wsC);
+      expect(conUna.pendientes.filter((x) => x.capacidad === 'C4')).toHaveLength(1);
+
+      // Con la propuesta pendiente, el concepto NO se vuelve a ofrecer: no se puede pedir otro
+      // lote encima del que está sin resolver.
+      expect(conUna.candidatas.C4.lista.map((x) => x.id)).not.toContain(conceptoId);
+
+      // Resuelta la primera, la ventana avanza y el lote siguiente pide SOLO la que falta.
+      await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: conUna.pendientes.find((x) => x.capacidad === 'C4')!.id,
+      });
+      await conProveedor(
+        {
+          ok: true,
+          datos: { revisiones: [sesion(lenteB, evB, 'Si tarda más de un café, lo dejo.')] },
+          intentos: [intento({ uso: null })],
+        },
+        pedir,
+      );
+      // El alcance de la SEGUNDA llamada dice UNA lente: la ventana avanzó sola.
+      expect(await alcanceUltimo()).toContain('1 arquetipos revisables');
+      const [n] = await admin`select count(*)::int as n from propuesta_ai
+        where concepto_id = ${conceptoId} and workspace_id = ${wsC}`;
+      expect(n!.n).toBe(2);
+    });
+  });
+
   it('C4 no admite dos sesiones del mismo arquetipo sobre el mismo concepto (SYS-20)', async () => {
     await enWorkspaceLimpio('c4-masiva', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const admin = sqlAdmin();
@@ -7696,11 +7881,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   it('el corte de agregados sintéticos dice lo mismo en el contrato que en la base', async () => {
     const admin = sqlAdmin();
     const casos = [
-      // Mediciones: las dos tienen que rechazarlas.
+      // Mediciones: las dos tienen que rechazarlas, en cualquier caja.
       'El 70 % de los desconfiados digitales abandonaría',
       '100% de acuerdo con lo que dijo',
       'el margen del 12,5% que midieron',
       '6 de cada 10 abandonan aquí',
+      // La misma proporción GRITADA: pasaba las dos capas, que es como no tener ninguna.
+      '6 DE CADA 10 abandonan aquí',
+      '6 De Cada 10 abandonan aquí',
       // Y NO mediciones: identificadores y códigos con un número pegado. Las dos las aceptan.
       'La versión v2r100% del prototipo',
       'La norma ISO9001% del proveedor',
@@ -7743,7 +7931,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     );
     expect(enElContrato).toEqual(enLaBase);
     // Y que la sonda mida algo: los cuatro primeros se rechazan, los cuatro últimos no.
-    expect(enLaBase).toEqual([false, false, false, false, true, true, true, true]);
+    expect(enLaBase).toEqual([
+      false, false, false, false, false, false, true, true, true, true,
+    ]);
   });
 
   /**

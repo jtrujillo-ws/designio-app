@@ -757,19 +757,23 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
        from arquetipo a
        where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id
          /*
-          * La MISMA ventana que usó la generación, congelada al instante de ESTA propuesta.
+          * La MISMA ventana que usó la generación, y con el mismo criterio que la aceptación:
+          * descuenta toda revisión de la lente SALVO las hermanas de este lote.
           *
-          * «creado_en <» y no un «not exists» a secas, que es lo que hace que las dos lecturas
-          * coincidan: al generar no había ninguna revisión de estas lentes, así que la del
-          * lote —creada al aceptar, después— NO puede descontarse aquí. Sin el corte temporal,
-          * aceptar la primera sesión de un lote de seis cambiaría el material de las otras
-          * cinco y las dejaría a todas marcadas «material movido», con su presencia literal
-          * sin poder medirse, que es la única señal contrastable que tiene quien revisa.
+          * Al generar no había ninguna revisión de estas lentes, así que las del lote —creadas
+          * al aceptar, después— no pueden descontarse aquí: si lo hicieran, aceptar la primera
+          * sesión de un lote de seis dejaría a las otras cinco marcadas «material movido», con
+          * su presencia literal sin poder medirse, que es la única señal contrastable que tiene
+          * quien revisa. Y al revés: una revisión escrita A MANO mientras la propuesta esperaba
+          * sí toma la lente, y el panel tiene que decirlo en vez de ofrecer un Aceptar que
+          * reventaría contra la clave única.
           */
          and not exists (select 1 from revision_simulada rs
            where rs.concepto_id = cpt.id and rs.arquetipo_id = a.id
              and rs.workspace_id = cpt.workspace_id
-             and rs.creado_en < p.creado_en)) as concepto_arquetipos`,
+             and not exists (select 1 from propuesta_ai ph
+               where ph.id = rs.propuesta_ai_id and ph.workspace_id = rs.workspace_id
+                 and ph.llamada_id = p.llamada_id))) as concepto_arquetipos`,
   },
   outcome_review_id: {
     // DOS joins, como el registry: el post mortem y su RETO. El reto no es adorno — el
@@ -1705,9 +1709,41 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
           where c2.id = p.concepto_id and c2.workspace_id = p.workspace_id
             and c2.estado = 'candidato')
           then 'concepto-decidido'
+        /*
+         * Y LA VENTANA DEL RETO, que se cierra por su cuenta. Un concepto puede seguir siendo
+         * candidato cuando G4 ya se firmó o la etapa 4 se completó: «reto_admite_conceptos» es
+         * del reto, el estado es del concepto, y las dos puertas se cierran por separado. Sin
+         * esta rama la tarjeta decía «disponible», ofrecía Aceptar, y el Aceptar reventaba —en
+         * la relectura del material o en la política de inserción— con un motivo que quien
+         * revisa no había podido ver venir. Y la huella no lo tapa: el material no lleva
+         * dentro ni el gate ni la etapa, así que no se mueve cuando ellos se cierran.
+         */
+        when not exists (
+          select 1 from concepto c3
+          where c3.id = p.concepto_id and c3.workspace_id = p.workspace_id
+            and reto_admite_conceptos(c3.reto_id, c3.workspace_id))
+          then 'reto-no-admite'
         else 'disponible'
       end`,
     material: (f) => materialDeRevision(revisionDeLaFila(f)).texto,
+    /*
+     * El NOMBRE de cada lente y el TÍTULO de cada documento, en el mismo mapa.
+     *
+     * Los dos hacen falta en la tarjeta y por lo mismo: una fila de C4 es UNA sesión, pero su
+     * ancla es el concepto, así que todas las del lote llegan al panel con el mismo título y
+     * ningún uuid dice nada. Sin el nombre del arquetipo, quien revisa no puede saber qué
+     * lente está aceptando —la síntesis es texto libre y no está obligada a nombrarse—; sin el
+     * título del documento, una cita no dice de qué testimonio sale.
+     *
+     * Los ids de arquetipo y de evidencia no chocan: son uuid de tablas distintas.
+     */
+    etiquetasDelContenido: (f) =>
+      Object.fromEntries(
+        revisionDeLaFila(f).arquetipos.flatMap((a) => [
+          [a.id, `${a.nombre} (${a.estado})`] as const,
+          ...a.evidencia.map((e) => [e.id, e.titulo] as const),
+        ]),
+      ),
     /*
      * El TRAMO de una cita: el documento que nombra, no el material entero. Sin esto un
      * fragmento del testimonio de al lado saldría PRESENTE, y quien revisa vería un verde
@@ -3386,21 +3422,28 @@ export const MOTIVO_MATERIAL_REVISION_MOVIDO =
  * El material de C4, y CON ÉL LA VENTANA DE LENTES: los arquetipos del reto que todavía no
  * tienen revisión de este concepto.
  *
- * `revisadasHasta` es lo que hace que las tres lecturas de este material —preparar, comprobar y
+ * `loteId` es lo que hace que las tres lecturas de este material —preparar, comprobar y
  * ACEPTAR— digan lo mismo cuando el lote se acepta sesión a sesión. Al generar no se pasa: no
  * hay propuesta todavía, así que descuentan TODAS las revisiones que existan. Al aceptar se
- * pasa el instante en que nació la propuesta, y entonces las revisiones del propio lote —que
- * nacen después, una por cada aceptación— NO descuentan.
+ * pasa la llamada de la que nació la propuesta, y entonces las revisiones de SUS HERMANAS —las
+ * que van naciendo, una por cada aceptación— no descuentan.
  *
  * Sin eso, aceptar la primera sesión de un lote de seis cambia el material de las otras cinco y
  * las cinco quedan «solo puede rechazarse». Lo dijo una sonda al fallar, después de que yo
  * escribiera el corte solo en la proyección del panel: la aceptación relee por aquí.
+ *
+ * Y es el LOTE y no un instante, que fue mi primera versión. `creado_en < p.creado_en` no
+ * distingue una hermana del propio lote de una revisión que alguien escribió A MANO mientras la
+ * propuesta esperaba: las dos son «posteriores», y la segunda SÍ toma la lente. Con el instante,
+ * la propuesta seguía pareciendo aceptable y reventaba contra la clave única al insertar. El
+ * lote las separa exactamente: la hermana lleva el sello de una propuesta de esta misma llamada;
+ * la escrita a mano no lleva sello, y la de otra generación lleva el de otra llamada.
  */
 export async function huellaDelMaterialDeRevision(
   tx: TransactionSql,
   workspaceId: string,
   anclaId: string,
-  revisadasHasta?: Date,
+  loteId?: string,
 ): Promise<{ huella: string; material: ConceptoARevisar | null }> {
   await tx`select pg_advisory_xact_lock_shared(
     hashtextextended('designio:workspace:' || ${workspaceId}, 42))`;
@@ -3438,8 +3481,12 @@ export async function huellaDelMaterialDeRevision(
          and not exists (select 1 from revision_simulada rs
            where rs.concepto_id = c.id and rs.arquetipo_id = a.id
              and rs.workspace_id = c.workspace_id
-             and (${revisadasHasta ?? null}::timestamptz is null
-                  or rs.creado_en < ${revisadasHasta ?? null}::timestamptz))) as arquetipos
+             -- salvo las HERMANAS de este mismo lote, que llevan el sello de una propuesta de
+             -- la misma llamada. Una escrita a mano no lleva sello; una de otra generación
+             -- lleva el de otra llamada: las dos toman la lente, que es lo correcto.
+             and not exists (select 1 from propuesta_ai ph
+               where ph.id = rs.propuesta_ai_id and ph.workspace_id = rs.workspace_id
+                 and ph.llamada_id = ${loteId ?? null}::uuid))) as arquetipos
     from concepto c
     where c.id = ${anclaId} and c.workspace_id = ${workspaceId}`;
   if (!fila || !(fila.revisable as boolean)) return { huella: '', material: null };
@@ -5432,9 +5479,10 @@ type PropuestaEnRevision = {
    * mueve sin que nadie haya tocado el material.
    */
   huellaMaterial: string | null;
-  /** Cuándo NACIÓ la propuesta. Lo usa C4 para releer el material con la ventana de lentes tal
-   * como estaba entonces: las revisiones que su propio lote va creando no pueden moverlo. */
-  creadoEn: Date;
+  /** De qué LLAMADA nació. Lo usa C4 para releer el material con la ventana de lentes tal como
+   * estaba entonces: las revisiones que sus hermanas de lote van creando no pueden moverlo, y
+   * cualquier otra —escrita a mano, o de otra generación— sí. */
+  llamadaId: string;
 };
 
 async function leerParaRevisar(
@@ -5448,7 +5496,7 @@ async function leerParaRevisar(
     (a, b) => tx`${a}, ${b}`,
   );
   const [p] = await tx`select capacidad, destino, ${columnasDeAncla}, contenido,
-      contenido_original, modelo, prompt_version, huella_material, estado, creado_en
+      contenido_original, modelo, prompt_version, huella_material, estado, llamada_id
     from propuesta_ai where id = ${propuestaId} and workspace_id = ${workspaceId}`;
   if (!p) throw new ErrorAI('La propuesta no existe en este workspace');
   if ((p.estado as string) !== 'propuesta') {
@@ -5475,7 +5523,7 @@ async function leerParaRevisar(
     modelo: p.modelo as string,
     promptVersion: p.prompt_version as string,
     huellaMaterial: (p.huella_material ?? null) as string | null,
-    creadoEn: p.creado_en as Date,
+    llamadaId: p.llamada_id as string,
   };
 }
 
@@ -6081,7 +6129,7 @@ async function materializarRevision(
     tx,
     workspaceId,
     p.anclaId,
-    p.creadoEn,
+    p.llamadaId,
   );
   if (!material) {
     throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}. Esta propuesta solo puede rechazarse`);

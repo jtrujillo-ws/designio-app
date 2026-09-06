@@ -248,7 +248,7 @@ server function. El scheduler in-app y el object storage están diseñados pero 
 | CTX-05 Entrega y Estado Efectivo | Releases, effective state, constataciones, conciliación | `entrega` | Construido |
 | CTX-06 Medición e Impacto | Metric Registry, snapshots, outcome review | `medicion` | Construido |
 | CTX-07 Biblioteca General | Conocimiento metodológico de la boutique | `biblioteca` (solo schemas; los checklists viven en `metodo.plantillas.ts`) | Diseñado |
-| CTX-08 Capacidades AI | PropuestaAI, llamadas, reservas, capacidades | `ai` | Construido para CI, C0, CT, C2, C3, C5, C6, C7 |
+| CTX-08 Capacidades AI | PropuestaAI, llamadas, reservas, capacidades | `ai` | Construido para CI, C0, CT, C2, C3, C4, C5, C6, C7 (queda C1) |
 
 ## Mapa de módulos y componentes funcionales
 
@@ -408,6 +408,7 @@ flowchart LR
   M_AI --> LLM
   M_AI -.->|al aceptar, escribe en<br/>las tablas de destino| T_EVI
   M_AI -.->|bloquearReto| M_MET
+  M_MET -.->|escribirRevisionSimulada<br/>ruta manual de C4| M_AI
   M_AI -.->|lee y valida journeys| M_JOU
   M_ENT -.->|bloquearReto| M_MET
   T_AI ~~~ LLM
@@ -429,14 +430,17 @@ datos se relacionan por identidad (ids y FKs compuestas con `workspace_id`), nun
 de objetos ajenos; pero quien busque **quién escribe en una tabla** debe contar tres cosas más: al
 aceptar una propuesta, `ai.servicio.ts` inserta directamente en `evidencia` y `derecho_uso` (CI),
 `criterio_exito` (C0), `insight`, `afirmacion`, `cita` y `contradiccion` (C2), `oportunidad` y
-`oportunidad_insight` (C3) y `entrada_kpi` (C6), y actualiza `outcome_review` (C7); todos los
-servicios insertan en `evento_dominio`; y las proyecciones (Aprobaciones, Biblioteca, la exportación
-bajo RLS) leen lo que otros poseen. En **tiempo de ejecución** hay cuatro dependencias entre módulos
-de dominio: `ai` llama a `bloquearReto` de `metodo` y a `leerJourneyCompleto`,
-`leerJourneysCompletos` y `validarJourney` de `journey`; `entrega` llama a `bloquearReto` de
-`metodo`; y `loop` lee las aprobaciones pendientes con `gatesAbiertos`, `gatesDelRol`,
-`conteoDeOtrosPendientes` y `rolEnWorkspace` de `aprobaciones` (los dos van en la misma caja del
-diagrama). Además, todos los servicios llaman a `exigirCuentaActiva` de `auth`, dos módulos
+`oportunidad_insight` (C3), `entrada_kpi` (C6) y `revision_simulada`, `hallazgo_simulado`,
+`hallazgo_simulado_evidencia` y `pregunta_de_test` (C4, por `escribirRevisionSimulada`), y actualiza
+`outcome_review` (C7); todos los servicios insertan en `evento_dominio`; y las proyecciones
+(Aprobaciones, Biblioteca, la exportación bajo RLS) leen lo que otros poseen. En **tiempo de
+ejecución** hay cinco dependencias entre módulos de dominio: `ai` llama a `bloquearReto` de `metodo`
+y a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`; `metodo`
+(gobernanza) llama en sentido contrario a `escribirRevisionSimulada` de `ai` para la ruta manual de
+C4 y valida con `ContenidoRevisionSimuladaSchema` de `ai.contenido`; `entrega` llama a
+`bloquearReto` de `metodo`; y `loop` lee las aprobaciones pendientes con `gatesAbiertos`,
+`gatesDelRol`, `conteoDeOtrosPendientes` y `rolEnWorkspace` de `aprobaciones` (los dos van en la
+misma caja del diagrama). Además, todos los servicios llaman a `exigirCuentaActiva` de `auth`, dos módulos
 reutilizan la sanitización de `evidencia`, y los esquemas Zod se importan libremente entre módulos
 como contratos compartidos. El detalle de tablas por contexto está en `21` y el de la capa AI en
 `22`.
@@ -852,8 +856,12 @@ con su pasaje o, si el derecho de uso se retiró después, solo el título y el 
 - **Ruta manual (SYS-21)**: los curadores (lead y diseñador) escriben una revisión desde el
   formulario de la etapa 4 (lente, síntesis, hasta 6 hallazgos con hasta 4 citas cada uno, hasta 6
   preguntas) por la **misma función** que usa la aceptación y validada con el **mismo contrato**
-  que gobierna al modelo, y la borran mientras el concepto siga candidato; los topes viven una vez
-  en `ai.schemas` porque los lee también el navegador. Cambiar la lente o el concepto reinicia el
+  que gobierna al modelo **más una restricción propia**: en esta ruta cada hallazgo cita **un solo
+  pasaje por documento** (`EscribirRevisionAManoSchema` rechaza dos citas con el mismo
+  `evidenciaId`), porque el enlace materializado tiene clave por documento y una revisión a mano no
+  tiene contenido inmutable donde conservar el segundo pasaje; el contrato del proveedor sí admite
+  dos pasajes distintos del mismo documento. La borran mientras el concepto siga candidato; los
+  topes viven una vez en `ai.schemas` porque los lee también el navegador. Cambiar la lente o el concepto reinicia el
   cuerpo: una revisión es lo que una lente ve en un concepto.
 - Las cuatro tablas van al **archivo** de exportación y quedan **fuera del entregable**: un hallazgo
   de revisión AI no es un resultado del trabajo (ver `16`).

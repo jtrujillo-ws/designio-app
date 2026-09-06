@@ -9775,14 +9775,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       try {
         // Hasta que de verdad esté bloqueada en el candado: se lee de `pg_locks`, no de un
         // tiempo de espera, que es lo que haría intermitente a esta prueba.
+        /*
+         * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
+         *
+         * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es
+         * un número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la
+         * cuenta sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite
+         * entera después de que el INSERT de propuestas empezara a tomar la clave del reto:
+         * «expected 3 to be 1». La sonda medía la contención de la máquina, no la carrera.
+         *
+         * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid`
+         * la alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA
+         * expresión que toma el candado.
+         */
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
         for (let i = 0; i < 100; i++) {
-          const [espera] = await admin`select count(*)::int as n from pg_locks
-            where locktype = 'advisory' and not granted`;
-          if ((espera!.n as number) > 0) break;
+          if ((await esperandoLaClave()) > 0) break;
           await new Promise((r) => setTimeout(r, 25));
         }
-        const [bloqueada] = await admin`select count(*)::int as n from pg_locks
-          where locktype = 'advisory' and not granted`;
+        const bloqueada = { n: await esperandoLaClave() };
         expect(
           bloqueada!.n,
           'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
@@ -9872,14 +9891,33 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
       });
       try {
+        /*
+         * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
+         *
+         * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es
+         * un número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la
+         * cuenta sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite
+         * entera después de que el INSERT de propuestas empezara a tomar la clave del reto:
+         * «expected 3 to be 1». La sonda medía la contención de la máquina, no la carrera.
+         *
+         * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid`
+         * la alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA
+         * expresión que toma el candado.
+         */
+        const esperandoLaClave = async () => {
+          const [f] = await admin`select count(*)::int as n
+            from pg_locks l, (select hashtextextended(
+              'designio:reto:' || ${retoC}::text, 42) as k) c
+            where l.locktype = 'advisory' and not l.granted
+              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+          return f!.n as number;
+        };
         for (let i = 0; i < 100; i++) {
-          const [espera] = await admin`select count(*)::int as n from pg_locks
-            where locktype = 'advisory' and not granted`;
-          if ((espera!.n as number) > 0) break;
+          if ((await esperandoLaClave()) > 0) break;
           await new Promise((r) => setTimeout(r, 25));
         }
-        const [bloqueada] = await admin`select count(*)::int as n from pg_locks
-          where locktype = 'advisory' and not granted`;
+        const bloqueada = { n: await esperandoLaClave() };
         expect(
           bloqueada!.n,
           'la propuesta no llegó a esperar el candado del reto: nace sobre una foto',

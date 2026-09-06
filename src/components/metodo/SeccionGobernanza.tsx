@@ -833,7 +833,7 @@ function BloqueRevisionesSimuladas({
       <h3 style={{ font: '600 13px var(--font-sans)', margin: 0 }}>
         Revisiones simuladas de los conceptos
       </h3>
-      <p style={{ font: '400 11.5px var(--font-sans)', color: 'var(--texto-3)', margin: 0 }}>
+      <p style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-faint)', margin: 0 }}>
         No son evidencia y no cuentan en G4/G5 (SYS-20). Lo que sí entregan es qué ir a probar
         con personas reales.
       </p>
@@ -854,7 +854,7 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
   if (revisiones.length === 0) return null;
   return (
     <div style={{ display: 'grid', gap: 10, gridColumn: '1 / -1' }}>
-      <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--texto-2)' }}>
+      <span style={{ font: '600 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
         Revisiones simuladas aceptadas · {revisiones.length}
       </span>
       {revisiones.map((r) => (
@@ -864,13 +864,13 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
             display: 'grid',
             gap: 6,
             padding: 10,
-            border: '1px solid var(--linea)',
+            border: '1px solid var(--border)',
             borderRadius: 6,
           }}
         >
           <header style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
             <strong style={{ font: '600 12.5px var(--font-sans)' }}>{r.arquetipoNombre}</strong>
-            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
+            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
               {r.arquetipoEstado}
             </span>
             {/*
@@ -893,7 +893,7 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
             >
               simulación
             </span>
-            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--texto-3)' }}>
+            <span style={{ font: '400 11px var(--font-sans)', color: 'var(--text-faint)' }}>
               {r.propuestaAiId === null ? 'escrita a mano' : 'propuesta por AI'}
             </span>
           </header>
@@ -903,7 +903,7 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
               <li key={h.id} style={{ font: '400 12px var(--font-sans)' }}>
                 <strong style={{ fontWeight: 600 }}>{h.titulo}</strong>
                 {h.esHipotesis && (
-                  <span style={{ color: 'var(--texto-3)' }}> · hipótesis, no observado</span>
+                  <span style={{ color: 'var(--text-faint)' }}> · hipótesis, no observado</span>
                 )}
                 <br />
                 {h.descripcion}
@@ -911,7 +911,7 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
                   // El PASAJE, no solo el documento: quien firma el pasa/muere tiene que poder
                   // ver qué dijo alguien, no solo dónde. Cuando la revisión se escribió a mano
                   // no hay fragmento que enseñar y queda el título, que es todo lo que existe.
-                  <span key={j} style={{ display: 'block', color: 'var(--texto-3)' }}>
+                  <span key={j} style={{ display: 'block', color: 'var(--text-faint)' }}>
                     {!c.citable
                       ? `· se apoyaba en ${c.evidenciaTitulo} · su permiso de cita ya no está, así que el pasaje no se muestra`
                       : c.fragmento === null
@@ -928,7 +928,7 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
           </ul>
           {r.preguntas.length > 0 && (
             <div style={{ display: 'grid', gap: 3 }}>
-              <span style={{ font: '600 11px var(--font-sans)', color: 'var(--texto-2)' }}>
+              <span style={{ font: '600 11px var(--font-sans)', color: 'var(--text-muted)' }}>
                 Qué ir a probar con personas
               </span>
               <ul style={{ display: 'grid', gap: 3, margin: 0, paddingLeft: 16 }}>
@@ -942,10 +942,10 @@ function RevisionesDelConcepto({ revisiones }: { revisiones: RevisionSimuladaDeC
                     <li key={q.id} style={{ font: '400 12px var(--font-sans)' }}>
                       {q.pregunta}
                       {q.escenario !== '' && (
-                        <span style={{ color: 'var(--texto-3)' }}> · {q.escenario}</span>
+                        <span style={{ color: 'var(--text-faint)' }}> · {q.escenario}</span>
                       )}
                       {nace !== undefined && (
-                        <span style={{ color: 'var(--texto-3)' }}> · nace de «{nace.titulo}»</span>
+                        <span style={{ color: 'var(--text-faint)' }}> · nace de «{nace.titulo}»</span>
                       )}
                     </li>
                   );

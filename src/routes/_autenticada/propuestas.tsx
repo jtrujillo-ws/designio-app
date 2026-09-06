@@ -1675,7 +1675,7 @@ function FichaInsight({
             flexDirection: 'column',
             gap: 2,
             paddingTop: 8,
-            borderTop: '1px solid var(--border-faint)',
+            borderTop: '1px solid var(--border)',
           }}
         >
           <Dato
@@ -1694,7 +1694,7 @@ function FichaInsight({
         </div>
       ))}
       {contenido.contradicciones.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, borderTop: '1px solid var(--border-faint)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
           {contenido.contradicciones.map((c, i) => (
             <Dato
               key={String(i)}
@@ -1941,7 +1941,7 @@ function FichaAsistenteGate({ contenido }: { contenido: ContenidoAsistenteGate }
               flexDirection: 'column',
               gap: 2,
               paddingTop: 8,
-              borderTop: '1px solid var(--border-faint)',
+              borderTop: '1px solid var(--border)',
             }}
           >
             <Dato rotulo={`Falta ${i + 1}`} valor={h.queFalta} />
@@ -1995,7 +1995,7 @@ function FichaRemediacionJourney({
               flexDirection: 'column',
               gap: 2,
               paddingTop: 8,
-              borderTop: '1px solid var(--border-faint)',
+              borderTop: '1px solid var(--border)',
             }}
           >
             {/*
@@ -2392,7 +2392,7 @@ function FichaPostMortem({
             flexDirection: 'column',
             gap: 6,
             paddingTop: 8,
-            borderTop: '1px solid var(--border-faint)',
+            borderTop: '1px solid var(--border)',
           }}
         >
           <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
@@ -2446,7 +2446,7 @@ function FichaOportunidad({
             flexDirection: 'column',
             gap: 2,
             paddingTop: 8,
-            borderTop: '1px solid var(--border-faint)',
+            borderTop: '1px solid var(--border)',
           }}
         >
           <Dato

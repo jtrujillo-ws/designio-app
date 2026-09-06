@@ -49,6 +49,13 @@ import {
   materialDePostMortem,
   promptPostMortem,
   type ExpedienteDePostMortem,
+  materialDeRevision,
+  promptRevision,
+  tramoDeEvidenciaEnRevision,
+  evidenciaQueLlegoAlRevisor,
+  SISTEMA_REVISION,
+  type ArquetipoQueRevisa,
+  type ConceptoARevisar,
   materialDeRegistry,
   materialDeUnCriterio,
   promptRegistry,
@@ -568,6 +575,29 @@ function expedienteDeLaFila(f: Record<string, unknown>): ExpedienteDePostMortem 
   };
 }
 
+/**
+ * El material de C4 recompuesto desde las columnas que proyectó su ancla: el concepto y TODOS
+ * los arquetipos del reto con su evidencia.
+ *
+ * Hermano de `expedienteDeLaFila`, y existe por lo mismo: el render del material y su huella
+ * salen de UNA construcción y no de dos copias del mismo objeto literal.
+ *
+ * TODOS los arquetipos y no solo el de esta propuesta, aunque cada fila del panel sea UNA
+ * sesión. Lo intenté al revés y era un error de los que se ven tarde: el material que se le
+ * mandó al modelo llevaba las lentes enteras —un lote es una llamada—, así que recomponer solo
+ * una da un texto que nadie mandó, la huella no cuadra nunca y toda propuesta de C4 nace
+ * marcada como «material movido». La fila es una sesión; el material es del lote.
+ */
+function revisionDeLaFila(f: Record<string, unknown>): ConceptoARevisar {
+  const arquetipos = (f.concepto_arquetipos as ArquetipoQueRevisa[] | null) ?? [];
+  return {
+    titulo: (f.concepto_titulo as string | null) ?? '',
+    descripcion: (f.concepto_descripcion as string | null) ?? '',
+    umbralTest: (f.concepto_umbral as string | null) ?? '',
+    arquetipos: arquetipos.map((a) => ({ ...a, evidencia: a.evidencia ?? [] })),
+  };
+}
+
 const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
   item_id: {
     join: (tx) => tx`left join item_importacion i
@@ -681,6 +711,47 @@ const ANCLA_EN_EL_PANEL: Record<AnclaCapacidad['columna'], AnclaEnElPanel> = {
                 order by c.kpi, c.id), '[]'::json)
        from criterio_exito c
        where c.reto_id = rr.id and c.workspace_id = rr.workspace_id) as registry_criterios`,
+  },
+  concepto_id: {
+    /*
+     * DOS joins: el concepto y su RETO. El reto no es adorno —de él salen los arquetipos, que
+     * son la otra mitad del material— y además es lo que hace legible el título: un uuid de
+     * concepto no le dice nada a quien revisa, y su título solo es único DENTRO del reto.
+     */
+    join: (tx) => tx`left join concepto cpt
+        on cpt.id = p.concepto_id and cpt.workspace_id = p.workspace_id
+      left join reto rcp on rcp.id = cpt.reto_id and rcp.workspace_id = cpt.workspace_id`,
+    titulo: (tx) => tx`rcp.codigo || ' · ' || cpt.titulo`,
+    /*
+     * El repertorio COMPLETO de la fila: el concepto con su estado —que es su puerta, porque
+     * uno decidido ya no admite revisión nueva—, el reto que lo sitúa, y LOS ARQUETIPOS del
+     * reto con la evidencia que los sostiene, que es el material contra el que se mide la
+     * presencia literal de cada cita.
+     *
+     * Los arquetipos salen con `estado` incluido y no solo con nombre y definición: el
+     * material lo enseña porque no es lo mismo revisar desde una hipótesis que desde un perfil
+     * confirmado, y quien lee el panel tiene que ver lo mismo que vio el modelo.
+     *
+     * Y la evidencia va DENTRO de cada arquetipo y no en una lista aparte: es lo que hace que
+     * el material de una sesión sea el de SU lente. Aplanarla aquí obligaría a recomponer la
+     * pertenencia en el render, que es donde se pierde.
+     */
+    columnas: (tx) => tx`cpt.estado as concepto_estado, cpt.titulo as concepto_titulo,
+      cpt.descripcion as concepto_descripcion, cpt.umbral_test as concepto_umbral,
+      rcp.codigo as concepto_reto_codigo, rcp.estado as concepto_reto_estado,
+      (select coalesce(json_agg(json_build_object(
+                'id', a.id, 'nombre', a.nombre, 'definicion', a.definicion, 'estado', a.estado,
+                'evidencia', (
+                  select coalesce(json_agg(json_build_object(
+                            'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen)
+                            order by e.titulo, e.id), '[]'::json)
+                  from arquetipo_evidencia ae
+                  join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+                  where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+                    and evidencia_usable(e.id, e.workspace_id, 'cliente')))
+                order by a.nombre, a.id), '[]'::json)
+       from arquetipo a
+       where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id) as concepto_arquetipos`,
   },
   outcome_review_id: {
     // DOS joins, como el registry: el post mortem y su RETO. El reto no es adorno — el
@@ -1594,6 +1665,81 @@ const CAPACIDAD_EN_EL_PANEL: Record<CapacidadActiva, CapacidadEnElPanel> = {
               and p.capacidad = 'C3' and p.estado = 'propuesta')
           and (${patron}::text is null or r.codigo || ' ' || r.titulo ilike ${patron})
         order by r.codigo asc, r.id asc
+        limit ${limite}`;
+      return {
+        lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),
+        hayMas: false,
+      };
+    },
+  },
+  C4: {
+    /*
+     * Lo que deja obsoleta una revisión simulada es que el concepto se DECIDA. Una revisión
+     * existe para dar preguntas al test que decide el pasa/muere; materializarla después del
+     * veredicto añade al expediente una lectura que parece haber informado la decisión y llegó
+     * tarde. La política de inserción de `revision_simulada` pide `estado = 'candidato'`, así
+     * que esto no es una regla de pantalla: es lo que la base va a decir de todas formas,
+     * anticipado para que la tarjeta lo explique en vez de dejar que aceptar falle con un 23514.
+     */
+    estado: (tx) => tx`case
+        when not exists (
+          select 1 from concepto c2
+          where c2.id = p.concepto_id and c2.workspace_id = p.workspace_id
+            and c2.estado = 'candidato')
+          then 'concepto-decidido'
+        else 'disponible'
+      end`,
+    material: (f) => materialDeRevision(revisionDeLaFila(f)).texto,
+    /*
+     * El TRAMO de una cita: el documento que nombra, no el material entero. Sin esto un
+     * fragmento del testimonio de al lado saldría PRESENTE, y quien revisa vería un verde
+     * prestado sobre la única señal contrastable que tiene.
+     */
+    pajarDeLaCita: (f, cita) => {
+      if (cita.alcanceId === undefined) return null;
+      return tramoDeEvidenciaEnRevision(revisionDeLaFila(f), cita.alcanceId);
+    },
+    materialVigente: (f) => materialDelPanelEsElDelModelo(f) === true,
+    /*
+     * Y la misma comparación leída como ESTADO. El material de C4 tiene TRES mitades que se
+     * mueven por trabajo normal —el concepto se reescribe mientras se explora, el arquetipo se
+     * confirma o se refuta en la etapa 2, y su evidencia crece—, y por eso el nombre del estado
+     * no menciona ninguna: las tres cambian lo que la sesión leyó y ninguna es más «la causa».
+     *
+     * `=== false` y no `!== true`, como sus hermanas: no saber no puede volverse una alarma que
+     * además culpa a quien no fue.
+     */
+    estadoDeLaFila: (f) => {
+      const comparable = materialDelPanelEsElDelModelo(f);
+      if (comparable === false) return 'material-de-revision-movido';
+      if (comparable === null) return 'material-no-comparable';
+      return null;
+    },
+    candidatas: async (tx, workspaceId, patron, limite) => {
+      const filas = await tx`
+        select cpt.id, rcp.codigo || ' · ' || cpt.titulo as titulo
+        from concepto cpt
+        join reto rcp on rcp.id = cpt.reto_id and rcp.workspace_id = cpt.workspace_id
+        where cpt.workspace_id = ${workspaceId}
+          and cpt.estado = 'candidato'
+          and reto_admite_conceptos(rcp.id, rcp.workspace_id)
+          /*
+           * Y con LENTES que puedan mirar. Un reto sin arquetipos, o con arquetipos sin
+           * evidencia citable enlazada, no da material: la llamada saldría cara y volvería con
+           * un perfil inventado hablando en primera persona, que es exactamente la avería que
+           * SYS-20 nombra. Es la misma puerta que C7 le pone a un post mortem sin expediente.
+           */
+          and exists (
+            select 1 from arquetipo a
+            join arquetipo_evidencia ae on ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+            join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+            where a.reto_id = rcp.id and a.workspace_id = rcp.workspace_id
+              and evidencia_usable(e.id, e.workspace_id, 'cliente'))
+          and not exists (select 1 from propuesta_ai p
+            where p.concepto_id = cpt.id and p.workspace_id = cpt.workspace_id
+              and p.capacidad = 'C4' and p.estado = 'propuesta')
+          and (${patron}::text is null or cpt.titulo ilike ${patron})
+        order by rcp.codigo asc, cpt.titulo asc, cpt.id asc
         limit ${limite}`;
       return {
         lista: filas.map((r) => ({ id: r.id as string, titulo: r.titulo as string })),

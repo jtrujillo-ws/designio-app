@@ -10,6 +10,7 @@ import {
 // Los topes de la HMW salen del contrato de `oportunidad`, no de aquí: escribirlos a mano es
 // cómo se separan, y con una pregunta más larga la propuesta pasaría este esquema para morir
 // en el CHECK de la tabla con la llamada ya pagada.
+import { TOPE_NARRATIVA } from '@/lib/medicion/medicion.schemas';
 import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import {
   CONFIANZA_PROPUESTA,
@@ -31,6 +32,20 @@ import {
  * validador está en el chunk, su marca está con él.
  */
 export const MARCA_CONTENIDO_SOLO_SERVIDOR = 'designio:contenido-ai-solo-servidor';
+
+/*
+ * Los dos topes de C7 que NO salen de ningún contrato de tabla, porque lo que acotan no se
+ * materializa: la lectura de una desviación y cuántas caben. Viven aquí por eso mismo — un
+ * tope de contenido cuyo destino existe se copia del destino (`TOPE_NARRATIVA`), y uno cuyo
+ * destino no existe se decide donde se usa, que es este fichero.
+ *
+ * El techo de la lista existe por lo que cuesta una respuesta sin él: la conciliación de un
+ * reto grande puede traer decenas de elementos, y un modelo que comente todos devuelve un
+ * informe que nadie lee y una factura que sí se nota. Cincuenta es más de lo que ninguna
+ * design version del piloto tiene, así que recorta sin quitar nada real.
+ */
+export const MAX_LECTURA_DESVIACION = 1000;
+export const MAX_DESVIACIONES_LEIDAS = 50;
 
 const CitasSchema = z
   .array(
@@ -367,7 +382,8 @@ export type ContenidoPropuesta =
   | ContenidoInsight
   | ContenidoRemediacionJourney
   | ContenidoEntradaKpi
-  | ContenidoOportunidad;
+  | ContenidoOportunidad
+  | ContenidoPostMortem;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -507,6 +523,87 @@ export const ContenidoOportunidadSchema = z
   .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
 export type ContenidoOportunidad = z.infer<typeof ContenidoOportunidadSchema>;
 
+/**
+ * C7 — el borrador del post mortem, escrito sobre datos deterministas (SPEC-08 §C7).
+ *
+ * ── LAS DISCREPANCIAS VIVEN AQUÍ, Y NO SON UN OBJETO NUEVO ──
+ *
+ * SPEC-08 pide «discrepancias propuestas» y «narrativa del outcome review». La primera lectura
+ * fue que la discrepancia era un objeto que la AI propondría —una constatación— y eso es justo
+ * lo que no puede hacer: una constatación es el testimonio de quien MIRÓ qué quedó
+ * funcionando, y el modelo no miró nada. Además llegan como ENTRADA («DV vs. constataciones»):
+ * ya están registradas cuando C7 corre.
+ *
+ * Así que las discrepancias son la lectura del modelo SOBRE el tablero, y viajan en el
+ * contenido como las remediaciones de C5: cada una nombra un elemento de cambio POR SU ID
+ * copiado del material, y el servicio comprueba que esté entre los que produjo la MISMA
+ * lectura de la conciliación con la que se armó el prompt. Una desviación sobre un elemento
+ * inexistente es una avería inventada, y de las caras: manda a alguien a revisar un release
+ * que estaba bien.
+ *
+ * ── LOS CUATRO CAMPOS QUE SE MATERIALIZAN, Y LOS DOS QUE NO ──
+ *
+ * Se proponen contribución, factores externos, hipótesis abiertas y aprendizajes. No se
+ * propone el VEREDICTO —`logrado / parcialmente-logrado / no-logrado / no-concluyente` es el
+ * dictamen, y RF-07.8 lo pone en manos de quien firma— ni la casilla del diseño experimental
+ * con su justificación: es la única que habilita lenguaje causal (SYS-24), y su justificación
+ * es la afirmación de un humano sobre el diseño de SU medición. Dejársela al modelo sería
+ * abrir la puerta trasera que esa invariante existe para cerrar, y encima con una firma que no
+ * es de nadie.
+ *
+ * ── LOS TOPES ──
+ *
+ * `TOPE_NARRATIVA` es el del formulario de la etapa 7, no uno propio: escribir aquí otro
+ * número es cómo los dos se separan, y con una narrativa de 9000 caracteres la propuesta
+ * pasaría este esquema para morir después con la llamada ya pagada. Misma lección que los
+ * cuatro topes de C6, que la aprendieron en una ronda de revisión.
+ */
+export const ContenidoPostMortemSchema = z
+  .object({
+    /*
+     * La contribución y los aprendizajes, obligatorios: son lo que un post mortem dice. Un
+     * borrador que llegara vacío en los dos es una llamada pagada que no contesta.
+     */
+    contribucion: z.string().trim().min(1).max(TOPE_NARRATIVA),
+    aprendizajes: z.string().trim().min(1).max(TOPE_NARRATIVA),
+    /*
+     * Los factores externos y las hipótesis abiertas PUEDEN venir vacíos, y eso es una
+     * respuesta: un reto donde no hubo nada externo que contar, o donde no quedó ninguna
+     * pregunta abierta, existe. Obligarlos sería pedirle al modelo que rellene, que es
+     * exactamente cómo se fabrica una narrativa que no se sostiene.
+     */
+    factoresExternos: z.string().trim().max(TOPE_NARRATIVA),
+    hipotesisAbiertas: z.string().trim().max(TOPE_NARRATIVA),
+    desviaciones: z
+      .array(
+        z.object({
+          /* El elemento de cambio, por su id copiado del tablero de conciliación. */
+          elementoId: z.string().uuid(),
+          /* Qué dice el modelo sobre él: la discrepancia leída, no la constatación. */
+          lectura: z.string().trim().min(1).max(MAX_LECTURA_DESVIACION),
+        }),
+      )
+      /*
+       * Puede venir VACÍA, al revés que las remediaciones de C5. Un reto cuyos elementos
+       * salieron todos «como aprobado» es un resultado legítimo y además el bueno, y C7 se
+       * ofrece sobre cualquier post mortem en borrador —no solo sobre los que tienen
+       * desviaciones—, así que la lista vacía sí describe un caso real.
+       */
+      .max(MAX_DESVIACIONES_LEIDAS),
+    /*
+     * Y las citas, SIN `alcanceId`: el material de C7 es UN documento —el expediente del post
+     * mortem, con el tablero de conciliación y las lecturas por criterio dentro—, así que la
+     * presencia literal se mide contra él entero y no hay documento vecino del que un
+     * fragmento pueda salir prestado. Es la forma de C0 y CI, no la de C2/C3/C6, y la
+     * diferencia no es de estilo: allí el material son VARIOS documentos y por eso cada cita
+     * tiene que decir de cuál sale.
+     */
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
+
 export const ESQUEMA_DE_CONTENIDO: Record<
   CapacidadActiva,
   z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>
@@ -518,6 +615,7 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   C5: ContenidoRemediacionJourneySchema,
   C6: ContenidoEntradaKpiSchema,
   C3: ContenidoOportunidadSchema,
+  C7: ContenidoPostMortemSchema,
 };
 
 /**
@@ -597,6 +695,8 @@ export const CITAS_DEL_CONTENIDO: Record<
    */
   C3: (c) =>
     (c as ContenidoOportunidad).citas.map((x) => ({ ...x, alcanceId: x.insightId })),
+  /* C7 cita contra un solo documento —el expediente del post mortem—, así que sin alcance. */
+  C7: (c) => (c as ContenidoPostMortem).citas,
 };
 
 /**
@@ -645,6 +745,19 @@ export const TESTIMONIO_ADICIONAL: Record<
   // C5 no guarda nada aparte de sus citas: sus remediaciones son el consejo, y ése SÍ se
   // corrige —para eso está la revisión humana—.
   C5: null,
+  /*
+   * C7 tampoco, y por el mismo argumento que C5, que es su pariente: las desviaciones son la
+   * LECTURA del modelo sobre el tablero, y una lectura es exactamente lo que quien revisa está
+   * para revisar. Lo contrastable —que el elemento exista en la conciliación de ESTE reto— no
+   * se protege dejándolo intocable, se protege comprobándolo antes de que la propuesta nazca,
+   * que es donde el servicio lo hace.
+   *
+   * La diferencia con el `criterioId` de C6, que sí es testimonio: allí el id ES el destino —
+   * dice a qué criterio responde el KPI que se va a materializar— y cambiarlo cambia el objeto
+   * que nace. Aquí no se materializa nada: las desviaciones se quedan en el contenido, que es
+   * inmutable por SYS-17 en su versión original.
+   */
+  C7: null,
   C6: {
     parte: (c) => (c as ContenidoEntradaKpi).criterioId,
     /*

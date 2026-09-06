@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
+import { TOPE_NARRATIVA } from '@/lib/medicion/medicion.schemas';
 import { Wordmark } from '@/components/ui/Wordmark';
 /*
  * Los topes de los campos de una entrada KPI, de donde salen también los de los dos esquemas
@@ -42,6 +43,7 @@ import {
   type ContenidoCriterio,
   type ContenidoEntradaKpi,
   type ContenidoOportunidad,
+  type ContenidoPostMortem,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -154,6 +156,15 @@ const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
   'evidencia-no-citable': false,
   'alcance-incompleto': false,
   'journey-cambiado': false,
+  /*
+   * Un post mortem CERRADO no admite corrección: no hay dónde escribir la narrativa, se
+   * corrija o no. Un tablero MOVIDO sí la admite, y es de los pocos casos en los que corregir
+   * es lo razonable: quien revisa tiene el tablero nuevo delante en la pantalla de la etapa 7,
+   * así que puede ajustar la narrativa a lo que hoy dice — y su firma queda como corrección
+   * humana, que es exactamente lo que la métrica de corrección mide.
+   */
+  'post-mortem-cerrado': false,
+  'conciliacion-cambiada': true,
   'ancla-ausente': false,
 };
 
@@ -187,6 +198,10 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto sabe cosas que esta propuesta no llegó a ver —evidencia enlazada o insights validados después de generarla, o que no cabían en el material que se le mandó al modelo—. Aceptarla sellaría un trabajo que no las miró, así que por ahora solo puede rechazarse. Vuelve a pedirla para que las tenga en cuenta.',
   'journey-cambiado':
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
+  'post-mortem-cerrado':
+    'Ese post mortem ya se completó: lleva su veredicto firmado con nombre y fecha, y su narrativa no se reescribe. Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'conciliacion-cambiada':
+    'La conciliación de ese reto cambió desde que el modelo la leyó: se constató un elemento, o se registró la lectura de un criterio. Este borrador puede estar contando una desviación que ya se resolvió, o callando una que apareció después — corrígelo contra el tablero de hoy, o recházalo y pide otro.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
   'criterios-cambiados':
@@ -1112,6 +1127,18 @@ const PRESENTACION_POR_CAPACIDAD: Record<
     // C6 SÍ materializa —nace una entrada del registry— así que no tiene nada que decir aquí.
     sinAccion: null,
   },
+  C7: {
+    rotulo: 'Borrador del post mortem',
+    ficha: (c, etiquetas) => (
+      <FichaPostMortem contenido={c as ContenidoPostMortem} etiquetas={etiquetas} />
+    ),
+    /*
+     * C7 SÍ materializa —aceptar escribe la narrativa en el post mortem que ya estaba abierto—
+     * así que no dice nada aquí. Que no CREE una fila no la hace informativa: lo informativo
+     * es no escribir en ningún sitio, y ésta escribe cuatro columnas.
+     */
+    sinAccion: null,
+  },
   C3: {
     rotulo: 'Oportunidad HMW propuesta',
     ficha: (c, etiquetas) => (
@@ -1230,6 +1257,29 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioCriterio
         inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'outcome-review': {
+    /*
+     * Corregir un borrador de post mortem es LO NORMAL, no la excepción: para eso es un
+     * borrador. Los cuatro campos narrativos se reescriben enteros —es prosa, y prosa que una
+     * persona va a firmar—, así que no hay bloqueo propio que poner.
+     *
+     * Lo que NO aparece en el formulario, y por eso lo dice el comentario: las desviaciones y
+     * las citas. Las citas son testimonio del modelo y las gobierna `CITAS_DEL_CONTENIDO`; las
+     * desviaciones no se editan porque nombran elementos que el servicio ya comprobó contra el
+     * material —dejarlas editables permitiría apuntar a otro elemento después de la
+     * comprobación, y lo que quedaría archivado sería una lectura sobre algo que el modelo no
+     * miró—. Se corrige la narrativa, que es lo que se materializa.
+     */
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioPostMortem
+        inicial={inicial as ContenidoPostMortem}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -2123,6 +2173,77 @@ function citasPorInsight(citas: ContenidoOportunidad['citas']) {
  * insight, no en una lista aparte, porque en C3 la cita ES la traza — separarlas sugeriría que
  * son dos cosas que pueden discrepar.
  */
+/**
+ * La ficha de C7: los cuatro campos que se van a escribir, y las desviaciones que el modelo
+ * leyó del tablero.
+ *
+ * Las desviaciones van SEPARADAS de la narrativa y con su elemento nombrado, no dentro del
+ * texto: son lo contrastable de esta salida —cada una señala un elemento que estaba en el
+ * material— y quien revisa tiene que poder ir a mirarlo. Metidas en la prosa, comprobar una
+ * exigiría leerla entera buscando a cuál se refiere.
+ *
+ * Y se dice lo que NO se propone. Sin eso, quien acepta puede creer que el borrador trae el
+ * veredicto y que aceptarlo cierra el post mortem, que es justo lo contrario: el veredicto lo
+ * firma quien lo cierra, y esta pantalla no lo toca.
+ */
+function FichaPostMortem({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoPostMortem;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Contribución" valor={contenido.contribucion} />
+      {contenido.factoresExternos !== '' && (
+        <Dato rotulo="Factores externos" valor={contenido.factoresExternos} />
+      )}
+      {contenido.hipotesisAbiertas !== '' && (
+        <Dato rotulo="Hipótesis abiertas" valor={contenido.hipotesisAbiertas} />
+      )}
+      <Dato rotulo="Aprendizajes" valor={contenido.aprendizajes} />
+      {contenido.desviaciones.length > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-faint)',
+          }}
+        >
+          <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
+            Desviaciones leídas del tablero
+          </span>
+          {contenido.desviaciones.map((d: ContenidoPostMortem['desviaciones'][number]) => (
+            <Dato
+              key={d.elementoId}
+              /* El nombre del elemento si el panel lo trae; su id si no. Un uuid a secas no le
+               * dice nada a quien revisa, y esa traducción la hace `etiquetasDelContenido`. */
+              rotulo={etiquetas[d.elementoId] ?? d.elementoId}
+              valor={d.lectura}
+            />
+          ))}
+        </div>
+      )}
+      <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+        No se propone el veredicto ni la casilla de diseño experimental: los firma quien cierra
+        el post mortem (RF-07.8, SYS-24).
+      </span>
+    </div>
+  );
+}
+
 function FichaOportunidad({
   contenido,
   etiquetas,
@@ -2258,6 +2379,89 @@ function FormularioOportunidad({
           {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
         </Button>
         <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function FormularioPostMortem({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoPostMortem;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoPostMortem) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [contribucion, setContribucion] = useState(inicial.contribucion);
+  const [factoresExternos, setFactoresExternos] = useState(inicial.factoresExternos);
+  const [hipotesisAbiertas, setHipotesisAbiertas] = useState(inicial.hipotesisAbiertas);
+  const [aprendizajes, setAprendizajes] = useState(inicial.aprendizajes);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          contribucion,
+          factoresExternos,
+          hipotesisAbiertas,
+          aprendizajes,
+          /* Intactas: son testimonio del modelo o ya están comprobadas contra el material. */
+          desviaciones: inicial.desviaciones,
+          citas: inicial.citas,
+          confianzaPropuesta: inicial.confianzaPropuesta,
+        });
+      }}
+    >
+      <label style={campo}>
+        <span style={etiqueta}>Contribución</span>
+        <Textarea
+          rows={4}
+          maxLength={TOPE_NARRATIVA}
+          value={contribucion}
+          onChange={(e) => setContribucion(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Factores externos</span>
+        <Textarea
+          rows={3}
+          maxLength={TOPE_NARRATIVA}
+          value={factoresExternos}
+          onChange={(e) => setFactoresExternos(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Hipótesis abiertas</span>
+        <Textarea
+          rows={3}
+          maxLength={TOPE_NARRATIVA}
+          value={hipotesisAbiertas}
+          onChange={(e) => setHipotesisAbiertas(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Aprendizajes</span>
+        <Textarea
+          rows={4}
+          maxLength={TOPE_NARRATIVA}
+          value={aprendizajes}
+          onChange={(e) => setAprendizajes(e.target.value)}
+        />
+      </label>
+      {/* Las desviaciones y las citas van a la vista y sin editar en la ficha: son lo
+          contrastable de esta salida y no se corrigen. */}
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button size="sm" type="submit" disabled={ocupado}>
+          Corregir y aceptar
+        </Button>
+        <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCancelar}>
           Cancelar
         </Button>
       </div>

@@ -17,6 +17,7 @@ export type {
   ContenidoExtraccion,
   ContenidoInsight,
   ContenidoOportunidad,
+  ContenidoPostMortem,
   ContenidoPropuesta,
   ContenidoRemediacionJourney,
 } from './ai.contenido';
@@ -78,7 +79,7 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6', 'C3'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6', 'C3', 'C7'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
 export const DestinoSchema = z.enum([
@@ -87,6 +88,13 @@ export const DestinoSchema = z.enum([
   'insight',
   'entrada-kpi',
   'oportunidad',
+  /*
+   * El séptimo, y el primero que NO crea una fila: aceptar una propuesta de C7 escribe los
+   * cuatro campos narrativos del post mortem que ya existe. El ancla y el objeto son la misma
+   * fila, así que no hay columna de objeto materializado que le corresponda — ver la migración
+   * de C7, que lo explica donde se comprueba.
+   */
+  'outcome-review',
 ]);
 export type Destino = z.infer<typeof DestinoSchema>;
 
@@ -188,7 +196,7 @@ export const MAX_REMEDIACIONES = 20;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id' | 'registry_id';
+  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id' | 'registry_id' | 'outcome_review_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -317,6 +325,7 @@ const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   gate_id: true,
   journey_id: true,
   registry_id: true,
+  outcome_review_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -327,13 +336,32 @@ export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad[
  */
 export const COLUMNA_DE_DESTINO: Record<
   Destino,
-  'evidencia_id' | 'criterio_id' | 'insight_id' | 'entrada_kpi_id' | 'oportunidad_id'
+  | 'evidencia_id'
+  | 'criterio_id'
+  | 'insight_id'
+  | 'entrada_kpi_id'
+  | 'oportunidad_id'
+  | 'outcome_review_id'
 > = {
   evidencia: 'evidencia_id',
   'criterio-exito': 'criterio_id',
   insight: 'insight_id',
   'entrada-kpi': 'entrada_kpi_id',
   oportunidad: 'oportunidad_id',
+  /*
+   * La MISMA columna que su ancla, y es la única que se repite entre los dos mapas. No es un
+   * atajo: el objeto que C7 materializa es el post mortem que ya era su ancla, así que la
+   * respuesta a «dónde está el id del objeto» y a «dónde está el id del ancla» es la misma
+   * casilla. Inventar `outcome_review_materializado_id` habría creado una columna cuyo único
+   * contenido posible es una copia de la de al lado, y dos columnas que tienen que coincidir
+   * acaban no coincidiendo.
+   *
+   * Lo que eso obliga a decir en la base está dicho allí: «aceptada ⇔ hay objeto» habla de
+   * objetos que NACEN al aceptar, y el de C7 existe desde antes — lo que para las otras
+   * garantiza esa restricción, para C7 lo garantizan la procedencia y la proyección del guard
+   * diferido.
+   */
+  'outcome-review': 'outcome_review_id',
 };
 
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
@@ -556,6 +584,53 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     exigeConsentimiento: false,
     esSimulacion: false,
   },
+  C7: {
+    etiqueta: 'Conciliación del reto → borrador del post mortem',
+    destino: 'outcome-review',
+    /*
+     * EL POST MORTEM EN BORRADOR, y no el reto, por lo mismo que C6 se ancla en el registry: la
+     * fila tiene que existir para que haya dónde materializar, y la política que la crea es la
+     * que sabe CUÁNDO hay algo que redactar —«el outcome review se habilita al cerrar la
+     * ventana del último criterio» (RF-07.7)—. Anclando en el reto, C7 se ofrecería sobre
+     * retos que todavía están midiendo y no tendría dónde escribir.
+     *
+     * Y con una diferencia respecto a las seis anteriores que vale la pena decir aquí, porque
+     * es lo que hace distinta a esta capacidad: aquí el ancla y el objeto materializado son la
+     * MISMA fila. Aceptar no crea nada; escribe los cuatro campos narrativos del post mortem
+     * que ya estaba abierto.
+     */
+    ancla: {
+      columna: 'outcome_review_id',
+      etiqueta: 'Post mortem en borrador',
+      enProsa: 'post mortem en borrador',
+      buscar: 'Buscar por código o título del reto…',
+      vacia:
+        'No hay post mortems en borrador. El outcome review se abre cuando cierra la ventana del último criterio del reto, y hasta entonces no hay nada que redactar.',
+      hayMas: (n) =>
+        `Hay más post mortems en borrador de los que caben aquí: se listan los ${n} primeros por ` +
+        'código de reto. Uno sale de la lista mientras su borrador espera revisión; para uno ' +
+        'concreto, búscalo por el código o el título de su reto.',
+      enCurso:
+        'Ese post mortem ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese post mortem ya tiene un borrador esperando revisión: decídelo antes de pedir otro',
+    },
+    /*
+     * SIN LOTE. Un post mortem es UN documento: sus cuatro campos se leen juntos —la
+     * contribución explica la lectura de los KPIs, los aprendizajes salen de las desviaciones—
+     * y aceptar media narrativa no describe ningún caso. Misma forma que C5 y CT, y por la
+     * misma razón que ellas: no hay revisión por elemento que proteger.
+     */
+    lote: null,
+    /*
+     * El material son el TABLERO DE CONCILIACIÓN del reto y las lecturas por criterio. Filas
+     * del método, no material de personas — eso entra por `item_importacion`, que es otra
+     * ancla, y el registro lo sujeta por el otro lado: quien exige consentimiento tiene que
+     * anclar en `item_id`.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+  },
   C3: {
     etiqueta: 'Oportunidades del reto → pregunta HMW trazada a insights',
     destino: 'oportunidad',
@@ -715,6 +790,11 @@ export const ESTADOS_ANCLA = [
   'portafolio-cerrado',
   'insight-no-validado',
   'material-no-comparable',
+  /* Los dos de C7: el post mortem que ya se completó —lleva veredicto firmado y su narrativa
+   * no se reescribe— y el tablero que se movió mientras el borrador esperaba, que en la etapa
+   * 7 es trabajo perfectamente normal: constatar elementos y registrar lecturas ES la etapa. */
+  'post-mortem-cerrado',
+  'conciliacion-cambiada',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

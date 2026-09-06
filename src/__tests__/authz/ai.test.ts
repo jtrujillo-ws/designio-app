@@ -26,6 +26,7 @@ import {
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoOportunidad,
+  type ContenidoPostMortem,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
@@ -236,6 +237,25 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     } satisfies ContenidoRemediacionJourney,
     /* Igual que CT y C2: se resuelve tarde porque el criterio se crea en el `beforeAll`, y su
      * id tiene que ser REAL — el guard exige que el criterio sea del reto del registry. */
+    /*
+     * C7 sin desviaciones por omisión, y eso es una respuesta y no un hueco: cada desviación
+     * tiene que señalar un elemento que estaba en la conciliación de SU reto —el servicio lo
+     * comprueba antes de guardar—, así que un fixture con un id inventado haría fallar toda
+     * propuesta de C7 que no lo pisara. Quien necesite desviaciones las compone con los ids
+     * del tablero de su reto.
+     *
+     * La lista vacía es además un caso legítimo del dominio: un reto cuyos elementos quedaron
+     * todos «como aprobado» no tiene desviaciones que contar.
+     */
+    C7: {
+      contribucion: 'La verificación diferida coincide con la caída del abandono en la ventana.',
+      factoresExternos: '',
+      hipotesisAbiertas: '',
+      aprendizajes: 'Lo aprobado sin release asignado no llega, por bueno que sea el diseño.',
+      desviaciones: [],
+      citas: [{ fragmento: 'LECTURA DE CADA CRITERIO', localizacion: 'cabecera del expediente' }],
+      confianzaPropuesta: 'media',
+    } satisfies ContenidoPostMortem,
     get C6() {
       return CONTENIDO_C6(criterioDelRegistryId);
     },
@@ -5441,14 +5461,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      // C1 y C7 hacen aquí el papel que hacían C3 y C4 antes de activarse: una capacidad del
-      // catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra —y
-      // el día que no quede ninguna inactiva, este caso se retira en vez de fingirse.
+      // C1 y C4 hacen aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad
+      // del catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra
+      // —y el día que no quede ninguna inactiva, este caso se retira en vez de fingirse. C7
+      // salió de aquí al activarse, y su relevo fue C4, que es como esta rotación se hace.
       expect(await motivoDe('C1', { reto_id: retoId })).toBeNull();
       expect(await motivoDe('C1', { item_id: item })).toBeNull();
       expect(await motivoDe('C4', {})).toBeNull();
       // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
-      expect(await motivoDe('C7', { gate_id: gateId })).toBeNull();
+      expect(await motivoDe('C4', { gate_id: gateId })).toBeNull();
 
       // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
       // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
@@ -5465,6 +5486,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
       expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
       expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
+      // C7 responde solo con los suyos. Sin ancla, la rama no encuentra post mortem y contesta
+      // «cerrado», que es la respuesta correcta para una fila que no señala ninguno.
+      const DE_C7 = ['disponible', 'post-mortem-cerrado'];
+      expect(DE_C7).toContain(await motivoDe('C7', {}));
       // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
       expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', { item_id: item }));
       // Ni el de CT uno de los otros dos: el ancla nueva entró por el mismo sitio por donde

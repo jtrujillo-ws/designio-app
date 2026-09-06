@@ -10685,6 +10685,96 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     });
   });
 
+
+  /**
+   * Y ESA LENTE SE PUEDE CORREGIR, que es la otra cara de admitir la mayúscula.
+   *
+   * Desde que el id no canónico se puede GUARDAR —los guards comparan con `lower()`— una
+   * corrección de sólo textos se volvía imposible: la corrección se parsea, el contrato la baja
+   * a minúscula, y las dos comprobaciones de testimonio leían la normalización como un intento
+   * de cambiar la lente. La propuesta sólo se podía aceptar tal cual o rechazar. Medido antes de
+   * tocar nada, y responde primero la capa del CONTRATO:
+   *
+   *   CORRECCION RECHAZADA: De una revisión simulada no se corrigen ni el arquetipo que la
+   *   firma ni la marca de hipótesis de sus hallazgos…
+   *
+   * El arreglo no es una excepción: es la pregunta correcta. Ese guard compara tres cosas, y las
+   * otras dos —las citas y las marcas— son texto y booleanos, donde la igualdad byte a byte SÍ
+   * es lo que se pregunta. Un IDENTIFICADOR no: «¿es la misma lente?» se contesta canónicamente.
+   *
+   * Y la sonda mide la otra mitad, porque si no esto sería debilitar el guard: cambiar la lente
+   * DE VERDAD sigue rechazándose.
+   */
+  it('C4 corrige los textos de una propuesta cuya lente se guardó en mayúscula, y no la lente', async () => {
+    await enWorkspaceLimpio('c4-mayuscula-correccion', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const { conceptoId, lenteA, lenteB, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
+      const contenido = {
+        arquetipoId: lenteA,
+        sintesis: 'Una lectura de este perfil.',
+        hallazgos: [
+          {
+            titulo: 'Pide saber para qué',
+            descripcion: 'No entrega el documento sin motivo.',
+            esHipotesis: false,
+            citas: [
+              { evidenciaId: evA, fragmento: 'No entrego la cédula', localizacion: 'resumen' },
+            ],
+          },
+        ],
+        preguntas: [{ pregunta: '¿Qué te haría entregarla?', escenario: '' }],
+        confianzaPropuesta: 'media' as const,
+      };
+      /*
+       * Por el camino REAL, para que la huella del material sea la de verdad —una propuesta
+       * insertada a mano no la tiene y la aceptación muere antes de llegar a lo que se mide—, y
+       * después se sube la CAJA del id con `sqlAdmin`: el contrato canoniza al parsear, así que
+       * un `arquetipoId` en mayúscula sólo puede llegar a la fila por fuera del servicio, que es
+       * exactamente la superficie de la que hablaba el hallazgo anterior.
+       */
+      await conProveedor(
+        { ok: true, datos: { revisiones: [contenido] }, intentos: [intento({ uso: null })] },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C4',
+            anclaId: conceptoId,
+          }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuestaId = panel.pendientes.find((x) => x.capacidad === 'C4')!.id;
+      await admin`update propuesta_ai
+          set contenido = jsonb_set(contenido, '{arquetipoId}', to_jsonb(upper(${lenteA}::text))),
+              contenido_original = jsonb_set(contenido_original, '{arquetipoId}',
+                                             to_jsonb(upper(${lenteA}::text)))
+        where id = ${propuestaId} and workspace_id = ${wsC}`;
+      const [guardado] = await admin`select contenido ->> 'arquetipoId' as id
+        from propuesta_ai where id = ${propuestaId}`;
+      expect(guardado!.id).toBe(lenteA.toUpperCase());
+
+      // Cambiar la LENTE de verdad sigue siendo fabricar una voz, esté en la caja que esté.
+      await expect(
+        aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId,
+          correccion: { ...contenido, arquetipoId: lenteB },
+        }),
+      ).rejects.toThrow(/arquetipo que la firma|no se corrige/i);
+
+      // Y corregir los TEXTOS entra, que es para lo que existe la corrección.
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId,
+        correccion: { ...contenido, sintesis: 'La misma lectura, con la síntesis pulida.' },
+      });
+      const [fila] = await admin`select arquetipo_id, sintesis from revision_simulada
+        where id = ${objetoId}`;
+      // Y la revisión materializada cuelga de la lente de verdad, no de un id en otra caja.
+      expect(fila!.arquetipo_id).toBe(lenteA);
+      expect(fila!.sintesis).toBe('La misma lectura, con la síntesis pulida.');
+    });
+  });
+
   /**
    * Y LA REVISIÓN A MANO RELEE SU ARQUETIPO BAJO EL CANDADO, que es la OTRA puerta.
    *

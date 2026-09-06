@@ -967,7 +967,18 @@ export const TESTIMONIO_ADICIONAL: Record<
   CT: null,
   C4: {
     parte: (c) => ({
-      arquetipoId: (c as ContenidoRevisionSimulada).arquetipoId,
+      /*
+       * CANÓNICO, porque lo que aquí se pregunta es «¿es la MISMA lente?» y la igualdad de un
+       * uuid no distingue caja. Los otros dos campos que este guard compara —las citas y las
+       * marcas de hipótesis— son texto y booleanos, donde la igualdad byte a byte SÍ es la
+       * pregunta; un identificador no.
+       *
+       * Sin esto, una propuesta cuyo `arquetipoId` se guardó en mayúscula por la superficie
+       * concedida sólo se podía aceptar tal cual o rechazar: la corrección se parsea, y el
+       * contrato la baja a minúscula, así que corregir una errata de la síntesis se leía como
+       * un intento de cambiar la lente. Medido antes de arreglarlo.
+       */
+      arquetipoId: (c as ContenidoRevisionSimulada).arquetipoId.toLowerCase(),
       hipotesis: (c as ContenidoRevisionSimulada).hallazgos.map((h) => h.esHipotesis),
     }),
     /*

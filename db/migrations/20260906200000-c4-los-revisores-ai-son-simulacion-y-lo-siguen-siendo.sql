@@ -1107,7 +1107,14 @@ begin
   then
     raise exception 'las citas de una revisión simulada no se corrigen, ni se reparten entre sus hallazgos: son el rastro de lo que el modelo dijo haber leído, y qué documento sostiene cuál lectura es lo único contrastable que hay aquí';
   end if;
-  if new.contenido -> 'arquetipoId' is distinct from new.contenido_original -> 'arquetipoId' then
+  -- Y el identificador, CANÓNICO en los dos lados. Las citas y las marcas de hipótesis se
+  -- comparan byte a byte porque son texto y booleanos —ahí la igualdad exacta es la pregunta—,
+  -- pero un uuid no: lo que esto pregunta es si sigue siendo LA MISMA lente. Sin `lower()`, una
+  -- propuesta guardada con el id en mayúscula no se podía corregir en absoluto, porque el
+  -- contrato canoniza al parsear la corrección y este guard leía la normalización como un
+  -- cambio de lente.
+  if lower(new.contenido ->> 'arquetipoId')
+     is distinct from lower(new.contenido_original ->> 'arquetipoId') then
     raise exception 'el arquetipo que la firma no se corrige: la lente dice desde qué perfil se hizo la lectura, y cambiarla conservando las frases es fabricar una voz (SYS-20)';
   end if;
   if jsonb_path_query_array(new.contenido, '$.hallazgos[*].esHipotesis')

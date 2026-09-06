@@ -44,6 +44,7 @@ import {
   type ContenidoEntradaKpi,
   type ContenidoOportunidad,
   type ContenidoPostMortem,
+  type ContenidoRevisionSimulada,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -174,6 +175,14 @@ const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
    */
   'post-mortem-cerrado': false,
   'conciliacion-cambiada': false,
+  /*
+   * Los dos de C4, y los dos `false` por el mismo motivo que sus hermanos: lo que falta no es
+   * texto de la propuesta. Un concepto ya decidido no admite revisión nueva —la base lo exige
+   * con `estado = 'candidato'` en la política de inserción—, y corregir la síntesis no devuelve
+   * el material a lo que las lentes leyeron.
+   */
+  'concepto-decidido': false,
+  'material-de-revision-movido': false,
   'ancla-ausente': false,
 };
 
@@ -209,8 +218,19 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
   'post-mortem-cerrado':
     'Ese post mortem ya se completó: lleva su veredicto firmado con nombre y fecha, y su narrativa no se reescribe. Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  /*
+   * El texto decía «corrígelo contra el tablero de hoy, o recházalo». La primera mitad dejó de
+   * ser cierta cuando este estado pasó a `false` en la tabla de arriba: la aceptación compara
+   * la huella guardada con el expediente de hoy SIEMPRE, corrija quien corrija, así que el
+   * envío que ese texto invitaba a hacer terminaba rechazado por obsoleto. Un mensaje que
+   * ofrece un camino cerrado es peor que uno que no ofrece ninguno.
+   */
   'conciliacion-cambiada':
-    'La conciliación de ese reto cambió desde que el modelo la leyó: se constató un elemento, o se registró la lectura de un criterio. Este borrador puede estar contando una desviación que ya se resolvió, o callando una que apareció después — corrígelo contra el tablero de hoy, o recházalo y pide otro.',
+    'La conciliación de ese reto cambió desde que el modelo la leyó: se constató un elemento, o se registró la lectura de un criterio. Este borrador puede estar contando una desviación que ya se resolvió, o callando una que apareció después, así que solo puede rechazarse. Pide otro y se escribirá sobre el tablero de hoy.',
+  'concepto-decidido':
+    'Ese concepto ya está decidido: pasó o murió, con su razón registrada. Una revisión simulada existe para dar preguntas al test que decide ese pasa/muere, así que aceptarla ahora solo añadiría al expediente una lectura que llegó tarde. Solo puede rechazarse.',
+  'material-de-revision-movido':
+    'El material de esa revisión cambió desde que las lentes lo leyeron: se reescribió el concepto, un arquetipo se confirmó o se refutó, o le enlazaron evidencia nueva. Estas sesiones se hicieron sobre otra cosa, así que solo pueden rechazarse. Pide otras y se harán sobre lo que hay hoy.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
   'criterios-cambiados':
@@ -1136,6 +1156,17 @@ const PRESENTACION_POR_CAPACIDAD: Record<
     // C6 SÍ materializa —nace una entrada del registry— así que no tiene nada que decir aquí.
     sinAccion: null,
   },
+  C4: {
+    rotulo: 'Revisión simulada por arquetipo',
+    ficha: (c) => <FichaRevision contenido={c as ContenidoRevisionSimulada} />,
+    /*
+     * C4 SÍ materializa: aceptar crea la revisión, sus hallazgos, sus citas y sus preguntas de
+     * test. Lo que no hace —y es de lo que más importa que se lea en la tarjeta— es producir
+     * EVIDENCIA, y eso no cabe en `sinAccion`, que habla de capacidades informativas. Se dice
+     * donde se ve: en la ficha, con la etiqueta de simulación delante de todo.
+     */
+    sinAccion: null,
+  },
   C7: {
     rotulo: 'Borrador del post mortem',
     ficha: (c, etiquetas) => (
@@ -1266,6 +1297,29 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioCriterio
         inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'revision-simulada': {
+    /*
+     * Corregir una revisión simulada es normal —es una lectura, y revisar lecturas es para lo
+     * que está quien revisa—, así que no hay bloqueo propio.
+     *
+     * Lo que NO aparece en el formulario, y por eso lo dice el comentario: el arquetipo, la
+     * marca de hipótesis de cada hallazgo y las citas. Los tres son testimonio y los gobierna
+     * `TESTIMONIO_ADICIONAL` con `CITAS_DEL_CONTENIDO`: el arquetipo es la lente —cambiarlo
+     * convierte la sesión de un perfil en la de otro conservando sus frases—, y la marca de
+     * hipótesis es lo que separa lo que se apoya en evidencia de lo que se extrapoló, que es
+     * media SYS-20. Se corrigen los TEXTOS: la síntesis, el título y la descripción de cada
+     * hallazgo, y las preguntas.
+     */
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioRevision
+        inicial={inicial as ContenidoRevisionSimulada}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -2195,6 +2249,75 @@ function citasPorInsight(citas: ContenidoOportunidad['citas']) {
  * veredicto y que aceptarlo cierra el post mortem, que es justo lo contrario: el veredicto lo
  * firma quien lo cierra, y esta pantalla no lo toca.
  */
+/**
+ * La ficha de C4, y la etiqueta va DELANTE de todo.
+ *
+ * No es decoración: SYS-20 dice que las salidas de revisores AI quedan etiquetadas como
+ * simulación, y quien lee esta tarjeta tiene que saber qué está leyendo ANTES de leer la
+ * primera frase. Una etiqueta al pie llega tarde — para entonces ya ha leído a un usuario
+ * hablando en primera persona.
+ *
+ * Y cada hallazgo dice si es hipótesis. La marca es lo que separa lo que se apoya en un
+ * documento de lo que el modelo extrapoló, y esconderla en el detalle sería devolver por la
+ * pantalla la confusión que el contrato y la base cortan por su lado.
+ */
+function FichaRevision({ contenido }: { contenido: ContenidoRevisionSimulada }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <span
+        style={{
+          font: '600 11px var(--font-mono)',
+          letterSpacing: '0.04em',
+          color: 'var(--text-muted)',
+          textTransform: 'uppercase',
+        }}
+      >
+        Simulación AI · no es evidencia y no cuenta para G4/G5
+      </span>
+      <Dato rotulo="Lectura del arquetipo" valor={contenido.sintesis} />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 8 }}>
+        <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
+          Hallazgos
+        </span>
+        {contenido.hallazgos.map((h, i) => (
+          <Dato
+            /* El índice ES la identidad aquí: `hallazgo_simulado` tiene único
+             * `(revision_id, orden)` y el orden es parte del objeto que se materializa. */
+            key={i}
+            rotulo={h.esHipotesis ? `${h.titulo} · hipótesis` : h.titulo}
+            valor={h.descripcion}
+          />
+        ))}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 8 }}>
+        <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
+          Preguntas para el test con personas reales
+        </span>
+        {contenido.preguntas.map((q, i) => (
+          <Dato
+            key={i}
+            rotulo={
+              q.hallazgoIndice === undefined
+                ? 'Pregunta'
+                : `Nace del hallazgo ${q.hallazgoIndice + 1}`
+            }
+            valor={q.escenario === '' ? q.pregunta : `${q.pregunta} — escenario: ${q.escenario}`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function FichaPostMortem({
   contenido,
   etiquetas,
@@ -2383,6 +2506,119 @@ function FormularioOportunidad({
           />
         </label>
       </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button type="submit" size="sm" disabled={ocupado}>
+          {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
+        </Button>
+        <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * El formulario de C4: los TEXTOS, y solo ellos.
+ *
+ * El arquetipo, la marca de hipótesis de cada hallazgo y las citas no aparecen, y no por falta
+ * de sitio: son testimonio y `TESTIMONIO_ADICIONAL` los rechaza si llegan cambiados. Un campo
+ * en pantalla que el servidor va a rechazar es peor que ninguno — es la lección que costó el
+ * estado `conciliacion-cambiada` de C7, arriba en la tabla de correcciones.
+ *
+ * Los hallazgos y las preguntas se editan en su sitio y en su orden: el orden es parte del
+ * objeto que se materializa (`unique (revision_id, orden)`), así que la lista tiene la longitud
+ * que trajo la propuesta y no se añade ni se quita. Quien quiera otra lista pide otra revisión.
+ */
+function FormularioRevision({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoRevisionSimulada;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoRevisionSimulada) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [sintesis, setSintesis] = useState(inicial.sintesis);
+  const [hallazgos, setHallazgos] = useState(inicial.hallazgos);
+  const [preguntas, setPreguntas] = useState(inicial.preguntas);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({ ...inicial, sintesis, hallazgos, preguntas });
+      }}
+    >
+      <label style={campo}>
+        <span style={etiqueta}>Lectura del arquetipo</span>
+        <Textarea
+          rows={3}
+          maxLength={2000}
+          value={sintesis}
+          onChange={(e) => setSintesis(e.target.value)}
+        />
+      </label>
+      {hallazgos.map((h, i) => (
+        <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <label style={campo}>
+            <span style={etiqueta}>
+              {`Hallazgo ${i + 1}${h.esHipotesis ? ' · hipótesis' : ''}`}
+            </span>
+            <Input
+              maxLength={200}
+              value={h.titulo}
+              onChange={(e) =>
+                setHallazgos(
+                  hallazgos.map((x, j) => (i === j ? { ...x, titulo: e.target.value } : x)),
+                )
+              }
+            />
+          </label>
+          <Textarea
+            rows={3}
+            maxLength={2000}
+            value={h.descripcion}
+            onChange={(e) =>
+              setHallazgos(
+                hallazgos.map((x, j) => (i === j ? { ...x, descripcion: e.target.value } : x)),
+              )
+            }
+          />
+        </div>
+      ))}
+      {preguntas.map((q, i) => (
+        <label key={i} style={campo}>
+          <span style={etiqueta}>{`Pregunta ${i + 1}`}</span>
+          <Input
+            maxLength={500}
+            value={q.pregunta}
+            onChange={(e) =>
+              setPreguntas(
+                preguntas.map((x, j) => (i === j ? { ...x, pregunta: e.target.value } : x)),
+              )
+            }
+          />
+          <Input
+            maxLength={1000}
+            value={q.escenario}
+            placeholder="Escenario (opcional)"
+            onChange={(e) =>
+              setPreguntas(
+                preguntas.map((x, j) => (i === j ? { ...x, escenario: e.target.value } : x)),
+              )
+            }
+          />
+        </label>
+      ))}
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        El arquetipo que firma la revisión y la marca de hipótesis de cada hallazgo no se
+        corrigen: son el testimonio del modelo, y cambiarlos convertiría una simulación en otra
+        cosa (SYS-20).
+      </span>
       <div style={{ display: 'flex', gap: 10 }}>
         <Button type="submit" size="sm" disabled={ocupado}>
           {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}

@@ -553,12 +553,21 @@ alter table llamada_ai add constraint llamada_ai_ancla_concepto
 alter table propuesta_ai add constraint propuesta_ai_ancla_concepto
   check ((concepto_id is not null) = (capacidad = 'C4'));
 
--- Y el ancla sigue siendo UNA. El check se sustituye entero porque `num_nonnulls` enumera, y
+-- Y el ancla sigue siendo UNA. El check se sustituye entero porque `num_nonnulls` ENUMERA, y
 -- una columna que no esté en la lista no cuenta: sin esto, una propuesta de C4 tendría cero
 -- anclas contadas y el check exigiría que otra estuviera puesta.
+--
+-- ⚠ Y por eso los tres `drop constraint` + `add constraint` de esta sección son el MISMO peligro
+-- que el `create or replace` del guard, con otra cara: la lista se escribe entera, así que
+-- omitir una columna que otra capacidad añadió la BORRA en silencio. Pasó de verdad con este
+-- fichero —se escribió antes de que C7 se integrara y las tres listas nacieron sin
+-- `outcome_review_id` ni `outcome-review`—, y no lo dijo ningún error de migración: lo dijeron
+-- cuatro pruebas de C7 al fallar. La regla es la misma que para el guard: releer lo VIVO cada
+-- vez que esta rama se pone al día con `agents`.
 alter table propuesta_ai drop constraint propuesta_ai_un_ancla;
 alter table propuesta_ai add constraint propuesta_ai_un_ancla
-  check (num_nonnulls(item_id, reto_id, gate_id, journey_id, registry_id, concepto_id) = 1);
+  check (num_nonnulls(item_id, reto_id, gate_id, journey_id, registry_id, outcome_review_id,
+                      concepto_id) = 1);
 
 -- ── El destino: la revisión simulada ──
 alter table propuesta_ai add column revision_simulada_id uuid;
@@ -570,7 +579,7 @@ create unique index propuesta_ai_revision_simulada_idx
 alter table propuesta_ai drop constraint propuesta_ai_destino_vocabulario;
 alter table propuesta_ai add constraint propuesta_ai_destino_vocabulario
   check (destino in ('evidencia', 'criterio-exito', 'insight', 'entrada-kpi', 'oportunidad',
-                     'revision-simulada'));
+                     'outcome-review', 'revision-simulada'));
 
 alter table propuesta_ai add constraint propuesta_ai_destino_c4
   check (capacidad <> 'C4' or destino = 'revision-simulada');
@@ -580,16 +589,60 @@ alter table propuesta_ai add constraint propuesta_ai_destino_c4
 -- aceptada habría contado CERO objetos materializados contra un `= 1`.
 alter table propuesta_ai drop constraint propuesta_ai_objeto_materializado;
 alter table propuesta_ai add constraint propuesta_ai_objeto_materializado
-  check (case
-    when estado not in ('aceptada', 'corregida')
-      then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id, oportunidad_id,
-                        revision_simulada_id) = 0
-    when destino = 'entrada-kpi'
-      then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id, oportunidad_id,
-                        revision_simulada_id) <= 1
-    else num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id, oportunidad_id,
-                      revision_simulada_id) = 1
-  end);
+  check (
+    case
+      /*
+       * La rama de C7 va PRIMERO y se copia de su migración tal cual, con `revision_simulada_id`
+       * añadido a los conteos. Su columna de objeto es la MISMA que su columna de ancla, así
+       * que contarla haría que toda propuesta suya tuviera un objeto puesto desde que nace;
+       * por eso `outcome_review_id` se comprueba aparte y no entra en ningún `num_nonnulls`.
+       */
+      when destino = 'outcome-review'
+        then outcome_review_id is not null
+             and num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
+                              oportunidad_id, revision_simulada_id) = 0
+      when estado not in ('aceptada', 'corregida')
+        then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
+                          oportunidad_id, revision_simulada_id) = 0
+      when destino = 'entrada-kpi'
+        then num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
+                          oportunidad_id, revision_simulada_id) <= 1
+      else num_nonnulls(evidencia_id, criterio_id, insight_id, entrada_kpi_id,
+                        oportunidad_id, revision_simulada_id) = 1
+    end);
+
+-- ── LA PROPUESTA CUELGA DE LA LLAMADA QUE LA PRODUJO ──
+--
+-- Hermano de los guards de linaje de C6 y C7, y por lo mismo: sin él, una propuesta de C4 puede
+-- colgar de la llamada de OTRO concepto, y entonces el libro de costos y el lineage dicen cosas
+-- distintas sobre la misma fila.
+--
+-- Que ninguna columna de ancla se quede sin su comparación lo sujeta un censo que enfrenta
+-- `COLUMNAS_DE_ANCLA` contra el TEXTO de los guards de `propuesta_ai`, buscando literalmente
+-- «l.<columna> is not distinct from new.<columna>». Es una prueba sobre el código fuente y
+-- suena frágil; es lo que hace falta, y funcionó: se lo dijo a C7 en su migración y me lo ha
+-- dicho a mí en ésta.
+create function propuesta_ai_c4_linaje_guard() returns trigger
+language plpgsql as $$
+begin
+  if new.capacidad <> 'C4' then
+    return new;
+  end if;
+  if not exists (
+    select 1 from llamada_ai l
+    where l.id = new.llamada_id and l.workspace_id = new.workspace_id
+      and l.concepto_id is not distinct from new.concepto_id
+  ) then
+    raise exception 'la propuesta debe colgar de la llamada que la produjo: mismo concepto';
+  end if;
+  return new;
+end $$;
+
+revoke execute on function propuesta_ai_c4_linaje_guard() from public;
+
+create trigger a_propuesta_ai_c4_linaje
+  before insert on propuesta_ai
+  for each row execute function propuesta_ai_c4_linaje_guard();
 
 grant insert (concepto_id) on reserva_ai to designio_app;
 grant insert (concepto_id) on llamada_ai to designio_app;

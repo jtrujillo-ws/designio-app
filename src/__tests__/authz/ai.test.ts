@@ -27,6 +27,7 @@ import {
   type ContenidoInsight,
   type ContenidoOportunidad,
   type ContenidoPostMortem,
+  type ContenidoRevisionSimulada,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
@@ -138,6 +139,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let requisitoIds: string[] = [];
   let evidenciaDelRetoId = '';
   let insightValidadoDelRetoId = '';
+  /* El arquetipo del reto del fixture, que es la LENTE de C4: su id tiene que ser real porque
+   * el servicio comprueba que cada sesión nombre uno que llegó al material. */
+  let arquetipoDelRetoId = '';
+  /* Y un concepto CANDIDATO del mismo reto, que es el ancla de C4. */
+  let conceptoDelRetoId = '';
   let registryId = '';
   let criterioDelRegistryId = '';
 
@@ -267,7 +273,44 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     get C3() {
       return CONTENIDO_C3(insightValidadoDelRetoId);
     },
+    /*
+     * C4 igual que C7 y por la misma razón, con una vuelta más: el `arquetipoId` tiene que ser
+     * REAL —el servicio comprueba que la sesión nombre un arquetipo que llegó al material— y
+     * los ids de las citas también, así que se resuelve tarde con el arquetipo del `beforeAll`.
+     *
+     * Y los hallazgos van marcados como HIPÓTESIS: es la única forma de que un fixture genérico
+     * no necesite citas reales, y no es una salida cómoda sino el caso legítimo que el contrato
+     * describe —una extrapolación del arquetipo, marcada como tal—. Los casos que miden la otra
+     * mitad, la del hallazgo que se apoya en evidencia, componen sus citas con los documentos de
+     * su propio arquetipo.
+     */
+    get C4() {
+      return CONTENIDO_C4(arquetipoDelRetoId);
+    },
   };
+
+  const CONTENIDO_C4 = (arquetipoId: string) =>
+    ({
+      arquetipoId,
+      sintesis: 'Este perfil llega con la guardia alta y el concepto se la sube.',
+      hallazgos: [
+        {
+          titulo: 'La verificación pide confianza antes de darla',
+          descripcion:
+            'Este arquetipo entrega documentos cuando ya entiende para qué sirven, y aquí se le piden antes de explicar nada.',
+          esHipotesis: true,
+          citas: [],
+        },
+      ],
+      preguntas: [
+        {
+          pregunta: '¿Qué esperarías saber antes de darnos tu documento?',
+          escenario: 'Con el prototipo abierto en la pantalla de verificación.',
+          hallazgoIndice: 0,
+        },
+      ],
+      confianzaPropuesta: 'media',
+    }) satisfies ContenidoRevisionSimulada;
 
   /**
    * Las columnas de ancla y sus valores, DERIVADOS del registro.
@@ -936,6 +979,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     registryId = mr!.id as string;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
+    arquetipoDelRetoId = arq!.id as string;
+    const [cpt] = await admin`insert into concepto
+      (workspace_id, reto_id, titulo, descripcion, creado_por)
+      values (${ws}, ${retoId}, 'Verificación diferida',
+              'Se abre la cuenta y el documento se pide después', ${leadId})
+      returning id`;
+    conceptoDelRetoId = cpt!.id as string;
     /*
      * Un insight VALIDADO del reto, que es el material de C3.
      *
@@ -1004,6 +1054,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from arquetipo_evidencia where workspace_id = ${ws}`;
       await admin`delete from evidencia where workspace_id = ${ws}`;
       await admin`delete from fuente where workspace_id = ${ws}`;
+      /*
+       * Y el concepto del fixture de C4, con lo que le cuelga: sus revisiones simuladas van por
+       * delante porque referencian AL ARQUETIPO además de al concepto, así que borrarlas
+       * después de él dejaría la limpieza muerta en la FK del arquetipo. El orden es el de las
+       * dependencias, no el de las capacidades.
+       */
+      await admin`delete from pregunta_de_test where workspace_id = ${ws}`;
+      await admin`delete from hallazgo_simulado_evidencia where workspace_id = ${ws}`;
+      await admin`delete from hallazgo_simulado where workspace_id = ${ws}`;
+      await admin`delete from revision_simulada where workspace_id = ${ws}`;
       await admin`delete from arquetipo where workspace_id = ${ws}`;
       await admin`delete from journey_snapshot where workspace_id = ${ws}`;
       await admin`delete from journey_nodo_evidencia where workspace_id = ${ws}`;
@@ -1014,6 +1074,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from gate_instancia where workspace_id = ${ws}`;
       await admin`delete from etapa_instancia where workspace_id = ${ws}`;
       await admin`delete from proyecto where workspace_id = ${ws}`;
+      await admin`delete from concepto where workspace_id = ${ws}`;
       await admin`delete from reto where workspace_id = ${ws}`;
       await admin`delete from servicio where workspace_id = ${ws}`;
       await admin`delete from miembro where workspace_id = ${ws}`;
@@ -5499,15 +5560,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      // C1 y C4 hacen aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad
-      // del catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra
-      // —y el día que no quede ninguna inactiva, este caso se retira en vez de fingirse. C7
-      // salió de aquí al activarse, y su relevo fue C4, que es como esta rotación se hace.
+      // C1 hace aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad del
+      // catálogo que este panel todavía no pinta. Con C4 activa es la ÚLTIMA que queda, así que
+      // ya no hay relevo posible: el día que C1 se active, este caso se retira en vez de
+      // fingirse con una capacidad inventada, que es lo que la rotación evitaba.
       expect(await motivoDe('C1', { reto_id: retoId })).toBeNull();
       expect(await motivoDe('C1', { item_id: item })).toBeNull();
-      expect(await motivoDe('C4', {})).toBeNull();
+      expect(await motivoDe('C1', {})).toBeNull();
       // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
-      expect(await motivoDe('C4', { gate_id: gateId })).toBeNull();
+      expect(await motivoDe('C1', { gate_id: gateId })).toBeNull();
+      // Ni sobre la de C4, que es la última que entró: es el sitio donde una rama escrita
+      // «para el concepto» en vez de «para esta capacidad» se cruzaría.
+      expect(await motivoDe('C1', { concepto_id: conceptoDelRetoId })).toBeNull();
 
       // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
       // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
@@ -5528,6 +5592,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // «cerrado», que es la respuesta correcta para una fila que no señala ninguno.
       const DE_C7 = ['disponible', 'post-mortem-cerrado'];
       expect(DE_C7).toContain(await motivoDe('C7', {}));
+      // Y C4 igual: sin ancla, la rama no encuentra concepto candidato y contesta «decidido»,
+      // que es la respuesta correcta para una fila que no señala ninguno.
+      const DE_C4 = ['disponible', 'concepto-decidido'];
+      expect(DE_C4).toContain(await motivoDe('C4', {}));
+      expect(DE_C4).toContain(await motivoDe('C4', { concepto_id: conceptoDelRetoId }));
+      // Y no hereda el de C7, que es la capacidad con la que comparte el sitio en el CASE.
+      expect(DE_C7.slice(1)).not.toContain(await motivoDe('C4', { concepto_id: conceptoDelRetoId }));
+      expect(DE_C4.slice(1)).not.toContain(await motivoDe('C7', {}));
       // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
       expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', { item_id: item }));
       // Ni el de CT uno de los otros dos: el ancla nueva entró por el mismo sitio por donde

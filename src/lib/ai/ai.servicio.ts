@@ -100,6 +100,7 @@ import {
   TESTIMONIO_ADICIONAL,
   type CitaDelContenido,
   type ContenidoPostMortem,
+  type ContenidoRevisionSimulada,
 } from './ai.contenido';
 import {
   credencialesAI,
@@ -3320,6 +3321,68 @@ async function huellaDelMaterialDeInsights(
  * No hay una tercera clave: `outcome_review` es 1:1 con su reto, así que la del reto ya lo
  * serializa contra quien lo completa (`bloquearReto`) y contra quien constata.
  */
+export const MOTIVO_CONCEPTO_DECIDIDO =
+  'Ese concepto ya está decidido: una revisión simulada sirve para dar preguntas al test que decide el pasa/muere, y después del veredicto solo añadiría al expediente una lectura que llegó tarde';
+export const MOTIVO_MATERIAL_REVISION_MOVIDO =
+  'El material de esa revisión cambió mientras el borrador esperaba —el concepto se reescribió, un arquetipo cambió de estado, o le enlazaron evidencia nueva—, así que estas sesiones se hicieron sobre otra cosa';
+
+/**
+ * El material de C4 y su huella, leídos bajo los candados del protocolo.
+ *
+ * Hermana de `huellaDelMaterialDelPostMortem`, con el mismo orden de candados —workspace
+ * compartido → clave del reto → fila del reto → fila del concepto— y la misma respuesta a la
+ * pregunta que caduca: `null` cuando la capacidad ya no aplica, y el motivo lo pone quien
+ * llama, que es el único que sabe si está preparando, revalidando o materializando.
+ *
+ * La huella se toma sobre el TEXTO del material, como las de C2, C3 y C6 y al revés que la de
+ * C7. La diferencia es de qué se firma: allí se acepta una narrativa CONTRA UN TABLERO —el
+ * objeto entero, cupiera o no en el prompt—; aquí lo que se firma es la lectura de unas lentes
+ * sobre lo que se les enseñó, y lo que se les enseñó ES el texto recortado. Que un arquetipo
+ * más allá del corte cambie no invalida la sesión de los que sí se vieron.
+ */
+export async function huellaDelMaterialDeRevision(
+  tx: TransactionSql,
+  workspaceId: string,
+  anclaId: string,
+): Promise<{ huella: string; material: ConceptoARevisar | null }> {
+  await tx`select pg_advisory_xact_lock_shared(
+    hashtextextended('designio:workspace:' || ${workspaceId}, 42))`;
+  const [dueno] = await tx`select reto_id from concepto
+    where id = ${anclaId} and workspace_id = ${workspaceId}`;
+  if (!dueno) return { huella: '', material: null };
+  const retoId = dueno.reto_id as string;
+  await tx`select pg_advisory_xact_lock(hashtextextended('designio:reto:' || ${retoId}, 42))`;
+  await tx`select 1 from reto where id = ${retoId} and workspace_id = ${workspaceId} for share`;
+  await tx`select 1 from concepto
+    where id = ${anclaId} and workspace_id = ${workspaceId} for share`;
+  const [fila] = await tx`select
+      c.estado = 'candidato' and reto_admite_conceptos(c.reto_id, c.workspace_id) as revisable,
+      c.titulo, c.descripcion, c.umbral_test,
+      (select coalesce(json_agg(json_build_object(
+                'id', a.id, 'nombre', a.nombre, 'definicion', a.definicion, 'estado', a.estado,
+                'evidencia', (
+                  select coalesce(json_agg(json_build_object(
+                            'id', e.id, 'titulo', e.titulo, 'resumen', e.resumen)
+                            order by e.titulo, e.id), '[]'::json)
+                  from arquetipo_evidencia ae
+                  join evidencia e on e.id = ae.evidencia_id and e.workspace_id = ae.workspace_id
+                  where ae.arquetipo_id = a.id and ae.workspace_id = a.workspace_id
+                    and evidencia_usable(e.id, e.workspace_id, 'cliente')))
+                order by a.nombre, a.id), '[]'::json)
+       from arquetipo a
+       where a.reto_id = c.reto_id and a.workspace_id = c.workspace_id) as arquetipos
+    from concepto c
+    where c.id = ${anclaId} and c.workspace_id = ${workspaceId}`;
+  if (!fila || !(fila.revisable as boolean)) return { huella: '', material: null };
+  const material: ConceptoARevisar = {
+    titulo: fila.titulo as string,
+    descripcion: fila.descripcion as string,
+    umbralTest: fila.umbral_test as string,
+    arquetipos: (fila.arquetipos as ArquetipoQueRevisa[] | null) ?? [],
+  };
+  return { huella: huellaDelMaterial(materialDeRevision(material).texto), material };
+}
+
 export async function huellaDelMaterialDelPostMortem(
   tx: TransactionSql,
   workspaceId: string,
@@ -3576,6 +3639,26 @@ const REVALIDAR: Record<
       throw new ErrorAI(
         'La evidencia de ese reto cambió mientras se preparaba la llamada —se revocaron derechos, se desenlazó o se editó—, así que el material ya no es el que se iba a mandar: no se llamó al proveedor. Vuelve a pedirlo.',
       );
+    }
+  },
+  C4: async (tx, entrada, huellaMaterial) => {
+    /*
+     * Las dos preguntas que caducan entre preparar y despachar, bajo los candados del lector:
+     * que el concepto SIGA por decidir —decidirlo es un acto humano que cabe justo en ese
+     * rato— y que el material siga siendo el que se armó.
+     *
+     * La segunda pasa más de lo que parece: los arquetipos se confirman o se refutan en la
+     * etapa 2 y su evidencia crece, y eso es trabajo normal que ocurre mientras alguien pide
+     * una revisión en la 4.
+     */
+    const { huella, material } = await huellaDelMaterialDeRevision(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (!material) throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}: no se llamó al proveedor`);
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(`${MOTIVO_MATERIAL_REVISION_MOVIDO}: no se llamó al proveedor. Vuelve a pedirlo.`);
     }
   },
   C7: async (tx, entrada, huellaMaterial) => {
@@ -3959,6 +4042,47 @@ const PREPARAR: Record<
       // Lo que el modelo tuvo delante, para que el suelo pueda volver a preguntarlo. Sale de
       // `material` y no de otra lectura: dos consultas para el mismo conjunto es cómo
       // empiezan las discrepancias que este PR ya ha corregido varias veces.
+      evidenciaDelMaterial: llegado.ids,
+    };
+  },
+  C4: async (tx, entrada) => {
+    // El MISMO lector que la revalidación, por lo mismo que en C7: el material que se manda y
+    // el que se vuelve a mirar antes de despachar salen de la misma lectura, o la huella
+    // compara dos textos que nadie compuso igual.
+    const { material } = await huellaDelMaterialDeRevision(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (!material) throw new ErrorAI(MOTIVO_CONCEPTO_DECIDIDO);
+    /*
+     * Y sin LENTES no hay revisión que pedir. El ancla ya filtra los conceptos cuyo reto tiene
+     * arquetipos con evidencia citable, pero entre listar y pedir cabe una revocación de
+     * derechos: sin esto, la llamada saldría cara y volvería con un perfil inventado hablando
+     * en primera persona, que es la avería exacta que SYS-20 nombra.
+     */
+    const conLente = material.arquetipos.filter((a) => a.evidencia.length > 0);
+    if (conLente.length === 0) {
+      throw new ErrorAI(
+        'El reto de ese concepto no tiene ningún arquetipo con evidencia citable enlazada: sin lentes no hay revisión que simular, y pedirla devolvería un perfil inventado hablando en primera persona. Enlaza evidencia a sus arquetipos en la etapa 2, o escribe la revisión a mano.',
+      );
+    }
+    const llegado = evidenciaQueLlegoAlRevisor(material);
+    return {
+      sistema: SISTEMA_REVISION,
+      prompt: promptRevision(material),
+      /*
+       * La huella de ESTE material, para volver a mirarla justo antes de despachar. Sale de la
+       * MISMA función que la revalidación por lo dicho arriba.
+       */
+      huellaMaterial: huellaDelMaterial(materialDeRevision(material).texto),
+      /*
+       * Y el ALCANCE honesto: lo que el modelo tuvo delante, no lo que se consultó para
+       * armarlo. La evidencia va la última del cuerpo, así que es lo primero que el recorte se
+       * come; apuntar aquí todo lo enlazado daría por vistos documentos que nadie enseñó, y el
+       * guard diferido sellaría una revisión que no pudo leer lo que se le atribuye. Es la
+       * misma lección que costó una ronda en C2.
+       */
       evidenciaDelMaterial: llegado.ids,
     };
   },
@@ -4398,6 +4522,56 @@ const COMPROBAR: Record<
       throw new ErrorContratoAI(
         'Alguna pregunta cita un insight que no llegó entero al material —el recorte lo dejó fuera—, así que se apoya en algo que el modelo no vio completo: se descarta el lote. Acorta la descripción del reto o los resúmenes de sus insights y vuelve a pedirlo.',
       );
+    }
+  },
+  C4: async (tx, entrada, contenidos, huellaMaterial) => {
+    const { huella, material } = await huellaDelMaterialDeRevision(
+      tx,
+      entrada.workspaceId,
+      entrada.anclaId,
+    );
+    if (!material) throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}: la propuesta no se guarda`);
+    if (huella !== (huellaMaterial ?? '')) {
+      throw new ErrorAI(`${MOTIVO_MATERIAL_REVISION_MOVIDO}: la propuesta no se guarda. Vuelve a pedirla.`);
+    }
+    /*
+     * Y que cada sesión nombre un arquetipo QUE LLEGÓ AL MODELO, y cada cita un documento de
+     * ESE arquetipo.
+     *
+     * Son dos puertas y ninguna la cubre la otra. La primera es la de C3 con sus insights: un
+     * arquetipo del reto que el recorte dejó fuera pasa el suelo de la base —existe, es del
+     * reto— y sin embargo la sesión que dice ser suya se escribió sin verlo. La segunda es la
+     * regla de RF-08.2 leída al derecho: lo que hace del hallazgo la lectura de esa lente es
+     * que se apoye en lo que constituyó a esa lente, y cruzar la evidencia de un arquetipo a
+     * la sesión de otro fabrica una voz. La base lo exige al materializar; esto lo corta antes
+     * de que la propuesta nazca, que es donde no cuesta una revisión humana.
+     *
+     * Se descarta el LOTE ENTERO y no la sesión que falle, como en C5, C6 y C7: media
+     * respuesta no es revisable, y cuál de las sesiones se apoyaba en la lente equivocada no
+     * lo puede decidir esta función.
+     */
+    const llegados = new Set(evidenciaQueLlegoAlRevisor(material).ids);
+    const porArquetipo = new Map(
+      material.arquetipos.map((a) => [a.id, new Set(a.evidencia.map((e) => e.id))]),
+    );
+    for (const contenido of contenidos) {
+      const c = contenido as ContenidoRevisionSimulada;
+      const suyas = porArquetipo.get(c.arquetipoId);
+      if (!suyas) {
+        throw new ErrorAI(
+          'Alguna sesión dice revisar desde un arquetipo que no es de este reto, o que el recorte dejó fuera del material: se descarta el lote, porque una lente que el modelo no vio no puede haber leído nada. Vuelve a pedirlo.',
+        );
+      }
+      const fuera = c.hallazgos.flatMap((h) =>
+        h.citas
+          .filter((x) => !suyas.has(x.evidenciaId) || !llegados.has(x.evidenciaId))
+          .map((x) => x.evidenciaId),
+      );
+      if (fuera.length > 0) {
+        throw new ErrorAI(
+          `Alguna sesión cita ${fuera.length} documento(s) que no son de su arquetipo, o que el recorte no dejó llegar enteros: se descarta el lote, porque un hallazgo apoyado en el testimonio del perfil de al lado fabrica una voz que nadie dio (RF-08.2, SYS-20). Vuelve a pedirlo.`,
+        );
+      }
     }
   },
   C7: async (tx, entrada, contenidos, huellaMaterial) => {
@@ -5338,6 +5512,14 @@ async function aceptarPropuestaEnTransaccion(
           p,
           contenido as ContenidoOportunidad,
         ),
+      'revision-simulada': () =>
+        materializarRevision(
+          tx,
+          actorId,
+          entrada.workspaceId,
+          p,
+          contenido as ContenidoRevisionSimulada,
+        ),
       'outcome-review': () =>
         // Sin `actorId`, y no por descuido: es la única materialización que no crea fila, así
         // que aquí no hay `creado_por` que firmar. Quien aceptó consta en `revisada_por` de la
@@ -5730,6 +5912,91 @@ async function materializarEntradaKpi(
  * portafolio, no la aprueba. El veredicto es un acto humano con su propia puerta —que
  * re-comprueba el razonamiento vivo— y su propia razón.
  */
+/**
+ * C4: la sesión de un arquetipo, con sus hallazgos, sus citas y sus preguntas de test.
+ *
+ * La materialización más COMPUESTA de las ocho: cuatro tablas en cascada, y el orden importa
+ * porque cada una necesita el id de la anterior. Las preguntas van al final porque su
+ * `hallazgo_id` sale de traducir el ÍNDICE que trae el contenido —cuando esa respuesta se
+ * escribió los hallazgos no existían como filas— y esa traducción solo se puede hacer con las
+ * filas ya nacidas.
+ *
+ * Lo que NO se escribe aquí, y son las dos mitades de SYS-20 en su forma más corta:
+ *
+ *  · `es_simulacion`, que no está en el grant de insert. Su valor lo pone el default de la
+ *    columna, que es `true`, y lo que no se concede no se puede escribir ni siquiera con el
+ *    valor bueno: la etiqueta no es un parámetro de la fila, es una propiedad de la tabla.
+ *  · `propuesta_ai_id`, que lo escribe el guard diferido. Concederlo dejaría a la aplicación
+ *    firmar una procedencia que no ocurrió, y hay un censo en la suite que lo comprueba.
+ */
+async function materializarRevision(
+  tx: TransactionSql,
+  actorId: string,
+  workspaceId: string,
+  p: PropuestaEnRevision,
+  c: ContenidoRevisionSimulada,
+): Promise<string> {
+  /*
+   * Las dos preguntas que caducan entre generar y aceptar, por la MISMA función que las hace
+   * antes de llamar al proveedor —y con ella los candados en el orden del protocolo—.
+   *
+   * El suelo lo pone la base: la política de inserción exige `estado = 'candidato'` y el guard
+   * del candado del reto relee la ventana con la clave en la mano. Esto es para que el motivo
+   * llegue con nombre a quien revisa, en vez de un 42501 o un 23514.
+   */
+  const { huella, material } = await huellaDelMaterialDeRevision(tx, workspaceId, p.anclaId);
+  if (!material) {
+    throw new ErrorAI(`${MOTIVO_CONCEPTO_DECIDIDO}. Esta propuesta solo puede rechazarse`);
+  }
+  if (huella !== (p.huellaMaterial ?? '')) {
+    throw new ErrorAI(
+      `${MOTIVO_MATERIAL_REVISION_MOVIDO}: solo puede rechazarse. Pide otra revisión.`,
+    );
+  }
+  const [rev] = await tx`
+    insert into revision_simulada (workspace_id, concepto_id, arquetipo_id, sintesis, creado_por)
+    values (${workspaceId}, ${p.anclaId}, ${c.arquetipoId}, ${c.sintesis}, ${actorId})
+    returning id`;
+  if (!rev) {
+    throw new ErrorAI(
+      'No se pudo escribir esa revisión: puede que ese arquetipo ya la tenga —una lente lee un concepto UNA vez (SYS-20)— o que el concepto ya no admita revisiones',
+    );
+  }
+  const revisionId = rev.id as string;
+  // Los hallazgos, con su `orden` = índice: es lo que la proyección del guard compara, y lo que
+  // hace que reordenar sea cambiar el objeto y no reescribir la misma cosa.
+  const idsHallazgo: string[] = [];
+  for (const [i, h] of c.hallazgos.entries()) {
+    const [fila] = await tx`
+      insert into hallazgo_simulado
+        (workspace_id, revision_id, orden, titulo, descripcion, es_hipotesis)
+      values (${workspaceId}, ${revisionId}, ${i}, ${h.titulo}, ${h.descripcion},
+              ${h.esHipotesis})
+      returning id`;
+    idsHallazgo.push(fila!.id as string);
+    /*
+     * Y sus citas como ENLACES, con `distinct` sobre el id: dos citas del mismo documento
+     * —dos fragmentos de la misma entrevista— son un solo enlace, y la clave primaria de
+     * `hallazgo_simulado_evidencia` lo diría con un 23505 en mitad del bucle. El fragmento no
+     * se pierde: vive en el `contenido`, que es inmutable por SYS-17 y es donde se lee de
+     * dónde salió la frase.
+     */
+    for (const evidenciaId of new Set(h.citas.map((x) => x.evidenciaId))) {
+      await tx`insert into hallazgo_simulado_evidencia (hallazgo_id, evidencia_id, workspace_id)
+        values (${fila!.id as string}, ${evidenciaId}, ${workspaceId})`;
+    }
+  }
+  // Y las preguntas, con el índice ya traducido al id que acaba de nacer.
+  for (const [i, q] of c.preguntas.entries()) {
+    await tx`insert into pregunta_de_test
+      (workspace_id, revision_id, hallazgo_id, orden, pregunta, escenario)
+      values (${workspaceId}, ${revisionId},
+              ${q.hallazgoIndice === undefined ? null : (idsHallazgo[q.hallazgoIndice] ?? null)},
+              ${i}, ${q.pregunta}, ${q.escenario})`;
+  }
+  return revisionId;
+}
+
 /**
  * C7: escribir la narrativa en el post mortem que ya existe.
  *

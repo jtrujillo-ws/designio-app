@@ -47,9 +47,10 @@ export async function registrarDecision(
       ),
       nueva as (
         insert into decision (workspace_id, proyecto_id, gate_id, tipo, titulo,
-                              fundamento, decidido_por)
+                              fundamento, decidido_por, concepto_id)
         select ${entrada.workspaceId}, destino.proyecto_id, destino.gate_id,
-               ${entrada.tipo}, ${entrada.titulo}, ${entrada.fundamento}, ${actorId}
+               ${entrada.tipo}, ${entrada.titulo}, ${entrada.fundamento}, ${actorId},
+               ${entrada.conceptoId ?? null}
         from destino
         returning id
       ),
@@ -69,7 +70,10 @@ export async function registrarDecision(
         insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
         select ${entrada.workspaceId}, 'DecisionAprobada',
           jsonb_build_object('decisionId', nueva.id, 'gateId', ${entrada.gateId}::uuid,
-                             'tipo', ${entrada.tipo}::text, 'titulo', ${entrada.titulo}::text),
+                             'tipo', ${entrada.tipo}::text, 'titulo', ${entrada.titulo}::text,
+                             -- El evento dice SOBRE QUÉ se decidió, no solo de qué clase era.
+                             -- Sin esto, la auditoría de un pasa/muere no llega al concepto.
+                             'conceptoId', ${entrada.conceptoId ?? null}::uuid),
           ${actorId}, quien.rol
         from nueva, quien
       )
@@ -287,12 +291,18 @@ export async function reabrirEtapa(
       hashtextextended('designio:reto:' || ${dueno.reto_id as string}, 42))`;
     const insightIds = [...new Set(entrada.insightIds)];
     let fila;
+    /*
+     * El evento `EtapaReabierta` NO se emite aquí: lo emite el guard diferido de
+     * `reapertura_etapa`, para que también lo produzca el SQL directo. Es la misma regla que
+     * el resto del esquema —un evento en el servicio es una promesa; uno en el trigger es una
+     * propiedad—, y aquí se volvió urgente cuando esa fila pasó a gobernar la salida de
+     * 'completada': un registro sin rastro abría todas las ventanas del ciclo sin que
+     * constara quién. Con el evento se fue el CTE `quien`, que solo existía para ponerle el
+     * rol al actor.
+     */
     try {
       [fila] = await tx`
-        with quien as (
-          select workspace_role(${actorId}, ${entrada.workspaceId}) as rol
-        ),
-        declarados as (
+        with declarados as (
           -- Los insights que existen DE VERDAD en el workspace: si el conteo no cuadra
           -- con lo pedido, la declaración era falsa y abajo se revierte todo.
           select i.id from insight i
@@ -337,19 +347,6 @@ export async function reabrirEtapa(
           select registro.id, declarados.id, ${entrada.workspaceId}
           from registro, declarados
           returning insight_id
-        ),
-        evento as (
-          insert into evento_dominio (workspace_id, tipo, payload, actor_id, actor_rol)
-          select ${entrada.workspaceId}, 'EtapaReabierta',
-            jsonb_build_object('proyectoId', ${entrada.proyectoId}::uuid,
-                               'etapa', ${entrada.etapaNumero}::int,
-                               'motivo', ${entrada.motivo}::text,
-                               'alcance', case when cardinality(${insightIds}::uuid[]) = 0
-                                               then 'etapa-completa' else 'declarado' end,
-                               'insightsDeclarados', (select count(*)::int from cambios),
-                               'decisionesMarcadas', (select count(*)::int from marcadas)),
-            ${actorId}, quien.rol
-          from registro, quien
         )
         select registro.id, (select count(*)::int from marcadas) as marcadas,
           (select count(*)::int from cambios) as declarados
@@ -451,7 +448,24 @@ export async function gobernanzaDeProyecto(
         coalesce((
           select jsonb_agg(jsonb_build_object('id', s.id, 'nombre', s.nombre) order by s.nombre)
           from segmento s where s.workspace_id = p.workspace_id
-        ), '[]'::jsonb) as segmentos_disponibles
+        ), '[]'::jsonb) as segmentos_disponibles,
+        -- Los CONCEPTOS del reto, que es sobre lo que decide un pasa/muere (RF-04.10). Van en
+        -- la misma sentencia y no en una consulta aparte por lo de siempre: el formulario que
+        -- los ofrece y la validación que los exige tienen que mirar la misma foto, o la
+        -- pantalla ofrece uno que el endpoint ya no admite.
+        --
+        -- TODOS, no solo los candidatos: la lista es el selector de «sobre qué decido», y una
+        -- decisión pasa/muere se registra JUNTO con el veredicto del concepto o justo después
+        -- —son dos escrituras del mismo acto—, así que filtrar por «candidato» dejaría fuera
+        -- exactamente el caso normal. Cuál de ellos tiene ya su decisión lo dice la pantalla
+        -- con lo que ya tiene: «decisiones» trae su «conceptoId».
+        coalesce((
+          select jsonb_agg(jsonb_build_object('id', c.id, 'titulo', c.titulo,
+                                              'estado', c.estado)
+                   order by c.titulo)
+          from concepto c
+          where c.reto_id = p.reto_id and c.workspace_id = p.workspace_id
+        ), '[]'::jsonb) as conceptos
       from proyecto p
       where p.id = ${proyectoId} and p.workspace_id = ${workspaceId}`;
     if (!fila) return null;
@@ -460,6 +474,7 @@ export async function gobernanzaDeProyecto(
       arquetipos: fila.arquetipos as GobernanzaDeProyecto['arquetipos'],
       reaperturas: fila.reaperturas as GobernanzaDeProyecto['reaperturas'],
       segmentosDisponibles: fila.segmentos_disponibles as GobernanzaDeProyecto['segmentosDisponibles'],
+      conceptos: fila.conceptos as GobernanzaDeProyecto['conceptos'],
     };
   });
 }

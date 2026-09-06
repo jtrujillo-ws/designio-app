@@ -3690,6 +3690,14 @@ describeAuthz('el calendario de las garantías lo fija la base', () => {
     // que no tiene reloj, y el guard se quedó con el sello y sin ningún nombre sin huso. El
     // censo ya no lo nombra, y una certificación que no se consume tapa la regresión que
     // existe para detectar (ver la exigencia de abajo).
+    'funcion propuesta_ai_materializacion_guard':
+      'el reloj es «e.creado_en = now()», y entrada_kpi.creado_en es timestamp with time zone: ' +
+      'instante contra instante, y la pregunta que resuelve es «¿nació esta fila en ESTA ' +
+      'transacción?» — now() es la hora de INICIO de la transacción y el default de la columna, ' +
+      'así que solo casan las filas escritas aquí. El nombre sin huso que obliga es «fecha», y ' +
+      'aparece cuatrocientas líneas más arriba en otra rama del mismo guard: «new.contenido ->> ' +
+      'fecha», la clave del jsonb de una extracción, que no se cruza con este reloj ni comparte ' +
+      'sentencia con él.',
     'funcion outcome_review_completar_guard':
       'el reloj es «new.completado_en := now()» y outcome_review.completado_en es timestamp ' +
       'with time zone. Obligan ventana_inicio (date) y ventana_de_medicion_abierta (que la ' +

@@ -31,6 +31,7 @@ describe('agrupación del lateral (4a)', () => {
     expect(l.estantes[0]?.destinos.map((d) => d.to)).toEqual([
       '/evidencia',
       '/insights',
+      '/oportunidades',
       '/segmentos',
     ]);
   });
@@ -44,6 +45,7 @@ describe('agrupación del lateral (4a)', () => {
       '/importacion',
       '/evidencia',
       '/insights',
+      '/oportunidades',
       '/segmentos',
     ]);
     // Sin contador: nunca se pinta un «0».
@@ -101,7 +103,7 @@ describe('agrupación del lateral (4a)', () => {
           (d) => d.to,
         );
         expect(new Set(rutas).size).toBe(rutas.length);
-        const esperadas = 13 - (rutas.includes('/auditoria') ? 0 : 1);
+        const esperadas = 14 - (rutas.includes('/auditoria') ? 0 : 1);
         expect(rutas).toHaveLength(esperadas);
       }
     }

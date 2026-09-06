@@ -8,7 +8,22 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { Tag } from '@/components/ui/Tag';
 import { Textarea } from '@/components/ui/Textarea';
+import { TOPE_NARRATIVA } from '@/lib/medicion/medicion.schemas';
 import { Wordmark } from '@/components/ui/Wordmark';
+/*
+ * Los topes de los campos de una entrada KPI, de donde salen también los de los dos esquemas
+ * que este formulario tiene que satisfacer. Escritos aquí a mano eran una TERCERA copia, y la
+ * que se quedó atrás cuando las otras dos se unificaron: el navegador dejaba escribir 500 y el
+ * servidor rechazaba a los 300, con lo que la corrección que esta pantalla ofrece —y que ante
+ * un nombre ocupado es la única salida— quedaba inservible hasta adivinar el límite.
+ */
+import {
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
+import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
 import { formatearCosteUsd } from '@/lib/ai/ai.degradacion';
 import {
   aceptarPropuestaAI,
@@ -26,6 +41,9 @@ import {
   type EstadoAncla,
   type ContenidoAsistenteGate,
   type ContenidoCriterio,
+  type ContenidoEntradaKpi,
+  type ContenidoOportunidad,
+  type ContenidoPostMortem,
   type ContenidoExtraccion,
   type ContenidoInsight,
   type ContenidoRemediacionJourney,
@@ -88,6 +106,77 @@ const COLOR_ESTADO: Record<PropuestaEnPanel['estado'], string> = {
  * registry FIRMADO es otro motivo y no una redacción del mismo: ahí no hay reapertura que
  * valga, así que ofrecer esa salida sería mandar al lead a un trámite que no desbloquea
  * nada. */
+/**
+ * Y cuáles de esos motivos dejan abierta la CORRECCIÓN.
+ *
+ * La pantalla trataba todo estado distinto de `disponible` como «esta propuesta ya solo se
+ * rechaza», y eso era exacto mientras todos los motivos hablaran del ancla: si el item se curó,
+ * si el reto se archivó o si el registry se firmó, corregir el texto no arregla nada — lo que
+ * cambió está fuera de la propuesta.
+ *
+ * `nombre-ocupado` rompe esa equivalencia y por eso hace falta este registro. No es un motivo
+ * del ancla: es una COLISIÓN DEL CONTENIDO con lo que hay en el registry, el servidor acepta la
+ * corrección que la arregla, y el propio mensaje le dice a quien revisa que corrija el nombre.
+ * Con el botón apagado, la pantalla decía una cosa y ofrecía la contraria.
+ *
+ * `Record<EstadoAncla, boolean>` y no una lista de excepciones: un estado nuevo tiene que
+ * decidir a cuál de los dos grupos pertenece, que es justo lo que este caso demuestra que no se
+ * puede heredar. «Aceptar tal cual» sigue apagado en los dos: eso lo gobierna `anclaDisponible`.
+ */
+const CORREGIR_SIGUE_ABIERTO: Record<EstadoAncla, boolean> = {
+  // `disponible` no pasa por aquí —el botón ya está activo—, pero la entrada existe porque el
+  // registro es exhaustivo y una respuesta es más clara que una ausencia.
+  disponible: true,
+  'item-curado': false,
+  'consentimiento-revocado': false,
+  'criterios-congelados': false,
+  'registry-firmado': false,
+  'registry-cerrado': false,
+  // El criterio al que la entrada responde ya no está, y ese campo es TESTIMONIO: no se
+  // corrige. Sin criterio al que apuntar, la única salida es rechazar.
+  'criterio-ausente': false,
+  // La única que SÍ: el nombre es del contenido, se corrige, y corregirlo es exactamente lo
+  // que el mensaje pide.
+  'nombre-ocupado': true,
+  // El material se movió por debajo: corregir el texto de la propuesta no devuelve el
+  // criterio a lo que el modelo leyó, así que la única salida es rechazar y pedir otro lote.
+  'criterios-cambiados': false,
+  // Y tampoco: lo que falta no es texto de la propuesta, es poder comparar su material.
+  // Lo mismo para C3: corregir la pregunta no devuelve los insights a lo que el modelo leyó.
+  'insights-cambiados': false,
+  // El portafolio se cerró, y los insights citados dejaron de estar validados: ninguna de las
+  // dos se arregla escribiendo en la propuesta.
+  'portafolio-cerrado': false,
+  'insight-no-validado': false,
+  'material-no-comparable': false,
+  'reto-no-admite': false,
+  'gate-decidido': false,
+  'checklist-avanzado': false,
+  'reto-archivado': false,
+  'evidencia-no-citable': false,
+  'alcance-incompleto': false,
+  'journey-cambiado': false,
+  /*
+   * Ninguno de los dos admite corrección.
+   *
+   * El post mortem CERRADO es evidente: no hay dónde escribir la narrativa, se corrija o no.
+   *
+   * El tablero MOVIDO lo puse en `true` razonando que quien revisa tiene el tablero nuevo
+   * delante en la pantalla de la etapa 7 y puede ajustar la narrativa a lo que hoy dice. El
+   * razonamiento es defendible y la pantalla mentía igual: `materializarPostMortem` compara la
+   * huella guardada con la del expediente de hoy SIEMPRE, haya corrección o no, así que cada
+   * envío que este estado invitaba a hacer terminaba rechazado por obsoleto. Ofrecer un camino
+   * que el backend cierra es peor que no ofrecerlo.
+   *
+   * Y puestos a elegir, el `false` es además lo coherente: `criterios-cambiados`,
+   * `insights-cambiados` y `journey-cambiado` son el mismo caso —el material se movió por
+   * debajo— y los tres dicen `false`. C7 no tenía por qué ser la excepción.
+   */
+  'post-mortem-cerrado': false,
+  'conciliacion-cambiada': false,
+  'ancla-ausente': false,
+};
+
 const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
   disponible: '',
   'item-curado': 'El item ya se curó a mano: esta propuesta quedó obsoleta y solo puede rechazarse.',
@@ -97,6 +186,12 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'El G0 del reto se aprobó y sus criterios quedaron congelados: esta propuesta quedó obsoleta y solo puede rechazarse. Reabrir la etapa 0 los descongela.',
   'registry-firmado':
     'El registry de medición de ese reto ya está firmado: sus criterios son el contrato acordado y la firma no se deshace (SYS-22). Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'registry-cerrado':
+    'El Metric Registry de ese reto ya no admite entradas: o se firmó —y firmarlo congela el contrato de medición (SYS-22)— o el trabajo de su reto se cerró. Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'criterio-ausente':
+    'El criterio de éxito al que responde esta entrada ya no está entre los del reto de su registry: sin la promesa que dice medir, el KPI no se puede aceptar. La propuesta solo puede rechazarse.',
+  'nombre-ocupado':
+    'Ya hay una entrada con ese nombre en el registry, y el nombre es su clave: corrígelo antes de aceptar, o rechaza la propuesta.',
   'reto-no-admite':
     'Ese reto ya no admite criterios nuevos: solo los admite mientras es candidato o está activo, y este ya avanzó a medición, cierre o archivo. La propuesta quedó obsoleta y solo puede rechazarse.',
   'gate-decidido':
@@ -105,12 +200,31 @@ const MOTIVO_ANCLA: Record<EstadoAncla, string> = {
     'Ese reto está archivado: su trabajo se cerró y esta propuesta quedó obsoleta, así que solo puede rechazarse.',
   'evidencia-no-citable':
     'Alguna de las evidencias que este insight cita ya no se puede citar al cliente: su derecho de uso se retiró, caducó o el documento ya no está. Aceptarlo fallaría al escribir la cita (DR001), así que por ahora solo puede rechazarse. Si el derecho vuelve, la propuesta vuelve a poder aceptarse sin hacer nada.',
+  // Lo emiten C2 —evidencia del reto— y C3 —insights validados—, así que el motivo nombra lo
+  // que falta sin decidir de cuál se trata: decir «evidencia» sobre una HMW mandaría a mirar
+  // donde no es.
   'alcance-incompleto':
-    'Ese reto tiene evidencia que estos insights no llegaron a ver: se enlazó después de generarlos, o no cabía en el material que se le mandó al modelo. Aceptarlos sellaría un análisis que no la miró, así que por ahora solo pueden rechazarse. Vuelve a pedirlos para que la tenga en cuenta.',
+    'Ese reto sabe cosas que esta propuesta no llegó a ver —evidencia enlazada o insights validados después de generarla, o que no cabían en el material que se le mandó al modelo—. Aceptarla sellaría un trabajo que no las miró, así que por ahora solo puede rechazarse. Vuelve a pedirla para que las tenga en cuenta.',
   'journey-cambiado':
     'El grafo de ese journey cambió desde que se generó el informe: alguna de las señales que remedia ya no está abierta, o el grafo que describe ya no es el que hay. Puedes leerlo, pero comprueba contra el journey antes de aplicar nada.',
+  'post-mortem-cerrado':
+    'Ese post mortem ya se completó: lleva su veredicto firmado con nombre y fecha, y su narrativa no se reescribe. Esta propuesta quedó obsoleta y solo puede rechazarse.',
+  'conciliacion-cambiada':
+    'La conciliación de ese reto cambió desde que el modelo la leyó: se constató un elemento, o se registró la lectura de un criterio. Este borrador puede estar contando una desviación que ya se resolvió, o callando una que apareció después — corrígelo contra el tablero de hoy, o recházalo y pide otro.',
   'checklist-avanzado':
     'Alguno de los requisitos que este informe señalaba ya se cerró: lo que dice que falta no describe el estado actual del gate. Vuelve a pedirlo si quieres uno al día.',
+  'criterios-cambiados':
+    'Los criterios de éxito de ese reto cambiaron desde que el modelo los leyó: esta entrada se escribió contra una definición, un objetivo o una ventana que ya no son los vigentes. Recházala y pide un lote nuevo.',
+  'insights-cambiados':
+    'Los insights validados de ese reto cambiaron desde que el modelo los leyó —se editó el título o el resumen de alguno, la formulación del reto, o alguno de sus criterios—: esta pregunta se escribió contra un material que ya no es el vigente. Recházala y pide un lote nuevo.',
+  'portafolio-cerrado':
+    'El portafolio de ese reto está cerrado: su G3 quedó firmado sobre lo que había, se abrió la medición, o el trabajo del reto se cerró. Esta propuesta quedó obsoleta y solo puede rechazarse. Reabrir la etapa 3 vuelve a abrirlo.',
+  'insight-no-validado':
+    'Alguno de los insights en los que esta pregunta se apoya ya no está validado: la traza de una oportunidad solo apunta a insights validados (SYS-15), así que por ahora solo puede rechazarse. Si vuelve a validarse, la propuesta vuelve a poder aceptarse sin hacer nada.',
+  // Escrito sin nombrar el material de una capacidad: lo emiten C6 —criterios— y C3 —insights
+  // y criterios—, y decir «los criterios» sobre una HMW mandaría a mirar donde no es.
+  'material-no-comparable':
+    'Esta propuesta se generó con otra versión del prompt, así que no se puede comprobar si su material sigue siendo el que el modelo leyó. No es que haya cambiado: es que no se sabe. Recházala y pide un lote nuevo.',
   'ancla-ausente': 'No se pudo comprobar el estado del objeto de origen: refresca la pantalla antes de decidir.',
 };
 
@@ -1014,6 +1128,34 @@ const PRESENTACION_POR_CAPACIDAD: Record<
       'Este informe no cambia el grafo y no se aprueba: se lee y se descarta. Las ' +
       'remediaciones las aplica una persona editando el journey.',
   },
+  C6: {
+    rotulo: 'Entrada del Metric Registry propuesta',
+    ficha: (c, etiquetas) => (
+      <FichaEntradaKpi contenido={c as ContenidoEntradaKpi} etiquetas={etiquetas} />
+    ),
+    // C6 SÍ materializa —nace una entrada del registry— así que no tiene nada que decir aquí.
+    sinAccion: null,
+  },
+  C7: {
+    rotulo: 'Borrador del post mortem',
+    ficha: (c, etiquetas) => (
+      <FichaPostMortem contenido={c as ContenidoPostMortem} etiquetas={etiquetas} />
+    ),
+    /*
+     * C7 SÍ materializa —aceptar escribe la narrativa en el post mortem que ya estaba abierto—
+     * así que no dice nada aquí. Que no CREE una fila no la hace informativa: lo informativo
+     * es no escribir en ningún sitio, y ésta escribe cuatro columnas.
+     */
+    sinAccion: null,
+  },
+  C3: {
+    rotulo: 'Oportunidad HMW propuesta',
+    ficha: (c, etiquetas) => (
+      <FichaOportunidad contenido={c as ContenidoOportunidad} etiquetas={etiquetas} />
+    ),
+    // C3 SÍ materializa —nace una oportunidad en el portafolio— así que tampoco dice nada aquí.
+    sinAccion: null,
+  },
 };
 
 /**
@@ -1124,6 +1266,58 @@ const MATERIALIZACION: Record<
     formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
       <FormularioCriterio
         inicial={inicial as ContenidoCriterio}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'outcome-review': {
+    /*
+     * Corregir un borrador de post mortem es LO NORMAL, no la excepción: para eso es un
+     * borrador. Los cuatro campos narrativos se reescriben enteros —es prosa, y prosa que una
+     * persona va a firmar—, así que no hay bloqueo propio que poner.
+     *
+     * Lo que NO aparece en el formulario, y por eso lo dice el comentario: las desviaciones y
+     * las citas. Las citas son testimonio del modelo y las gobierna `CITAS_DEL_CONTENIDO`; las
+     * desviaciones no se editan porque nombran elementos que el servicio ya comprobó contra el
+     * material —dejarlas editables permitiría apuntar a otro elemento después de la
+     * comprobación, y lo que quedaría archivado sería una lectura sobre algo que el modelo no
+     * miró—. Se corrige la narrativa, que es lo que se materializa.
+     */
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioPostMortem
+        inicial={inicial as ContenidoPostMortem}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  'entrada-kpi': {
+    // Una entrada tampoco: su esquema exige los seis campos que la tabla necesita para nacer,
+    // y los que quedan vacíos —el dueño del dato, la línea base, la ventana, el dashboard— los
+    // pone una persona DESPUÉS editando la entrada, que es exactamente el mismo reparto que
+    // el criterio y por la misma razón: son compromisos, no redacción.
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioEntradaKpi
+        inicial={inicial as ContenidoEntradaKpi}
+        ocupado={ocupado}
+        onEnviar={onEnviar}
+        onCancelar={onCancelar}
+      />
+    ),
+  },
+  oportunidad: {
+    // Tampoco: lo que la HMW necesita para nacer —la pregunta, su prioridad y su razón— lo
+    // trae entero la propuesta, y el VEREDICTO lo pone una persona después, en el portafolio,
+    // con su propia puerta. Ese reparto es el mismo del criterio y el de la entrada KPI.
+    bloqueoPropio: () => null,
+    formulario: ({ inicial, ocupado, onEnviar, onCancelar }) => (
+      <FormularioOportunidad
+        inicial={inicial as ContenidoOportunidad}
         ocupado={ocupado}
         onEnviar={onEnviar}
         onCancelar={onCancelar}
@@ -1356,7 +1550,9 @@ function TarjetaPropuesta({
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={ocupado || !anclaDisponible}
+                disabled={
+                  ocupado || (!anclaDisponible && !CORREGIR_SIGUE_ABIERTO[propuesta.anclaEstado])
+                }
                 onClick={() => setCorrigiendo(true)}
               >
                 Corregir y aceptar
@@ -1908,6 +2104,481 @@ function FormularioExtraccion({
           {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
         </Button>
         <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function FichaEntradaKpi({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoEntradaKpi;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="KPI" valor={contenido.nombre} />
+      <Dato
+        rotulo="Responde al criterio"
+        // El KPI del criterio, no su uuid: quien revisa tiene que poder decir si este
+        // indicador mide ESA promesa, y para eso hay que leer la promesa.
+        valor={
+          etiquetas[contenido.criterioId] ??
+          `criterio ${contenido.criterioId} (ya no está)`
+        }
+      />
+      <Dato rotulo="Definición del cálculo" valor={contenido.definicion} />
+      <Dato rotulo="Fuente del dato" valor={contenido.fuente} />
+      {contenido.dimensiones && <Dato rotulo="Dimensiones" valor={contenido.dimensiones} />}
+      <Dato rotulo="Frecuencia" valor={contenido.frecuencia} />
+      {contenido.citas.map((c, i) => (
+        <Dato key={String(i)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+      ))}
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        La entrada nace sin dueño del dato, sin línea base y sin fecha de inicio: eso lo acuerda
+        una persona del cliente y se completa en el registry antes de firmarlo.
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Las citas de una HMW, agrupadas por el insight en el que se apoyan.
+ *
+ * El orden es el de PRIMERA APARICIÓN, y los grupos salen de los `insightId` DISTINTOS: es
+ * exactamente el conjunto que `oportunidad_insight` materializa al aceptar, así que la ficha
+ * enseña tantos apoyos como filas de traza se van a escribir. Pintadas en plano —una fila por
+ * cita— dos citas al mismo insight enseñaban dos apoyos donde la traza tendrá uno, y quien
+ * revisa contaba mal justo lo que el guard comprueba.
+ */
+function citasPorInsight(citas: ContenidoOportunidad['citas']) {
+  const grupos = new Map<string, ContenidoOportunidad['citas']>();
+  for (const c of citas) {
+    const suyas = grupos.get(c.insightId);
+    if (suyas) suyas.push(c);
+    else grupos.set(c.insightId, [c]);
+  }
+  return [...grupos].map(([insightId, suyas]) => ({ insightId, citas: suyas }));
+}
+
+/**
+ * La ficha de una HMW propuesta.
+ *
+ * Enseña la TRAZA con el título de cada insight y no con su uuid, por lo mismo que la de C6
+ * enseña el KPI del criterio: quien revisa tiene que poder decir si esta pregunta se sostiene
+ * en ESAS conclusiones, y para eso hay que leerlas. Y las citas van agrupadas debajo de su
+ * insight, no en una lista aparte, porque en C3 la cita ES la traza — separarlas sugeriría que
+ * son dos cosas que pueden discrepar.
+ */
+/**
+ * La ficha de C7: los cuatro campos que se van a escribir, y las desviaciones que el modelo
+ * leyó del tablero.
+ *
+ * Las desviaciones van SEPARADAS de la narrativa y con su elemento nombrado, no dentro del
+ * texto: son lo contrastable de esta salida —cada una señala un elemento que estaba en el
+ * material— y quien revisa tiene que poder ir a mirarlo. Metidas en la prosa, comprobar una
+ * exigiría leerla entera buscando a cuál se refiere.
+ *
+ * Y se dice lo que NO se propone. Sin eso, quien acepta puede creer que el borrador trae el
+ * veredicto y que aceptarlo cierra el post mortem, que es justo lo contrario: el veredicto lo
+ * firma quien lo cierra, y esta pantalla no lo toca.
+ */
+function FichaPostMortem({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoPostMortem;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Contribución" valor={contenido.contribucion} />
+      {contenido.factoresExternos !== '' && (
+        <Dato rotulo="Factores externos" valor={contenido.factoresExternos} />
+      )}
+      {contenido.hipotesisAbiertas !== '' && (
+        <Dato rotulo="Hipótesis abiertas" valor={contenido.hipotesisAbiertas} />
+      )}
+      <Dato rotulo="Aprendizajes" valor={contenido.aprendizajes} />
+      {contenido.desviaciones.length > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-faint)',
+          }}
+        >
+          <span style={{ font: '500 11.5px var(--font-mono)', color: 'var(--text-muted)' }}>
+            Desviaciones leídas del tablero
+          </span>
+          {contenido.desviaciones.map((d: ContenidoPostMortem['desviaciones'][number]) => (
+            <Dato
+              key={d.elementoId}
+              /* El nombre del elemento si el panel lo trae; su id si no. Un uuid a secas no le
+               * dice nada a quien revisa, y esa traducción la hace `etiquetasDelContenido`. */
+              rotulo={etiquetas[d.elementoId] ?? d.elementoId}
+              valor={d.lectura}
+            />
+          ))}
+        </div>
+      )}
+      <span style={{ font: '400 11.5px var(--font-sans)', color: 'var(--text-muted)' }}>
+        No se propone el veredicto ni la casilla de diseño experimental: los firma quien cierra
+        el post mortem (RF-07.8, SYS-24).
+      </span>
+    </div>
+  );
+}
+
+function FichaOportunidad({
+  contenido,
+  etiquetas,
+}: {
+  contenido: ContenidoOportunidad;
+  etiquetas: Record<string, string>;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        padding: 12,
+        background: 'var(--surface-sunken)',
+        borderRadius: 'var(--r-sm)',
+      }}
+    >
+      <Dato rotulo="Pregunta" valor={contenido.pregunta} />
+      <Dato rotulo="Prioridad" valor={String(contenido.prioridad)} />
+      <Dato rotulo="Por qué esa prioridad" valor={contenido.prioridadRazon} />
+      {citasPorInsight(contenido.citas).map((g) => (
+        <div
+          key={g.insightId}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            paddingTop: 8,
+            borderTop: '1px solid var(--border-faint)',
+          }}
+        >
+          <Dato
+            // El insight ENCABEZA el grupo y no va dentro del valor de cada cita: es de quién
+            // se copia, no parte de lo copiado. Y si ya no está, se dice con su id — que es lo
+            // único que queda.
+            rotulo="Se apoya en"
+            valor={etiquetas[g.insightId] ?? `insight ${g.insightId} (ya no está)`}
+          />
+          {g.citas.map((c, j) => (
+            <Dato key={String(j)} rotulo="Cita" valor={`«${c.fragmento}» · ${c.localizacion}`} />
+          ))}
+        </div>
+      ))}
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        Aceptarla la mete en el portafolio POR DECIDIR: aprobarla o descartarla es un acto
+        aparte, y descartarla exige una razón.
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Y su corrección: la pregunta, la prioridad y su razón.
+ *
+ * Las CITAS no están, y esa ausencia es la regla de la capacidad: los insights citados son la
+ * traza, así que reapuntarlos conservando el texto sería quedarse con el sostén de unos para
+ * afirmar sobre otros. Si el modelo se apoyó en el insight equivocado, la salida es rechazar.
+ */
+function FormularioOportunidad({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoOportunidad;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoOportunidad) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [pregunta, setPregunta] = useState(inicial.pregunta);
+  const [prioridad, setPrioridad] = useState(String(inicial.prioridad));
+  const [prioridadRazon, setPrioridadRazon] = useState(inicial.prioridadRazon);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          pregunta,
+          // El campo es texto y el contrato pide un entero del rango: se acota ANTES de salir,
+          // como hace la pantalla del portafolio. Un valor que el servidor rechaza llega como
+          // «vuelve a intentarlo», que no dice lo único que hay que saber.
+          prioridad: Math.min(1000, Math.max(0, Math.round(Number(prioridad) || 0))),
+          prioridadRazon,
+          // Mismo criterio que el resto: lo que el modelo afirmó —sus citas y su confianza— no
+          // lo reescribe quien corrige. Y aquí las citas son además la traza.
+          confianzaPropuesta: inicial.confianzaPropuesta,
+          citas: inicial.citas,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Pregunta</span>
+        <Textarea
+          required
+          rows={2}
+          maxLength={MAX_PREGUNTA}
+          value={pregunta}
+          onChange={(e) => setPregunta(e.target.value)}
+        />
+      </label>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 3fr', gap: 12 }}>
+        <label style={campo}>
+          <span style={etiqueta}>Prioridad</span>
+          <Input
+            required
+            type="number"
+            min={0}
+            max={1000}
+            step={1}
+            value={prioridad}
+            onChange={(e) => setPrioridad(e.target.value)}
+          />
+        </label>
+        <label style={campo}>
+          <span style={etiqueta}>Por qué esa prioridad</span>
+          <Textarea
+            required
+            rows={2}
+            maxLength={MAX_RAZON}
+            value={prioridadRazon}
+            onChange={(e) => setPrioridadRazon(e.target.value)}
+          />
+        </label>
+      </div>
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button type="submit" size="sm" disabled={ocupado}>
+          {ocupado ? 'Aceptando…' : 'Aceptar con estas correcciones'}
+        </Button>
+        <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function FormularioPostMortem({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoPostMortem;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoPostMortem) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [contribucion, setContribucion] = useState(inicial.contribucion);
+  const [factoresExternos, setFactoresExternos] = useState(inicial.factoresExternos);
+  const [hipotesisAbiertas, setHipotesisAbiertas] = useState(inicial.hipotesisAbiertas);
+  const [aprendizajes, setAprendizajes] = useState(inicial.aprendizajes);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          contribucion,
+          factoresExternos,
+          hipotesisAbiertas,
+          aprendizajes,
+          /* Intactas: son testimonio del modelo o ya están comprobadas contra el material. */
+          desviaciones: inicial.desviaciones,
+          citas: inicial.citas,
+          confianzaPropuesta: inicial.confianzaPropuesta,
+        });
+      }}
+    >
+      <label style={campo}>
+        <span style={etiqueta}>Contribución</span>
+        <Textarea
+          rows={4}
+          maxLength={TOPE_NARRATIVA}
+          value={contribucion}
+          onChange={(e) => setContribucion(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Factores externos</span>
+        <Textarea
+          rows={3}
+          maxLength={TOPE_NARRATIVA}
+          value={factoresExternos}
+          onChange={(e) => setFactoresExternos(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Hipótesis abiertas</span>
+        <Textarea
+          rows={3}
+          maxLength={TOPE_NARRATIVA}
+          value={hipotesisAbiertas}
+          onChange={(e) => setHipotesisAbiertas(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Aprendizajes</span>
+        <Textarea
+          rows={4}
+          maxLength={TOPE_NARRATIVA}
+          value={aprendizajes}
+          onChange={(e) => setAprendizajes(e.target.value)}
+        />
+      </label>
+      {/* Las desviaciones y las citas van a la vista y sin editar en la ficha: son lo
+          contrastable de esta salida y no se corrigen. */}
+      <div style={{ display: 'flex', gap: 10 }}>
+        <Button size="sm" type="submit" disabled={ocupado}>
+          Corregir y aceptar
+        </Button>
+        <Button size="sm" variant="ghost" type="button" disabled={ocupado} onClick={onCancelar}>
+          Cancelar
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function FormularioEntradaKpi({
+  inicial,
+  ocupado,
+  onEnviar,
+  onCancelar,
+}: {
+  inicial: ContenidoEntradaKpi;
+  ocupado: boolean;
+  onEnviar: (c: ContenidoEntradaKpi) => Promise<void>;
+  onCancelar: () => void;
+}) {
+  const [nombre, setNombre] = useState(inicial.nombre);
+  const [definicion, setDefinicion] = useState(inicial.definicion);
+  const [fuente, setFuente] = useState(inicial.fuente);
+  const [dimensiones, setDimensiones] = useState(inicial.dimensiones);
+  const [frecuencia, setFrecuencia] = useState(inicial.frecuencia);
+
+  return (
+    <form
+      style={CAJA_CORRECCION}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void onEnviar({
+          criterioId: inicial.criterioId,
+          nombre,
+          definicion,
+          fuente,
+          dimensiones,
+          frecuencia,
+          // Mismo criterio que en CI y en C0: lo que el modelo afirmó —sus citas y su
+          // confianza— no lo reescribe quien corrige.
+          confianzaPropuesta: inicial.confianzaPropuesta,
+          citas: inicial.citas,
+        });
+      }}
+    >
+      <span style={{ font: '700 13px var(--font-sans)', color: 'var(--ink)' }}>
+        Corregir antes de aceptar (la propuesta original se conserva)
+      </span>
+      <label style={campo}>
+        <span style={etiqueta}>Nombre del KPI</span>
+        <Input
+          required
+          maxLength={MAX_NOMBRE_KPI}
+          value={nombre}
+          onChange={(e) => setNombre(e.target.value)}
+        />
+      </label>
+      <label style={campo}>
+        <span style={etiqueta}>Definición del cálculo</span>
+        <Textarea
+          required
+          rows={2}
+          maxLength={MAX_DEFINICION_KPI}
+          value={definicion}
+          onChange={(e) => setDefinicion(e.target.value)}
+        />
+      </label>
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12 }}>
+        <label style={campo}>
+          <span style={etiqueta}>Fuente del dato</span>
+          <Input
+            required
+            maxLength={MAX_FUENTE_KPI}
+            value={fuente}
+            onChange={(e) => setFuente(e.target.value)}
+          />
+        </label>
+        <label style={campo}>
+          <span style={etiqueta}>Frecuencia</span>
+          <select
+            required
+            value={frecuencia}
+            onChange={(e) => setFrecuencia(e.target.value as ContenidoEntradaKpi['frecuencia'])}
+            style={{ font: '400 13px var(--font-sans)', padding: '6px 8px' }}
+          >
+            <option value="semanal">semanal</option>
+            <option value="mensual">mensual</option>
+            <option value="trimestral">trimestral</option>
+            <option value="unica">única</option>
+          </select>
+        </label>
+      </div>
+      <label style={campo}>
+        <span style={etiqueta}>Dimensiones (opcional)</span>
+        <Input
+          maxLength={MAX_DIMENSIONES_KPI}
+          value={dimensiones}
+          onChange={(e) => setDimensiones(e.target.value)}
+        />
+      </label>
+      <span style={{ font: '400 12px var(--font-sans)', color: 'var(--text-faint)' }}>
+        El criterio al que responde no se cambia aquí: si es el equivocado, rechaza la propuesta
+        —o acéptala y reapúntala editando la entrada, que es el camino que el registry tiene
+        mientras sea borrador.
+      </span>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <Button type="submit" size="sm" disabled={ocupado}>
+          Aceptar corregida
+        </Button>
+        <Button type="button" size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
           Cancelar
         </Button>
       </div>

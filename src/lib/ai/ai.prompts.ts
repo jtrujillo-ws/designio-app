@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-05.11';
+export const PROMPT_VERSION = 'ai-2026-09-06.20';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -307,6 +307,448 @@ export function materialDeUnaEvidencia(reto: RetoConEvidencia, evidenciaId: stri
 }
 
 /**
+ * Material de C3: los INSIGHTS VALIDADOS del reto, cada uno con su id delante, y detrás los
+ * CRITERIOS DE ÉXITO como segundo bloque.
+ *
+ * SPEC-08 pone las dos cosas en la fila de C3 —«insights validados + criterios del reto»— y
+ * cada una hace un trabajo distinto, que es la razón de que vayan separadas:
+ *
+ *   · los INSIGHTS son el material CONTRA el que se propone: de ahí se copian las citas, y de
+ *     ahí sale la traza. Llevan tramos, como la evidencia de C2 y los criterios de C6, porque
+ *     la presencia literal de una cita se mide contra EL insight que nombra y no contra el
+ *     material entero — si no, un fragmento del insight de al lado saldría PRESENTE;
+ *   · los CRITERIOS no se citan: son contra lo que la razón de la prioridad tiene que
+ *     argumentar. Una HMW se prioriza por lo que promete mover, y esa promesa está en G0.
+ *
+ * Van en el mismo cuerpo delimitado y no en dos bloques: los dos son material del reto, los
+ * dos se recortan con el mismo presupuesto, y separarlos daría dos techos que hay que repartir
+ * a mano. Los criterios van DETRÁS a propósito — si el recorte muerde, que muerda lo que no se
+ * cita, no lo que sostiene las citas.
+ */
+export type InsightsDelReto = { id: string; titulo: string; resumen: string }[];
+
+type RetoConInsights = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  insights: InsightsDelReto;
+  criterios: CriteriosDelReto;
+};
+
+export function materialDeOportunidades(reto: RetoConInsights): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', reto.codigo],
+      ['Título del reto', reto.titulo],
+    ],
+    cuerpoDeOportunidades(reto).texto,
+  );
+}
+
+/** El cuerpo del material de C3 y dónde queda cada insight dentro de él. Hermano exacto de
+ * `cuerpoDeInsights`, con el mismo motivo escrito allí: el pajar de una cita es el documento
+ * que nombra, y hay que sacarlo de AQUÍ y no recomponerlo aparte —recomponerlo reinicia el
+ * presupuesto y devuelve un texto que el modelo nunca vio—. */
+function cuerpoDeOportunidades(reto: RetoConInsights): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+  tramosCriterios: Map<string, [number, number]>;
+} {
+  const partes = [reto.descripcion, '', 'INSIGHTS VALIDADOS DEL RETO'];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const i of reto.insights) {
+    const linea = `[${i.id}] ${i.titulo}\n${i.resumen}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(i.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  // Los criterios, detrás. Se enseñan enteros —KPI, definición y objetivo— porque la razón de
+  // la prioridad tiene que poder nombrarlos, y una lista de KPIs a secas no da para argumentar
+  // contra nada.
+  //
+  // Y CON tramos, aunque no se citen: van al final, así que son los primeros que el recorte se
+  // come, y el sistema exige que cada razón nombre el criterio que movería. Sin poder decir
+  // cuáles llegaron enteros no había forma de distinguir «no nombró ninguno» de «no le
+  // enseñamos ninguno», que es la diferencia entre una respuesta mala y una pregunta mal hecha.
+  partes.push('', 'CRITERIOS DE ÉXITO DEL RETO (contra los que se prioriza; no se citan)');
+  largo = partes.join('\n').length;
+  const tramosCriterios = new Map<string, [number, number]>();
+  for (const c of reto.criterios) {
+    const linea = `${c.kpi}: ${c.definicion} · objetivo: ${c.objetivo}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramosCriterios.set(c.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  return { texto: partes.join('\n'), tramos, tramosCriterios };
+}
+
+/**
+ * Cuántos criterios de éxito llegaron ENTEROS al modelo EN EL MATERIAL DE C3.
+ *
+ * Hermana y no la misma que `criteriosQueLlegaronAlModelo`, que mide los de C6: son dos
+ * cuerpos distintos —allí los criterios SON el material y van delante; aquí van detrás de los
+ * insights— así que se recortan en sitios distintos. Una sola función mediría un texto que en
+ * la otra capacidad nadie manda.
+ *
+ * El sistema de C3 dice que la razón de la prioridad argumenta contra los criterios del reto:
+ * «qué criterio movería esta pregunta si se resolviera». Pero `prioridadRazon` es prosa libre
+ * —el contrato solo exige que no esté vacía—, así que si no llega ningún criterio el modelo
+ * cumple la instrucción inventándose uno, y lo inventado se materializa con aspecto de
+ * argumento. Es el mismo motivo por el que C6 no se ofrece sobre un reto sin criterios: no se
+ * pide un razonamiento contra un material que no se ha enseñado.
+ */
+export function criteriosQueLlegaronConLasOportunidades(reto: RetoConInsights): {
+  ids: string[];
+  fuera: number;
+} {
+  const { texto, tramosCriterios } = cuerpoDeOportunidades(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.criterios
+    .filter((c) => {
+      const tramo = tramosCriterios.get(c.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((c) => c.id);
+  return { ids, fuera: reto.criterios.length - ids.length };
+}
+
+/**
+ * Qué insights llegaron ENTEROS al modelo, cuántos se quedaron fuera y cuánto ocupaba todo.
+ *
+ * Hermano de `evidenciaQueLlegoAlModelo`, y con la misma razón de contar solo los COMPLETOS:
+ * `alcance_insights` dice qué tuvo delante quien escribió las preguntas, y el suelo lo compara
+ * con lo que el reto sabe hoy. Medio insight no es un insight leído — la parte que habría
+ * cambiado la pregunta puede ser justo la que se cortó, y el sello diría que se miró.
+ */
+export function insightsQueLlegaronAlModelo(reto: RetoConInsights): {
+  ids: string[];
+  fuera: number;
+  caracteres: number;
+} {
+  const { texto, tramos } = cuerpoDeOportunidades(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.insights
+    .filter((i) => {
+      const tramo = tramos.get(i.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((i) => i.id);
+  return { ids, fuera: reto.insights.length - ids.length, caracteres: texto.length };
+}
+
+/** El texto de UN insight tal como el modelo lo vio, para medir contra él las citas que lo
+ * nombran — y SOLO él. Mismo orden de operaciones que su hermano de C2: se recorta primero y
+ * se corta el tramo después, porque la neutralización del delimitador cambia un carácter por
+ * otro y no mueve las posiciones. */
+export function materialDeUnInsight(reto: RetoConInsights, insightId: string): string {
+  const { texto, tramos } = cuerpoDeOportunidades(reto);
+  const tramo = tramos.get(insightId);
+  if (!tramo) return '';
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
+}
+
+/**
+ * Material de C6: los CRITERIOS DE ÉXITO del reto, cada uno con su id delante.
+ *
+ * Mismo patrón que el material de C2 y por el mismo motivo: la cita de una entrada KPI señala
+ * UN criterio, así que hace falta saber dónde queda cada uno dentro del cuerpo para medir la
+ * presencia literal contra el trozo que le corresponde y no contra el material entero. Sin
+ * los tramos, un fragmento copiado del criterio de al lado saldría PRESENTE.
+ *
+ * Los ids son uuid de la base y no son superficie de inyección; el KPI, la definición y el
+ * objetivo de cada criterio sí los escribió un miembro, y por eso todo va dentro del mismo
+ * bloque no confiable, ficha incluida.
+ */
+export type CriteriosDelReto = {
+  id: string;
+  kpi: string;
+  definicion: string;
+  objetivo: string;
+  ventanaDias: number | null;
+  lineaBasePlan: string;
+}[];
+
+/**
+ * El expediente que C7 lee: el reto, sus lecturas por criterio y su tablero de conciliación.
+ *
+ * Los tipos son los de las dos lecturas que lo componen, no una copia suya: `lecturas` viene
+ * de `resultado_criterio` unido a su criterio, y `conciliacion` de `conciliacion_del_reto`, que
+ * compone `filas_de_conciliacion`. Escribir aquí una forma propia sería la segunda redacción de
+ * un contrato que la base ya tiene, y las dos se separan en cuanto una de ellas cambie.
+ */
+export type ExpedienteDePostMortem = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  metricaObjetivo: string;
+  lecturas: {
+    criterioId: string;
+    kpi: string;
+    objetivo: string;
+    ventanaDias: number;
+    lectura: string;
+    sinDatosMotivo: string;
+  }[];
+  conciliacion: {
+    proyectoCodigo: string;
+    designVersionCodigo: string;
+    elementos: {
+      elementoId: string;
+      elementoTitulo: string;
+      tipo: string;
+      operacion: string;
+      estado: string;
+      releaseCodigo: string | null;
+      releaseResponsable: string | null;
+      releaseFecha: string | null;
+      queQuedoDistinto: string;
+      razonDesviacion: string;
+    }[];
+  }[];
+};
+
+type RetoConCriterios = {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  criterios: CriteriosDelReto;
+};
+
+/**
+ * El material de C7: el EXPEDIENTE del post mortem, que son dos lecturas deterministas.
+ *
+ * ── QUÉ ENTRA, Y POR QUÉ SOLO ESO ──
+ *
+ * SPEC-08 dice «DV vs. constataciones; snapshots». Traducido a lo que este esquema tiene:
+ *
+ *   · el TABLERO DE CONCILIACIÓN del reto —elemento a elemento, dónde quedó cada uno en la
+ *     cadena aprobado → release → despliegue → constatación, con el «qué quedó distinto» y la
+ *     razón que el lead registró—, que sale de `conciliacion_del_reto`, que compone
+ *     `filas_de_conciliacion`, que es LA MISMA que dibuja el tablero de G7. Que el material del
+ *     modelo y el tablero del humano sean la misma lectura es la mitad de lo que hace
+ *     determinista a esta capacidad.
+ *   · las LECTURAS POR CRITERIO: qué prometía cada uno, en qué ventana, y qué dio (o por qué no
+ *     hay dato). Eso es `resultado_criterio`, cuyo XOR garantiza que una fila nunca traiga las
+ *     dos cosas.
+ *
+ * Lo que NO entra: los snapshots crudos. La serie completa de un KPI son cientos de filas que
+ * el modelo no puede leer con provecho y que ya están resumidas en la lectura final que el lead
+ * registró — meterlas sería pagar contexto por ruido y, peor, invitar al modelo a recalcular
+ * un resultado que un humano ya constató.
+ */
+export function materialDePostMortem(expediente: ExpedienteDePostMortem): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', expediente.codigo],
+      ['Título del reto', expediente.titulo],
+      ['Métrica objetivo', expediente.metricaObjetivo],
+    ],
+    cuerpoDePostMortem(expediente).texto,
+  );
+}
+
+function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
+  texto: string;
+  /**
+   * Dónde acaba la LÍNEA de cada elemento dentro del cuerpo.
+   *
+   * Existe por la misma razón que los tramos de C2 y C3, y con una diferencia: allí el tramo
+   * es el pajar contra el que se mide una cita; aquí no se cita ningún elemento —las citas de
+   * C7 van contra el expediente entero— y lo que hace falta saber es más simple, si la línea
+   * del elemento SOBREVIVIÓ al recorte. Por eso basta con el final, no con el par.
+   */
+  finales: Map<string, number>;
+  /**
+   * Dónde ACABA cada sección del cuerpo, para que el aviso del recorte diga la verdad.
+   *
+   * La primera versión del aviso afirmaba que lo que faltaba era «la cola del tablero», y eso
+   * es cierto casi siempre —la conciliación va la última— pero no siempre: con una descripción
+   * de reto larga y cuatro lecturas cerca de su tope, el corte cae DENTRO del bloque de
+   * lecturas y el tablero no llega a empezar. Un aviso que nombra la sección equivocada es peor
+   * que uno genérico: le dice al modelo que las lecturas que ve son todas, y esa es
+   * exactamente la afirmación falsa que el aviso existía para impedir.
+   */
+  secciones: { lecturas: number; conciliacion: number };
+} {
+  const partes = [expediente.descripcion, '', 'LECTURA DE CADA CRITERIO DE ÉXITO'];
+  if (expediente.lecturas.length === 0) {
+    partes.push('(ninguna registrada todavía)');
+  }
+  for (const l of expediente.lecturas) {
+    partes.push(
+      `- [${l.criterioId}] ${l.kpi}`,
+      `  Objetivo: ${l.objetivo}`,
+      `  Ventana: ${l.ventanaDias} días`,
+      /*
+       * O la lectura, O el motivo por el que no hay dato — nunca las dos, que es lo que el
+       * XOR de `resultado_criterio` garantiza. Se escribe con la misma forma para que el
+       * modelo no tenga que adivinar cuál de los dos está viendo.
+       */
+      l.lectura.trim() !== ''
+        ? `  Resultado: ${l.lectura}`
+        : `  Sin dato: ${l.sinDatosMotivo}`,
+    );
+  }
+  const finLecturas = partes.join('\n').length;
+  partes.push('', 'CONCILIACIÓN: QUÉ SE APROBÓ Y QUÉ QUEDÓ');
+  if (expediente.conciliacion.length === 0) {
+    partes.push('(este reto no tiene design versions a cargo de sus proyectos)');
+  }
+  const finales = new Map<string, number>();
+  /*
+   * El largo del texto YA UNIDO, llevado INCREMENTALMENTE. La primera versión hacía
+   * `partes.join('\n').length` dentro del bucle, o sea copiar el prefijo entero una vez por
+   * elemento: cuadrático sobre una conciliación que la base no acota, y pagado en CADA render
+   * —el del prompt y el del panel— aunque el único que necesita este mapa sea el del recorte.
+   * Medido antes de cambiarlo: 1,7 ms con 100 elementos, 46 ms con 800.
+   *
+   * Es la forma que ya usan `cuerpoDeInsights`, `cuerpoDeOportunidades` y `cuerpoDeRevision`;
+   * ésta se escribió sola y por eso se desvió. `partes` nunca está vacío aquí —arriba se
+   * empujó la cabecera del bloque—, así que el '\n' que une cada línea a lo anterior siempre
+   * cuenta.
+   */
+  let largo = partes.join('\n').length;
+  const anota = (linea: string) => {
+    partes.push(linea);
+    largo = largo + 1 + linea.length;
+  };
+  for (const bloque of expediente.conciliacion) {
+    anota(`${bloque.proyectoCodigo} · ${bloque.designVersionCodigo}`);
+    for (const e of bloque.elementos) {
+      anota(`- [${e.elementoId}] ${e.elementoTitulo} (${e.tipo}/${e.operacion}) → ${e.estado}`);
+      if (e.releaseCodigo) {
+        anota(`  Release: ${e.releaseCodigo} · ${e.releaseResponsable} · ${e.releaseFecha}`);
+      }
+      /* La desviación registrada, que es el hecho del que el modelo puede hablar. Su ausencia
+       * también dice algo —el elemento quedó como se aprobó— y por eso no se rellena. */
+      if (e.queQuedoDistinto) anota(`  Quedó distinto: ${e.queQuedoDistinto}`);
+      if (e.razonDesviacion) anota(`  Razón registrada: ${e.razonDesviacion}`);
+      /*
+       * Y dónde acaba lo que este elemento aporta. Se anota después de sus líneas opcionales y
+       * no en la primera: un elemento cuyo «quedó distinto» cayó al otro lado del corte llegó a
+       * medias, y lo que la desviación necesita es precisamente ese hecho.
+       */
+      finales.set(e.elementoId, largo);
+    }
+  }
+  return {
+    texto: partes.join('\n'),
+    finales,
+    secciones: { lecturas: finLecturas, conciliacion: largo },
+  };
+}
+
+/**
+ * Qué elementos de la conciliación llegaron ENTEROS al modelo.
+ *
+ * Hermana de `evidenciaQueLlegoAlModelo` y de `insightsQueLlegaronAlModelo`, y hace falta por
+ * lo mismo: el cuerpo se recorta ENTERO a `MAX_MATERIAL`, así que con una conciliación grande
+ * la cola se queda fuera. Un `elementoId` del sufijo truncado pasa el suelo —es un elemento de
+ * este reto y su estado admite lectura— y sin embargo la desviación que lo nombra se escribió
+ * sin verlo: manda a alguien a revisar un release que el modelo nunca leyó, con la firma de un
+ * post mortem detrás.
+ */
+/**
+ * Qué SECCIONES del expediente sobrevivieron enteras al recorte.
+ *
+ * El aviso del prompt se compone con esto y no con una suposición. «Lo que falta es la cola del
+ * tablero» es cierto casi siempre —la conciliación va la última—, y deja de serlo con una
+ * descripción de reto larga y lecturas cerca de su tope: entonces el corte cae dentro del
+ * bloque de lecturas y el tablero no llega a empezar. Nombrar la sección equivocada es peor que
+ * no nombrar ninguna: le dice al modelo que las lecturas que ve son todas.
+ */
+export function seccionesQueLlegaronAlPostMortem(expediente: ExpedienteDePostMortem): {
+  lecturas: boolean;
+  conciliacion: boolean;
+} {
+  const { texto, secciones } = cuerpoDePostMortem(expediente);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { lecturas: secciones.lecturas <= cabe, conciliacion: secciones.conciliacion <= cabe };
+}
+
+export function elementosQueLlegaronAlModelo(expediente: ExpedienteDePostMortem): {
+  ids: string[];
+} {
+  const { texto, finales } = cuerpoDePostMortem(expediente);
+  const cabe = materialQueVeElModelo(texto).length;
+  return { ids: [...finales].filter(([, fin]) => fin <= cabe).map(([id]) => id) };
+}
+
+export function materialDeRegistry(reto: RetoConCriterios): MaterialDelimitado {
+  return bloqueConFicha(
+    [
+      ['Código del reto', reto.codigo],
+      ['Título del reto', reto.titulo],
+    ],
+    cuerpoDeRegistry(reto).texto,
+  );
+}
+
+function cuerpoDeRegistry(reto: RetoConCriterios): {
+  texto: string;
+  tramos: Map<string, [number, number]>;
+} {
+  const partes = [reto.descripcion, '', 'CRITERIOS DE ÉXITO DEL RETO'];
+  const tramos = new Map<string, [number, number]>();
+  let largo = partes.join('\n').length;
+  for (const c of reto.criterios) {
+    // La VENTANA va dentro y no es adorno: es lo que decide si una frecuencia da una serie o
+    // un solo punto. `null` se escribe como tal —«sin ventana»— en vez de omitirse, porque
+    // omitirla se lee como que no importa.
+    const linea =
+      `[${c.id}] ${c.kpi}\n${c.definicion}\nObjetivo: ${c.objetivo}\n` +
+      `Ventana: ${c.ventanaDias === null ? 'sin ventana declarada' : `${c.ventanaDias} días`}\n` +
+      `Línea base: ${c.lineaBasePlan}`;
+    const inicio = largo + 1; // el '\n' que la une a lo anterior
+    tramos.set(c.id, [inicio, inicio + linea.length]);
+    partes.push(linea);
+    largo = inicio + linea.length;
+  }
+  return { texto: partes.join('\n'), tramos };
+}
+
+/**
+ * Qué criterios llegaron ENTEROS al modelo, cuántos se quedaron fuera y cuánto ocupaba todo.
+ *
+ * El hermano de `evidenciaQueLlegoAlModelo`, y existe por lo mismo: el cuerpo se recorta
+ * ENTERO a `MAX_MATERIAL`, así que la cola se queda fuera —a medias o del todo— y apuntar
+ * como visto todo lo consultado daría por leído lo que el recorte se comió. Medio criterio no
+ * es un criterio leído: la ventana o el objetivo pueden estar justo en el trozo cortado, y el
+ * KPI propuesto contra él no mediría lo que promete.
+ */
+export function criteriosQueLlegaronAlModelo(reto: RetoConCriterios): {
+  ids: string[];
+  fuera: number;
+  caracteres: number;
+} {
+  const { texto, tramos } = cuerpoDeRegistry(reto);
+  const visto = materialQueVeElModelo(texto);
+  const ids = reto.criterios
+    .filter((c) => {
+      const tramo = tramos.get(c.id);
+      return tramo !== undefined && visto.slice(tramo[0], tramo[1]).length === tramo[1] - tramo[0];
+    })
+    .map((c) => c.id);
+  return { ids, fuera: reto.criterios.length - ids.length, caracteres: texto.length };
+}
+
+/**
+ * El texto de UN criterio tal como el modelo lo vio, para medir contra él las citas de la
+ * entrada que lo nombra — y SOLO él. Mismas dos razones que su hermano de C2: ni el material
+ * completo (la formulación del reto saldría como sostén de cualquier cita) ni el criterio
+ * recompuesto aparte (reiniciaría el presupuesto y devolvería texto que el modelo no vio).
+ */
+export function materialDeUnCriterio(reto: RetoConCriterios, criterioId: string): string {
+  const { texto, tramos } = cuerpoDeRegistry(reto);
+  const tramo = tramos.get(criterioId);
+  if (!tramo) return '';
+  return materialQueVeElModelo(texto).slice(tramo[0], tramo[1]);
+}
+
+/**
  * Material de un journey: su ficha, su GRAFO y las SEÑALES que la validación ya emitió.
  *
  * Las señales van dentro, y son lo que distingue a C5 de una capacidad que adivina: el
@@ -523,6 +965,79 @@ export const SISTEMA_INSIGHTS = [
 ].join('\n');
 
 /**
+ * C3 propone PREGUNTAS, y su sistema tiene que decir tres cosas que un modelo no adivina.
+ *
+ * 1. Una HMW no es una solución disfrazada. «¿Cómo podríamos añadir un chatbot?» ya decidió
+ *    qué se va a hacer y deja a la etapa 4 sin nada que explorar; la etapa 3 existe para
+ *    abrir el espacio, no para cerrarlo. Es el error más fácil de cometer y el más difícil de
+ *    ver después, porque una solución bien redactada suena a pregunta.
+ * 2. La traza ES la cita. No se le pide una lista de insights aparte: los que cita son en los
+ *    que se apoya, y por eso citar de más o de menos no es un detalle de estilo.
+ * 3. La prioridad se argumenta contra los CRITERIOS DE ÉXITO del reto, que van en el material
+ *    justo por eso. Un número sin ese anclaje es una opinión ordenada.
+ *
+ * Y el prefijo «¿Cómo podríamos…?» se PIDE aquí y no se comprueba en ningún sitio: exigirlo
+ * por CHECK impondría un idioma a un producto que se usa en español y en inglés, y una regla
+ * que se rodea escribiendo el prefijo delante no es una regla. Es la misma decisión que tomó
+ * la tabla.
+ */
+export const SISTEMA_OPORTUNIDADES = [
+  'Eres una capacidad de síntesis de una plataforma de service design. Propones; una persona decide.',
+  'Propones OPORTUNIDADES en forma de pregunta «¿Cómo podríamos…?» (HMW) a partir de los insights validados de un reto.',
+  'Una HMW ABRE el espacio de solución, no lo cierra. Si tu pregunta ya nombra la solución —una app, un chatbot, un formulario nuevo—, no es una oportunidad: es una decisión disfrazada de pregunta. Pregunta por el CAMBIO que hace falta, no por el artefacto.',
+  'Cada oportunidad trae al menos una cita: un fragmento LITERAL del insight en el que se apoya (copiado carácter a carácter, sin parafrasear), con el id EXACTO del insight entre corchetes y su localización. No inventes ids.',
+  'Los insights que citas SON aquellos en los que la pregunta se apoya: no hay otra lista. Cita todos los que la sostienen y ninguno más — citar de adorno inventa un apoyo que nadie escribió.',
+  'La RAZÓN de la prioridad argumenta contra los CRITERIOS DE ÉXITO del reto, que van al final del material: qué criterio movería esta pregunta si se resolviera. Un número sin ese argumento es una opinión ordenada.',
+  'La prioridad va de 0 a 1000, y sirve para ORDENAR: no repartas números parecidos a todo.',
+  'No propongas preguntas que los insights no sostengan, aunque suenen bien: prefiere menos y mejor citadas.',
+  'NO decidas la oportunidad. Tu propuesta entra al portafolio por decidir; aprobarla o descartarla es de las personas, y descartarla exige una razón que tú no puedes escribir.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
+ * C6 redacta un CONTRATO, y por eso su sistema empieza diciendo lo que NO redacta.
+ *
+ * El Metric Registry es lo que el cliente se compromete a aportar y contra lo que se lee el
+ * outcome review (ADR-0007). La mitad que es redacción —qué se mide, cómo se calcula, de dónde
+ * sale, cada cuánto se lee— la puede proponer un modelo; la mitad que es COMPROMISO —quién
+ * responde por el dato, desde cuándo, contra qué línea base— no, y la diferencia no es de
+ * grado: un compromiso propuesto y aceptado queda firmado por quien aceptó, no por quien se
+ * compromete. Sin decírselo, un modelo al que se le enseña una ficha con campos vacíos los
+ * rellena, y los mete dentro de la definición si el esquema no se los admite.
+ */
+/**
+ * El sistema de C7.
+ *
+ * Tres cosas que no se piden, dichas donde el modelo las lee: el veredicto, la casilla del
+ * diseño experimental, y el lenguaje causal. Las tres son la misma decisión de fondo —SYS-24
+ * separa contribución de causalidad, y el único sitio donde lo causal se habilita es una
+ * casilla que una persona firma justificándola—, y las tres se repiten en el prompt de usuario
+ * porque un modelo al que solo se le prohíbe en el sistema encuentra la manera de decirlo en
+ * el cuerpo.
+ */
+export const SISTEMA_POST_MORTEM = [
+  'Eres una capacidad de análisis de resultados de una plataforma de service design. Propones un BORRADOR; una persona lo lee, lo corrige y lo firma.',
+  'Redactas la narrativa de un post mortem sobre DATOS DETERMINISTAS que se te dan: las lecturas de cada criterio de éxito y el tablero de conciliación —qué se aprobó, qué se desplegó, qué se constató y qué quedó distinto—. No tienes más datos que esos, y no hay ninguno que puedas suponer.',
+  'CONTRIBUCIÓN, nunca causa. Está prohibido escribir «provocó», «causó», «gracias a», «se debe a», «el impacto de X fue» o cualquier forma equivalente. Di qué se movió, en qué ventana, y junto a qué se movió. El lenguaje causal lo habilita una casilla que una persona firma justificando el diseño experimental, y no se propone en su nombre.',
+  'NO dictamines si el reto se logró. El veredicto —logrado, parcialmente logrado, no logrado, no concluyente— lo firma quien cierra el post mortem, y proponerlo sería proponer la conclusión con el documento todavía sin leer.',
+  'Las desviaciones que señales salen del tablero, nombrando el elemento por el id EXACTO entre corchetes. No inventes ids, ni elementos, ni constataciones: lo que quedó distinto ya lo escribió quien lo miró, y lo tuyo es por qué importa para el resultado.',
+  'Un criterio sin dato se cuenta como lo que es —sin dato, con el motivo registrado—, nunca se estima.',
+  'Cada afirmación se apoya en una cita: un fragmento LITERAL del material, copiado carácter a carácter, con su localización. Sin eso, la narrativa es prosa sobre datos que nadie puede comprobar.',
+].join(' ');
+
+export const SISTEMA_REGISTRY = [
+  'Eres una capacidad de medición de una plataforma de service design. Propones; una persona decide.',
+  'Propones ENTRADAS del Metric Registry: qué indicadores hay que leer para saber si el reto se logró. Cada entrada responde a UN criterio de éxito del material, por su id EXACTO entre corchetes. No inventes ids.',
+  'Cada entrada trae al menos una cita: un fragmento LITERAL del criterio al que responde (copiado carácter a carácter, sin parafrasear) con su localización. Es lo que permite comprobar que el KPI mide esa promesa y no otra.',
+  'La DEFINICIÓN dice cómo se calcula —numerador, denominador, filtros—, no qué bonito sería medirlo. Un KPI sin fórmula es un rótulo.',
+  'La FRECUENCIA tiene que dar varias lecturas dentro de la ventana del criterio: una serie de un solo punto no dice si algo mejoró.',
+  'NO propongas quién aporta el dato, ni la línea base, ni desde cuándo se mide, ni la fecha del post mortem: eso lo acuerdan las personas y se firma aparte. Tampoco lo escondas dentro de la definición o de la fuente.',
+  'No propongas indicadores que estos criterios no pidan, aunque sean interesantes: un KPI que no responde a una promesa es telemetría.',
+  'Si el registry ya tiene entradas, se te dan aparte: no propongas otra vez lo que ya mide, ni con otro nombre. Dos formas de medir lo mismo dentro del mismo contrato es lo que hace que nadie sepa cuál se lee.',
+  REGLAS_COMUNES,
+].join('\n');
+
+/**
  * C5 no valida: REMEDIA. Y su sistema lo dice en la primera línea, porque es la confusión
  * que más caro sale.
  *
@@ -610,6 +1125,248 @@ export function promptInsights(reto: {
       .filter(Boolean)
       .join('\n\n'),
     alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.evidencia.length} evidencias (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+  };
+}
+
+export type EntradasDelRegistry = { nombre: string; definicion: string }[];
+
+/**
+ * Lo que el registry YA mide, como SEGUNDO bloque no confiable.
+ *
+ * Sin esto, el modelo no sabe qué hay dentro del contrato: un registry a medio llenar —o el
+ * segundo lote del mismo, que el panel vuelve a ofrecer en cuanto el primero se decide— recibe
+ * exactamente el mismo material y propone otra vez lo mismo. La colisión EXACTA de nombre la
+ * ve el panel («nombre-ocupado»); un sinónimo, no la ve nadie, y entra al contrato como una
+ * segunda forma de medir lo mismo.
+ *
+ * Bloque APARTE y no dentro del material, y esa separación es la decisión que hay que
+ * entender: el material es aquello CONTRA lo que se propone —lo que las citas copian, lo que
+ * la huella vigila y lo que el recorte decide si llegó entero—. Las entradas existentes no son
+ * eso: son el estado del contrato, contexto para no repetirse. Metidas en el material moverían
+ * la huella cada vez que se acepta una entrada, y como C6 es un LOTE que se revisa fila a fila,
+ * aceptar la primera dejaría la segunda sin poder aceptarse — el arreglo de la ronda 3
+ * volviéndose contra su propio caso de uso.
+ *
+ * Delimitado igual que el resto: el nombre y la definición de una entrada los escribe un
+ * miembro, así que son dato, no instrucciones.
+ *
+ * ── EL PRESUPUESTO SE REPARTE POR ENTRADA, Y LO QUE CEDE ES LA DEFINICIÓN ──
+ *
+ * La primera versión componía la lista entera y la pasaba por el delimitador, que recorta a
+ * `MAX_MATERIAL` y devuelve un `truncado` que aquí se tiraba. Con diez entradas de definición
+ * casi al tope —lo que el editor del registry admite— la lista pasa de 22.000 caracteres:
+ * medido, la cabecera decía «ya tiene 10 entradas» y llegaban NUEVE nombres, en silencio. Un
+ * bloque que se anuncia completo y no lo está es peor que no tenerlo: el modelo cree que ya
+ * comprobó contra todo, y la entrada que se quedó fuera del corte es exactamente la que puede
+ * volver a proponer con otro nombre.
+ *
+ * Así que el techo se reparte a partes iguales y **el nombre siempre llega entero**: es la
+ * IDENTIDAD de la entrada —lo que el panel compara para decir `nombre-ocupado`, y lo que un
+ * sinónimo imita—, mientras que la definición es la ayuda para reconocer que dos redacciones
+ * miden lo mismo. Perder ayuda degrada; perder una entrada ciega. Y cuando alguna definición
+ * cede, el bloque LO DICE, para que una definición a medias no se lea como la entera.
+ *
+ * Queda un suelo, y es el que devuelve `nombresCompletos`: con tantas entradas que ni sus
+ * nombres caben (a 200 caracteres de nombre, unas noventa y nueve), el bloque ya no puede
+ * hacer su trabajo y quien decide qué hacer es `PREPARAR.C6`, que es donde se niegan las
+ * llamadas — esta función es pura y solo informa.
+ */
+function bloqueDeEntradas(entradas: EntradasDelRegistry): {
+  bloque: string;
+  /** Si TODOS los nombres llegaron enteros: si no, el bloque no puede evitar el duplicado. */
+  nombresCompletos: boolean;
+  /** Si alguna definición cedió para que cupieran todas las entradas. */
+  definicionesRecortadas: boolean;
+} {
+  if (entradas.length === 0) {
+    return {
+      bloque:
+        'Este Metric Registry todavía no tiene ninguna entrada: propón el contrato desde cero.',
+      nombresCompletos: true,
+      definicionesRecortadas: false,
+    };
+  }
+  // Menos uno por el salto de línea que une cada par: así la suma cabe en el techo sin que
+  // haya que volver a medirla después, que es la comprobación que se olvida.
+  const porEntrada = Math.floor(MAX_MATERIAL / entradas.length) - 1;
+  let nombresCompletos = true;
+  let definicionesRecortadas = false;
+  const lineas = entradas.map((e) => {
+    const cabeza = `- ${e.nombre}`;
+    if (cabeza.length > porEntrada) {
+      nombresCompletos = false;
+      return cabeza.slice(0, Math.max(0, porEntrada));
+    }
+    // Lo que queda para la definición, descontando el «: » que la separa del nombre.
+    const cabe = porEntrada - cabeza.length - 2;
+    if (e.definicion.length > Math.max(0, cabe)) definicionesRecortadas = true;
+    const definicion = cabe > 0 ? e.definicion.slice(0, cabe) : '';
+    return definicion ? `${cabeza}: ${definicion}` : cabeza;
+  });
+  return {
+    bloque: [
+      `Este Metric Registry ya tiene ${entradas.length} ${entradas.length === 1 ? 'entrada' : 'entradas'}. NO vuelvas a proponer lo que ya mide, ni con otro nombre:`,
+      delimitarMaterialNoConfiable(lineas.join('\n')).bloque,
+      definicionesRecortadas
+        ? '(Las definiciones de arriba van recortadas para que quepan TODAS las entradas: el nombre está entero, la definición puede quedarse a medias. Si no puedes descartar que tu propuesta repita una de ellas, no la propongas.)'
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    nombresCompletos,
+    definicionesRecortadas,
+  };
+}
+
+/**
+ * Prompt de C6: los criterios del reto, delimitados como dato igual que el resto.
+ *
+ * Lo que NO se le pide es la mitad del contrato, y por eso está escrito en el prompt y no solo
+ * en el esquema: el dueño del dato, la línea base, el inicio de la ventana y la fecha del post
+ * mortem son compromisos y hechos, no redacción. Un modelo al que no se le dice esto los
+ * rellena —son campos que «faltan»— y quien revisa acepta un contrato que nadie firmó.
+ */
+/**
+ * El prompt de C7.
+ *
+ * Lo que más pesa aquí no es lo que se pide sino lo que se PROHÍBE, y por una invariante con
+ * nombre: SYS-24 separa contribución de causalidad, y el único sitio donde el lenguaje causal
+ * se habilita es una casilla que firma un humano justificándola. Un borrador que llegue
+ * escrito en causal deja a quien revisa la tarea de reescribirlo entero o —lo que de verdad
+ * pasa— la tentación de aceptarlo como está, con la casilla sin marcar y la prosa diciendo lo
+ * contrario. Así que la prohibición va en el prompt Y en la descripción del campo.
+ *
+ * Y el veredicto no se pide en ninguna de las dos: no está en el esquema, no está en el texto,
+ * y esta nota existe para que la próxima vuelta no lo añada «para que quede completo».
+ */
+/**
+ * El aviso del recorte, redactado sobre lo que SE CORTÓ de verdad.
+ *
+ * Dos mitades en las dos ramas, y las dos hacen falta:
+ *
+ *  · «No señales lo que no ves» la respalda una puerta: una desviación sobre un elemento que no
+ *    llegó descarta el lote. Pero la puerta solo rechaza lo que YA llegó, con la llamada
+ *    pagada; el aviso es lo único que puede cambiar lo que el modelo devuelve.
+ *
+ *  · «No des por completo ningún recuento» no la corta nada. «Tres de doce elementos se
+ *    desviaron» sobre una cola truncada es una frase entera, comprobable y falsa: no nombra
+ *    ningún elemento, así que ninguna puerta la ve. Si el aviso no la nombra, no la nombra
+ *    nadie — y por eso está también en la rama de las lecturas, donde «ningún criterio se
+ *    quedó sin dato» sería la misma avería con otra cara.
+ */
+function avisoDelRecorteDelPostMortem(expediente: ExpedienteDePostMortem): string {
+  const llegaron = seccionesQueLlegaronAlPostMortem(expediente);
+  const falta = llegaron.lecturas
+    ? 'la COLA DEL TABLERO de conciliación'
+    : 'parte de las LECTURAS DE CRITERIO y el TABLERO de conciliación ENTERO';
+  return `(El material se truncó a ${MAX_MATERIAL} caracteres y lo que falta es ${falta}: no señales desviaciones ni cites lecturas que no ves, y no des por completo ningún recuento —ni de lo desviado ni de los criterios—.)`;
+}
+
+export function promptPostMortem(expediente: ExpedienteDePostMortem): {
+  usuario: string;
+  alcanceResumen: string;
+} {
+  const material = materialDePostMortem(expediente);
+  const elementos = expediente.conciliacion.reduce((n, b) => n + b.elementos.length, 0);
+  return {
+    usuario: [
+      'Redacta el BORRADOR del post mortem del reto descrito en el material. Lo escribe una persona después de leerlo y corregirlo: tu trabajo es que tenga delante lo que los datos dicen, no ahorrarle el juicio.',
+      material.bloque,
+      'Habla de CONTRIBUCIÓN, nunca de causa. No escribas «provocó», «causó», «gracias a», «se debe a» ni ninguna forma equivalente: di qué se movió, en qué ventana, y junto a qué se movió. Lo que habilita el lenguaje causal es una casilla que firma una persona justificando el diseño experimental, y no se propone en su nombre.',
+      'No dictamines si el reto se logró. El veredicto lo firma quien cierra el post mortem.',
+      'Las desviaciones salen del tablero de conciliación y nombran el elemento por el id que va entre corchetes, copiado. No inventes elementos ni constataciones: lo que quedó distinto ya lo escribió quien lo miró, y tu lectura es por qué importa.',
+      'Si un criterio no tiene dato, dilo así —con el motivo registrado— en vez de estimarlo.',
+      'Cita literal del material lo que afirmes. Sin citas, la narrativa es prosa sobre datos que nadie puede comprobar.',
+      /*
+       * Y el aviso del recorte, que C7 era la ÚNICA capacidad en no dar.
+       *
+       * Todas las demás le dicen al modelo que su material se truncó. Aquí no, y con la puerta
+       * que #49 le puso —una desviación sobre un elemento que no llegó descarta el LOTE— el
+       * silencio salía caro: el modelo seguiría nombrando la cola que no vio y el lote entero,
+       * pagado, se tiraría. Decírselo es lo único que puede cambiar lo que devuelve; la puerta
+       * solo puede rechazar lo que ya llegó.
+       *
+       * Nombra el TABLERO y no «el material» a secas porque es la conciliación la que se come
+       * el corte: va la última del cuerpo, así que es lo primero que se pierde. Y avisa de las
+       * dos cosas que la ausencia estropea —señalar lo que no ve, y dar por completo un
+       * recuento de lo desviado—, porque la segunda no la corta ninguna puerta: un «tres de
+       * doce elementos se desviaron» sobre una cola truncada es una frase entera y falsa.
+       */
+      material.truncado ? avisoDelRecorteDelPostMortem(expediente) : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `Post mortem de ${expediente.codigo}: ${expediente.lecturas.length} lecturas de criterio y ${elementos} elementos conciliados${material.truncado ? ', truncado' : ''}`,
+  };
+}
+
+export function promptRegistry(reto: {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  criterios: CriteriosDelReto;
+  entradas: EntradasDelRegistry;
+  cuantas: number;
+}): { usuario: string; alcanceResumen: string; nombresDeEntradasCompletos: boolean } {
+  const material = materialDeRegistry(reto);
+  const yaMedido = bloqueDeEntradas(reto.entradas);
+  return {
+    nombresDeEntradasCompletos: yaMedido.nombresCompletos,
+    usuario: [
+      `Propón hasta ${reto.cuantas} entradas del Metric Registry para el reto descrito en el material: qué se va a medir para saber si se logró.`,
+      material.bloque,
+      yaMedido.bloque,
+      'Cada entrada responde a UN criterio de éxito del material, por su id. Un KPI que no responde a ninguno es telemetría, no medición de impacto: no lo propongas.',
+      'No propongas dos entradas para el mismo criterio salvo que midan cosas distintas de verdad, y nunca dos con el mismo nombre.',
+      // Lo que no se pide, dicho: el esquema no lo admite, pero un modelo al que no se le
+      // explica por qué mete el compromiso dentro de la definición, que sí es texto libre.
+      'NO digas quién aporta el dato, ni la línea base, ni desde cuándo se mide, ni la fecha del post mortem: eso lo acuerdan las personas y no se propone en su nombre. Tampoco los metas dentro de la definición.',
+      'Si estos criterios no dan para ninguna entrada medible, devuelve la lista vacía: es una respuesta correcta y preferible a proponer un KPI que nadie puede leer.',
+      material.truncado
+        ? `(Los criterios se truncaron a ${MAX_MATERIAL} caracteres: no propongas nada contra un criterio que no ves entero.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    // El resumen dice si esas entradas llegaron ENTERAS, y no solo cuántas hay: un alcance que
+    // declara «10 entradas» cuando el bloque llevaba nueve nombres y siete definiciones a
+    // medias es un archivo que sobredeclara lo que el modelo tuvo delante.
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.criterios.length} criterios, ${reto.entradas.length} entradas ya en el registry${yaMedido.definicionesRecortadas ? ' (definiciones recortadas)' : ''} (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
+  };
+}
+
+/**
+ * Prompt de C3: los insights validados y los criterios del reto, delimitados como dato.
+ *
+ * `alcanceResumen` cuenta las dos cosas por separado porque son dos papeles distintos —de lo
+ * que se cita y de aquello contra lo que se prioriza— y un archivo que las sumara no diría
+ * cuál faltó cuando el recorte muerda.
+ */
+export function promptOportunidades(reto: {
+  codigo: string;
+  titulo: string;
+  descripcion: string;
+  insights: InsightsDelReto;
+  criterios: CriteriosDelReto;
+  cuantas: number;
+}): { usuario: string; alcanceResumen: string } {
+  const material = materialDeOportunidades(reto);
+  return {
+    usuario: [
+      `Propón hasta ${reto.cuantas} oportunidades HMW para el reto descrito en el material: qué preguntas abre lo que ya se sabe.`,
+      material.bloque,
+      'Cada oportunidad cita al menos un insight del material, por su id EXACTO entre corchetes, con un fragmento LITERAL suyo. Los insights que cites son en los que la pregunta se apoya: no hay otra lista.',
+      'La razón de la prioridad dice contra qué CRITERIO DE ÉXITO del reto juega esta pregunta. Los criterios están al final del material y no se citan: son para argumentar, no para copiar.',
+      // Lo que no se pide, dicho: el veredicto es de las personas y tiene su propia puerta.
+      'NO decidas la oportunidad ni escribas por qué se descartaría: tu propuesta entra al portafolio por decidir.',
+      'Si estos insights no dan para ninguna pregunta que valga la pena explorar, devuelve la lista vacía: es una respuesta correcta y preferible a rellenar el portafolio con preguntas que alguien tendrá que descartar una a una.',
+      material.truncado
+        ? `(El material se truncó a ${MAX_MATERIAL} caracteres: no cites nada de un insight que no ves entero.)`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    alcanceResumen: `reto ${reto.codigo} «${reto.titulo}» · ${reto.insights.length} insights validados, ${reto.criterios.length} criterios (${material.usados} caracteres${material.truncado ? ', truncado' : ''})`,
   };
 }
 
@@ -1009,6 +1766,220 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
             localizacion: { type: 'string', description: 'Qué parte del material es' },
           },
         },
+      },
+    },
+  },
+  C6: {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'criterioId',
+      'nombre',
+      'definicion',
+      'fuente',
+      'dimensiones',
+      'frecuencia',
+      'citas',
+      'confianzaPropuesta',
+    ],
+    properties: {
+      criterioId: {
+        type: 'string',
+        description:
+          'El id EXACTO del criterio de éxito al que responde este KPI, copiado de entre corchetes en el material. No lo inventes: un KPI que no responde a un criterio del reto no es medición de impacto',
+      },
+      nombre: {
+        type: 'string',
+        description: 'El nombre del KPI. Único dentro del registry: no repitas uno del lote',
+      },
+      definicion: {
+        type: 'string',
+        description: 'Qué mide exactamente y CÓMO se calcula (numerador, denominador, filtros)',
+      },
+      fuente: {
+        type: 'string',
+        description:
+          'De dónde sale el dato (qué sistema, qué tabla, qué informe). Si el material no lo dice, descríbelo como lo que haría falta, no inventes un sistema',
+      },
+      dimensiones: {
+        type: 'string',
+        description:
+          'Cortes por los que conviene desagregarlo, o vacío si no hay ninguno útil. Vacío es una respuesta',
+      },
+      frecuencia: {
+        type: 'string',
+        enum: ['semanal', 'mensual', 'trimestral', 'unica'],
+        description:
+          'Cada cuánto se lee. Que quepan varias lecturas dentro de la ventana del criterio, o la serie tendrá un solo punto',
+      },
+      citas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['fragmento', 'localizacion'],
+          properties: {
+            fragmento: {
+              type: 'string',
+              description:
+                'Fragmento LITERAL del criterio al que responde este KPI: la parte que dice qué se prometió',
+            },
+            localizacion: {
+              type: 'string',
+              description: 'Qué parte del criterio es (el KPI, la definición, el objetivo…)',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description: 'Cómo de seguro estás de que ESTE KPI mide lo que el criterio promete',
+      },
+    },
+  },
+  C7: {
+    type: 'object',
+    additionalProperties: false,
+    required: [
+      'contribucion',
+      'factoresExternos',
+      'hipotesisAbiertas',
+      'aprendizajes',
+      'desviaciones',
+      'citas',
+      'confianzaPropuesta',
+    ],
+    properties: {
+      contribucion: {
+        type: 'string',
+        description:
+          'Qué CONTRIBUYÓ el trabajo del reto a la métrica objetivo, leído de las lecturas por criterio. Habla de contribución, NUNCA de causa: no digas «provocó», «causó» ni «gracias a»; di qué se movió, en qué ventana y junto a qué se movió',
+      },
+      factoresExternos: {
+        type: 'string',
+        description:
+          'Qué pasó fuera del control del equipo y pudo mover las mismas lecturas. Vacío si no hay ninguno que el material nombre: inventarlos para rellenar es peor que dejarlo vacío',
+      },
+      hipotesisAbiertas: {
+        type: 'string',
+        description:
+          'Qué quedó sin contestar y valdría la pena mirar. Vacío si el material no deja ninguna abierta',
+      },
+      aprendizajes: {
+        type: 'string',
+        description:
+          'Qué se aprendió, del método o del servicio, que sirva para el siguiente reto. Sale de la conciliación tanto como de las lecturas: lo que se aprobó y no llegó a implementarse enseña algo',
+      },
+      desviaciones: {
+        type: 'array',
+        maxItems: 50,
+        description:
+          'Las discrepancias que el TABLERO DE CONCILIACIÓN muestra, una por elemento que merezca comentario. Lista vacía si todos quedaron como se aprobaron: es un resultado legítimo y además el bueno',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['elementoId', 'lectura'],
+          properties: {
+            elementoId: {
+              type: 'string',
+              description:
+                'El id del elemento de cambio, COPIADO del material entre corchetes. Único en la lista: un elemento se lee UNA vez, y dos lecturas del mismo se rechazan enteras. Un id que no esté en el tablero de ESTE reto también',
+            },
+            lectura: {
+              type: 'string',
+              description:
+                'Qué dice ese elemento sobre el resultado: por qué importa que quedara así, no la constatación (esa ya está registrada y la escribió quien miró)',
+            },
+          },
+        },
+      },
+      citas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        description:
+          'De dónde sale lo que afirmas, copiado LITERAL del material. Sin citas, la narrativa es prosa sobre datos que nadie puede comprobar',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['fragmento', 'localizacion'],
+          properties: {
+            fragmento: {
+              type: 'string',
+              description: 'El texto copiado literalmente del material, sin reescribir',
+            },
+            localizacion: {
+              type: 'string',
+              description:
+                'Dónde está en el material: el código del criterio, o el del release, o el del elemento',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description:
+          'Cuánta confianza tienes en este borrador. Baja si el material trae pocas lecturas o muchos elementos sin constatar: quien revisa ordena su cola por esto',
+      },
+    },
+  },
+  C3: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['pregunta', 'prioridad', 'prioridadRazon', 'citas', 'confianzaPropuesta'],
+    properties: {
+      pregunta: {
+        type: 'string',
+        description:
+          'La oportunidad en forma de pregunta «¿Cómo podríamos…?». Pregunta por el CAMBIO que hace falta, no por el artefacto: si nombra la solución, ya cerró el espacio que la etapa 4 tiene que explorar',
+      },
+      prioridad: {
+        type: 'integer',
+        minimum: 0,
+        maximum: 1000,
+        description:
+          'Para ORDENAR el portafolio, de 0 a 1000. Reparte: números parecidos para todo no ordenan nada',
+      },
+      prioridadRazon: {
+        type: 'string',
+        description:
+          'Por qué esa prioridad, argumentado contra los CRITERIOS DE ÉXITO del reto (al final del material): qué criterio movería esta pregunta si se resolviera',
+      },
+      citas: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 6,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['insightId', 'fragmento', 'localizacion'],
+          properties: {
+            insightId: {
+              type: 'string',
+              description:
+                'El id EXACTO del insight del que copias, de entre corchetes en el material. Los insights que cites SON en los que la pregunta se apoya: no hay otra lista, así que no cites de adorno',
+            },
+            fragmento: {
+              type: 'string',
+              description:
+                'Fragmento LITERAL de ESE insight: la parte que hace que esta pregunta tenga sentido',
+            },
+            localizacion: {
+              type: 'string',
+              description: 'Qué parte del insight es (su título, su resumen…)',
+            },
+          },
+        },
+      },
+      confianzaPropuesta: {
+        type: 'string',
+        enum: ['alta', 'media', 'baja'],
+        description:
+          'Cómo de seguro estás de que esta pregunta se sostiene en lo que citas, y de que abre en vez de cerrar',
       },
     },
   },

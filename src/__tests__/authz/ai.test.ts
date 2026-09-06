@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
@@ -9,21 +10,42 @@ import {
   MODELO_PRIMARIO,
   VENTANA_SALUD_PROVEEDOR_MS,
 } from '@/lib/ai/ai.degradacion';
-import { materialDeJourney, MAX_CRITERIOS_POR_LOTE, PROMPT_VERSION } from '@/lib/ai/ai.prompts';
+import {
+  criteriosQueLlegaronAlModelo,
+  materialDeJourney,
+  MAX_CRITERIOS_POR_LOTE,
+  PROMPT_VERSION,
+} from '@/lib/ai/ai.prompts';
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
+  ESTADOS_ANCLA,
+  type EstadoAncla,
   type ContenidoAsistenteGate,
+  type ContenidoEntradaKpi,
   type ContenidoCriterio,
   type ContenidoExtraccion,
   type ContenidoInsight,
+  type ContenidoOportunidad,
+  type ContenidoPostMortem,
   type ContenidoRemediacionJourney,
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { parsearContenido } from '@/lib/ai/ai.contenido';
-import { evidenciaQueLlegoAlModelo, MAX_MATERIAL } from '@/lib/ai/ai.prompts';
+import {
+  criteriosQueLlegaronConLasOportunidades,
+  evidenciaQueLlegoAlModelo,
+  elementosQueLlegaronAlModelo,
+  materialDePostMortem,
+  promptPostMortem,
+  seccionesQueLlegaronAlPostMortem,
+  type ExpedienteDePostMortem,
+  MAX_MATERIAL,
+} from '@/lib/ai/ai.prompts';
 import {
   aceptarPropuesta,
   ErrorAI,
+  huellaDelMaterialDelPostMortem,
+  huellaDelMaterialDelRegistry,
   generarPropuestas,
   panelPropuestas,
   proyeccionDelPanel,
@@ -44,6 +66,7 @@ import {
 import type { PendingQuery, Row, TransactionSql } from 'postgres';
 import { validarJourney } from '@/lib/journey/journey.mermaid';
 import { leerJourneyCompleto, leerJourneysCompletos } from '@/lib/journey/journey.servicio';
+import { borrarEntrada } from '@/lib/medicion/medicion.servicio';
 import { describeAuthz } from './helpers';
 
 /** El proveedor es el ÚNICO tercero del pipeline y se sustituye para poder recorrer la
@@ -118,6 +141,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   let gateId = '';
   let requisitoIds: string[] = [];
   let evidenciaDelRetoId = '';
+  let insightValidadoDelRetoId = '';
+  let registryId = '';
+  let criterioDelRegistryId = '';
 
   const MATERIAL = 'El 71% de los abandonos ocurre en la carga del documento de identidad.';
 
@@ -170,6 +196,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     citas: [{ fragmento: 'El journey está validado', localizacion: 'requisito 1' }],
   });
 
+  const CONTENIDO_C6 = (criterioId: string): ContenidoEntradaKpi => ({
+    criterioId,
+    nombre: 'Tasa de verificación completada en móvil',
+    definicion: 'Verificaciones completadas / verificaciones iniciadas, solo en app móvil',
+    fuente: 'Eventos de la app, tablero de onboarding',
+    dimensiones: 'canal, segmento',
+    frecuencia: 'mensual',
+    confianzaPropuesta: 'media',
+    citas: [{ fragmento: 'Tiempo de verificación', localizacion: 'KPI del criterio' }],
+  });
+
   /**
    * El contenido de prueba de cada capacidad, por su nombre.
    *
@@ -204,6 +241,36 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       citas: [{ fragmento: 'NODOS', localizacion: 'cabecera del grafo' }],
       confianzaPropuesta: 'baja',
     } satisfies ContenidoRemediacionJourney,
+    /* Igual que CT y C2: se resuelve tarde porque el criterio se crea en el `beforeAll`, y su
+     * id tiene que ser REAL — el guard exige que el criterio sea del reto del registry. */
+    /*
+     * C7 sin desviaciones por omisión, y eso es una respuesta y no un hueco: cada desviación
+     * tiene que señalar un elemento que estaba en la conciliación de SU reto —el servicio lo
+     * comprueba antes de guardar—, así que un fixture con un id inventado haría fallar toda
+     * propuesta de C7 que no lo pisara. Quien necesite desviaciones las compone con los ids
+     * del tablero de su reto.
+     *
+     * La lista vacía es además un caso legítimo del dominio: un reto cuyos elementos quedaron
+     * todos «como aprobado» no tiene desviaciones que contar.
+     */
+    C7: {
+      contribucion: 'La verificación diferida coincide con la caída del abandono en la ventana.',
+      factoresExternos: '',
+      hipotesisAbiertas: '',
+      aprendizajes: 'Lo aprobado sin release asignado no llega, por bueno que sea el diseño.',
+      desviaciones: [],
+      citas: [{ fragmento: 'LECTURA DE CADA CRITERIO', localizacion: 'cabecera del expediente' }],
+      confianzaPropuesta: 'media',
+    } satisfies ContenidoPostMortem,
+    get C6() {
+      return CONTENIDO_C6(criterioDelRegistryId);
+    },
+    /* Igual que los tres anteriores: se resuelve tarde porque el insight se crea en el
+     * `beforeAll`, y su id tiene que ser REAL — la traza se materializa desde las citas, así
+     * que un id inventado no llega ni a insertar el enlace. */
+    get C3() {
+      return CONTENIDO_C3(insightValidadoDelRetoId);
+    },
   };
 
   /**
@@ -282,6 +349,16 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       },
     ],
     contradicciones: [],
+    confianzaPropuesta: 'media',
+  });
+  const CONTENIDO_C3 = (insightId: string): ContenidoOportunidad => ({
+    pregunta: '¿Cómo podríamos verificar sin pedir un documento que no está a mano?',
+    prioridad: 700,
+    prioridadRazon:
+      'Mueve el criterio del tiempo de verificación: es donde se pierde la mayoría.',
+    citas: [
+      { insightId, fragmento: 'Quien no lleva el documento encima', localizacion: 'resumen' },
+    ],
     confianzaPropuesta: 'media',
   });
   /**
@@ -514,6 +591,9 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
        * En el uso normal se omite y sale de `CAPACIDADES`, que es lo que hace el servicio. */
       destino?: Destino | null;
       contenido?: ContenidoPropuesta;
+      /** Solo para probar el suelo del INSERT con un alcance que NO es el del reto: en el uso
+       * normal se omite y sale de la misma función que miran el guard y el panel. */
+      alcanceInsights?: string[];
     },
   ): Promise<string> {
     const contenido = campos.contenido ?? CONTENIDO_POR_CAPACIDAD[campos.capacidad];
@@ -527,7 +607,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         (workspace_id, capacidad, destino, ${anclasDeFixture(tx).columnas},
          contenido, contenido_original,
          confianza, modelo, prompt_version, alcance_resumen, huella_material,
-         alcance_evidencia, origen_key,
+         alcance_evidencia, alcance_insights, origen_key,
          llamada_id, creado_por)
       values (${ws}, ${campos.capacidad}, ${destino},
               ${anclasDeFixture(tx, campos.anclas).valores},
@@ -543,6 +623,18 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               -- a mano fijaría en el fixture justo lo que el suelo compara contra la base.
               -- Para las demás capacidades no aplica y va nulo, como el CHECK permite.
               ${campos.anclas.reto_id ? ALCANCE_DEL_RETO(tx, ws, campos.anclas.reto_id) : null},
+              -- Y el alcance de INSIGHTS, que C3 declara igual. Sale de la misma función que
+              -- usan el guard y el panel —no de una lista escrita aquí— por lo mismo que el de
+              -- evidencia: una copia en el fixture fijaría justo lo que el suelo compara.
+              -- Solo para C3: el CHECK deja nulo a las demás.
+              ${
+                campos.alcanceInsights !== undefined
+                  ? campos.alcanceInsights
+                  : campos.capacidad === 'C3' && campos.anclas.reto_id
+                    ? tx`array(select v.id from insights_validados_del_reto(
+                        ${campos.anclas.reto_id}, ${ws}) as v(id))`
+                    : null
+              },
               'entorno', ${llamadaId}, ${actorId})
       returning id`);
     return p!.id as string;
@@ -654,6 +746,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // se rompe soltando el sello y borrando la propuesta primero; el insight se va después,
       // con su descendencia, de la hoja a la raíz.
       await admin`update insight set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      // Y `entrada_kpi`, que es el CUARTO destino y llegó con C6. Faltaba porque hasta ahora
+      // ninguna sonda de este arnés había aceptado una propuesta de C6 dentro de un workspace
+      // efímero: sin esta línea la limpieza muere en la FK del sello, y el fallo aparece como
+      // un `miembro_usuario_id_fkey` al final, que no dice nada de dónde está.
+      await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${wsL}`;
+      /* Y el post mortem, que es el quinto objeto sellado — y el único cuyo sello apunta a una
+       * propuesta que NO lo creó, porque la fila ya existía. La FK es la misma. */
+      await admin`update outcome_review set propuesta_ai_id = null where workspace_id = ${wsL}`;
       await admin`delete from propuesta_ai where workspace_id = ${wsL}`;
       await admin`delete from llamada_ai where workspace_id = ${wsL}`;
       await admin`delete from reserva_ai where workspace_id = ${wsL}`;
@@ -664,7 +765,45 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from entrada_kpi where workspace_id = ${wsL}`;
       await admin`delete from metric_registry where workspace_id = ${wsL}`;
       await admin`delete from derecho_uso where workspace_id = ${wsL}`;
+      /* El post mortem y sus lecturas cuelgan de los criterios, así que van delante. */
+      await admin`delete from resultado_criterio where workspace_id = ${wsL}`;
+      await admin`delete from outcome_review where workspace_id = ${wsL}`;
       await admin`delete from criterio_exito where workspace_id = ${wsL}`;
+      // Y la oportunidad con su traza, que es el QUINTO destino y llega con C3. Va aquí y no
+      // más abajo porque apunta a los dos lados: su traza cuelga de `insight` —que se borra
+      // justo debajo— y ella misma del `reto`, que se borra al final.
+      await admin`delete from oportunidad_insight where workspace_id = ${wsL}`;
+      await admin`delete from oportunidad where workspace_id = ${wsL}`;
+      /*
+       * El expediente del post mortem, de dentro afuera: las constataciones cuelgan del
+       * effective state y del elemento, el effective state del release, y el review del reto,
+       * que se borra al final. Sin esto, el reto no se puede borrar y el workspace se queda
+       * colgado — que es exactamente lo que dijo la primera vuelta de las sondas de C7.
+       */
+      await admin`delete from constatacion where workspace_id = ${wsL}`;
+      await admin`delete from effective_state where workspace_id = ${wsL}`;
+
+      /*
+       * Los elementos y su design version, en LA MISMA transacción. Aprobar los congela
+       * («la design version se aprobó mientras se editaban sus elementos», SYS-05) y ese guard
+       * corre también para el propietario; desaprobar no es salida, porque la transición
+       * aprobada → borrador es ilegal.
+       *
+       * La salida es que ese guard es un constraint trigger DIFERIDO: lee el estado de la
+       * design version AL COMMIT. Borrando las dos cosas juntas, cuando mira ya no hay
+       * versión que consultar y se aparta —que es la respuesta correcta, porque lo que
+       * protege es un congelado que a esas alturas no existe—.
+       *
+       * Y el plan de releases va dentro por lo mismo, con su propia versión del argumento: «ese
+       * release ya salió: su alcance es fijo» protege el alcance de un release desplegado, y en
+       * la misma transacción el release tampoco queda.
+       */
+      await admin.begin(async (tx) => {
+        await tx`delete from release_elemento where workspace_id = ${wsL}`;
+        await tx`delete from release where workspace_id = ${wsL}`;
+        await tx`delete from elemento_cambio where workspace_id = ${wsL}`;
+        await tx`delete from design_version where workspace_id = ${wsL}`;
+      });
       await admin`delete from cita where workspace_id = ${wsL}`;
       await admin`delete from contradiccion where workspace_id = ${wsL}`;
       await admin`delete from afirmacion where workspace_id = ${wsL}`;
@@ -782,8 +921,50 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       (workspace_id, evidencia_id, estado, ambito, base, decidido_por, decidido_en, creado_por)
       values (${ws}, ${evidenciaDelRetoId}, 'concedido', 'cliente',
               'Consentimiento del participante', ${leadId}, now(), ${leadId})`;
+
+    /*
+     * Y el ancla de C6: el contrato de medición del reto, en borrador, con un criterio real al
+     * que una entrada KPI pueda responder. El criterio tiene que existir de verdad porque el
+     * guard de la materialización exige que sea del reto DEL REGISTRY, y la cita se mide contra
+     * su texto.
+     */
+    const [crit] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Tiempo de verificación',
+              'Minutos medianos desde iniciar hasta completar la verificación',
+              'Bajar de 8 a 4 minutos', 90, 'Medir dos semanas antes del release', ${leadId})
+      returning id`;
+    criterioDelRegistryId = crit!.id as string;
+    const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+      values (${ws}, ${retoId}, ${leadId}) returning id`;
+    registryId = mr!.id as string;
     await admin`insert into arquetipo_evidencia (workspace_id, arquetipo_id, evidencia_id)
       values (${ws}, ${arq!.id as string}, ${evidenciaDelRetoId})`;
+    /*
+     * Un insight VALIDADO del reto, que es el material de C3.
+     *
+     * «Del reto» no es una columna: un insight pertenece a un reto si alguna de sus
+     * afirmaciones cita evidencia que cuelga de un arquetipo suyo. Por eso el fixture tiene
+     * que montar la cadena entera —afirmación → cita → esa evidencia— y no basta con crear un
+     * insight en el workspace: `insights_validados_del_reto` lo recorrería y no lo
+     * encontraría, y las propuestas de C3 del fixture nacerían con un id que el guard rechaza.
+     */
+    const [ins] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'La verificación excluye a quien no tiene el documento a mano',
+              'Quien no lleva el documento encima abandona y no vuelve.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    insightValidadoDelRetoId = ins!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${ws}, ${insightValidadoDelRetoId}, 0,
+              'El abandono se concentra en la carga del documento', false)
+      returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${ws}, ${af!.id as string}, ${evidenciaDelRetoId},
+              'El 71% de los abandonos', 'resumen', ${leadId})`;
   });
 
   afterAll(async () => {
@@ -793,13 +974,25 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from reserva_ai where workspace_id = ${ws}`;
       await admin`update evidencia set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`update criterio_exito set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y la oportunidad, que es el QUINTO destino con sello. Cada uno que llega añade su
+      // línea aquí, y olvidarla no falla donde está: la limpieza muere en la FK y el error
+      // sale al final nombrando otra tabla.
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
       // Ver la nota de `enWorkspaceLimpio`: el sello va de la propuesta al insight y del
       // insight a la propuesta, así que se suelta antes de borrar ninguno de los dos.
       await admin`update insight set propuesta_ai_id = null where workspace_id = ${ws}`;
+      // Y lo mismo con la entrada KPI, que es el cuarto objeto sellado. El sello va en los dos
+      // sentidos —`propuesta_ai.entrada_kpi_id` y `entrada_kpi.propuesta_ai_id`—, así que hay
+      // que soltarlo antes de borrar cualquiera de los dos extremos.
+      await admin`update entrada_kpi set propuesta_ai_id = null where workspace_id = ${ws}`;
       await admin`delete from propuesta_ai where workspace_id = ${ws}`;
       await admin`delete from llamada_ai where workspace_id = ${ws}`;
       await admin`delete from consentimiento_item where workspace_id = ${ws}`;
       await admin`delete from item_importacion where workspace_id = ${ws}`;
+      // El contrato de medición, por delante de los criterios: `entrada_kpi` referencia a los
+      // dos, y el registry al reto.
+      await admin`delete from entrada_kpi where workspace_id = ${ws}`;
+      await admin`delete from metric_registry where workspace_id = ${ws}`;
       await admin`delete from criterio_exito where workspace_id = ${ws}`;
       await admin`delete from cita where workspace_id = ${ws}`;
       await admin`delete from contradiccion where workspace_id = ${ws}`;
@@ -5296,6 +5489,11 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                        -- ninguna; nulo la deja inerte, que es la respuesta correcta para una
                        -- fila sintética que no representa a ninguna propuesta.
                        null::uuid[] as alcance_evidencia,
+                       -- Y el de C3, por lo mismo: su motivo mira si el reto tiene insights
+                       -- validados fuera del alcance. Nulo por la misma razón — lo que este
+                       -- censo mide es el ENRUTADO, no la completitud de ninguna propuesta.
+                       null::uuid[] as alcance_insights,
+            null::uuid as entrada_kpi_id,
                        ${ws}::uuid as workspace_id) p
           ${proyeccion.joins}`;
         return (f!.estado as string | null) ?? null;
@@ -5305,11 +5503,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       // null como 'ancla-ausente', que solo admite rechazar. Antes respondía con el motivo del
       // vecino — primero el del reto por caer en su rama, después el de quien compartiera
       // columna.
-      expect(await motivoDe('C3', { reto_id: retoId })).toBeNull();
-      expect(await motivoDe('C3', { item_id: item })).toBeNull();
+      // C1 y C4 hacen aquí el papel que hicieron C3, C4 y C7 antes de activarse: una capacidad
+      // del catálogo que este panel todavía no pinta. Cuando les toque, el sustituto será otra
+      // —y el día que no quede ninguna inactiva, este caso se retira en vez de fingirse. C7
+      // salió de aquí al activarse, y su relevo fue C4, que es como esta rotación se hace.
+      expect(await motivoDe('C1', { reto_id: retoId })).toBeNull();
+      expect(await motivoDe('C1', { item_id: item })).toBeNull();
       expect(await motivoDe('C4', {})).toBeNull();
       // Y una capacidad desconocida sobre el ancla NUEVA tampoco hereda la de CT.
-      expect(await motivoDe('C7', { gate_id: gateId })).toBeNull();
+      expect(await motivoDe('C4', { gate_id: gateId })).toBeNull();
 
       // Y cada capacidad responde SOLO con motivos suyos: se comprueban los conjuntos, no un
       // valor concreto, porque lo que se sujeta es que las ramas no se crucen y no en qué
@@ -5317,9 +5519,19 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       const DE_CI = ['disponible', 'item-curado', 'consentimiento-revocado'];
       const DE_C0 = ['disponible', 'reto-no-admite', 'registry-firmado', 'criterios-congelados'];
       const DE_CT = ['disponible', 'gate-decidido', 'checklist-avanzado'];
+      const DE_C3 = [
+        'disponible',
+        'portafolio-cerrado',
+        'insight-no-validado',
+        'alcance-incompleto',
+      ];
       expect(DE_CI).toContain(await motivoDe('CI', { item_id: item }));
       expect(DE_C0).toContain(await motivoDe('C0', { reto_id: retoId }));
       expect(DE_CT).toContain(await motivoDe('CT', { gate_id: gateId }));
+      // C7 responde solo con los suyos. Sin ancla, la rama no encuentra post mortem y contesta
+      // «cerrado», que es la respuesta correcta para una fila que no señala ninguno.
+      const DE_C7 = ['disponible', 'post-mortem-cerrado'];
+      expect(DE_C7).toContain(await motivoDe('C7', {}));
       // El de CI no puede ser NUNCA uno exclusivo de C0 (que es lo que pasaba).
       expect(DE_C0.slice(1)).not.toContain(await motivoDe('CI', { item_id: item }));
       // Ni el de CT uno de los otros dos: el ancla nueva entró por el mismo sitio por donde
@@ -5328,6 +5540,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         await motivoDe('CT', { gate_id: gateId }),
       );
       expect(DE_CT.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+      /*
+       * Y C3, que es el caso que este censo existe para vigilar: comparte la columna del ancla
+       * con C0 —y con C2—, así que es exactamente donde una rama escrita «para el reto» en vez
+       * de «para esta capacidad» se cruzaría. Se mide en los dos sentidos.
+       */
+      expect(DE_C3).toContain(await motivoDe('C3', { reto_id: retoId }));
+      expect(DE_C3.slice(1)).not.toContain(await motivoDe('C0', { reto_id: retoId }));
+      expect(DE_C0.slice(1)).not.toContain(await motivoDe('C3', { reto_id: retoId }));
 
       /*
        * Y el motivo que distingue un informe VIVO de uno que ya no describe el gate: con el
@@ -6147,6 +6367,1419 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       expect(decidida!.insight_id).toBe(objetoId);
     });
   });
+  /**
+   * Un insight VALIDADO del reto, en un workspace efímero. «Del reto» no es una columna: se
+   * llega por afirmación → cita → evidencia → arquetipo → reto, así que la cadena entera hace
+   * falta o `insights_validados_del_reto` no lo encuentra. Devuelve su id.
+   */
+  async function insightValidadoDelReto(
+    wsC: string,
+    evidenciaId: string,
+    actorId: string,
+    campos: { titulo: string; resumen: string; fragmento: string },
+  ): Promise<string> {
+    const admin = sqlAdmin();
+    const [ins] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${wsC}, ${campos.titulo}, ${campos.resumen}, 'validado', ${actorId}, now(),
+              ${actorId})
+      returning id`;
+    const insightId = ins!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${wsC}, ${insightId}, 0, ${campos.titulo}, false) returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${wsC}, ${af!.id as string}, ${evidenciaId}, ${campos.fragmento}, 'resumen',
+              ${actorId})`;
+    return insightId;
+  }
+
+  /**
+   * La puerta de G3 montada pero SIN firmar: el portafolio sigue abierto y la firma queda a un
+   * `update` de distancia. Devuelve el id del gate.
+   *
+   * Se monta con las réplicas desactivadas —lo que se mide es la VENTANA, no el camino de ocho
+   * gates que lleva hasta ella, que tiene sus propias pruebas—. Partirlo en dos es lo que
+   * permite firmar EN VUELO, que es el caso para el que existe el guard diferido.
+   */
+  async function puertaDeG3(wsC: string, retoC: string, actorId: string): Promise<string> {
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${wsC}, ${retoC}, 'P-G3', 'Proyecto', 'activo', 'rapido', ${actorId}) returning id`;
+    return await admin.begin(async (tx) => {
+      await tx`set local session_replication_role = replica`;
+      await tx`insert into etapa_instancia (workspace_id, proyecto_id, numero, nombre, estado)
+        values (${wsC}, ${p!.id as string}, 3, 'Conceptualización', 'completada')`;
+      const [g] = await tx`insert into gate_instancia
+        (workspace_id, proyecto_id, numero, rol_aprobador, estado)
+        values (${wsC}, ${p!.id as string}, 3, 'sponsor', 'pendiente') returning id`;
+      return g!.id as string;
+    });
+  }
+
+  /** El `update` que firma esa puerta y con ella cierra el portafolio. Sin las réplicas no
+   * pasaría: aprobar un gate tiene sus propias exigencias, que no son lo que aquí se mide. */
+  const firmaDeG3 = (tx: TransactionSql, wsC: string, gateId: string, actorId: string) =>
+    tx`set local session_replication_role = replica`.then(
+      () => tx`update gate_instancia set estado = 'aprobado', aprobado_por = ${actorId},
+                 aprobado_en = now()
+               where id = ${gateId} and workspace_id = ${wsC}`,
+    );
+
+  /** Un criterio de éxito real para el reto: C3 no se ofrece sin al menos uno entero en el
+   * material, porque la razón de cada prioridad tiene que nombrar el que movería. */
+  async function criterioDelReto(wsC: string, retoC: string, actorId: string): Promise<string> {
+    const [c] = await sqlAdmin()`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${wsC}, ${retoC}, 'Tiempo de verificación',
+              'Minutos medianos desde iniciar hasta completar la verificación',
+              'Bajar de 8 a 4 minutos', 90, 'Medir dos semanas antes del release', ${actorId})
+      returning id`;
+    return c!.id as string;
+  }
+
+  /**
+   * Una propuesta de C3 pendiente, nacida por el camino REAL sobre un reto con un insight
+   * validado. Devuelve lo que los casos de caducidad necesitan mover después.
+   */
+  async function propuestaC3Pendiente(ctx: { ws: string; curadorId: string; retoId: string }) {
+    const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+      titulo: 'Abandono en verificación',
+      resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+    });
+    const insightId = await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+      titulo: 'La verificación excluye a quien no tiene el documento a mano',
+      resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+      fragmento: 'El 71% de los abandonos',
+    });
+    await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+    await conProveedor(
+      {
+        ok: true,
+        datos: { oportunidades: [CONTENIDO_C3(insightId)] },
+        intentos: [intento({ uso: null })],
+      },
+      () =>
+        generarPropuestas(ctx.curadorId, {
+          workspaceId: ctx.ws,
+          capacidad: 'C3',
+          anclaId: ctx.retoId,
+        }),
+    );
+    const [guardada] = await sqlAdmin()`select id from propuesta_ai
+      where workspace_id = ${ctx.ws} and capacidad = 'C3'`;
+    expect(guardada, 'no se generó la propuesta de C3').toBeDefined();
+    return { evId, insightId, propuestaId: guardada!.id as string };
+  }
+
+  /**
+   * El camino REAL de C3, de punta a punta, y hasta la traza materializada.
+   *
+   * C3 es la primera capacidad cuyo objeto materializado NO SE COPIA de la propuesta: la HMW
+   * lleva su pregunta y su prioridad, pero su apoyo —`oportunidad_insight`— se deriva de las
+   * citas, y eso es una tabla más que nace en la aceptación. Es también el quinto destino, y
+   * cada destino nuevo estrena las mismas costuras: el vocabulario de `destino`, el CHECK de
+   * «decidida ⇒ exactamente un objeto», la columna de sello y la rama del despachador de
+   * procedencia. Esa última faltaba, y la encontró el `else` que grita, no el compilador.
+   *
+   * Lo que este caso sujeta y ninguna sonda de SQL directo puede sujetar: que el servicio
+   * escriba lo que el guard exige. Las sondas miden el SUELO —que por SQL crudo no se pueda
+   * mentir—; ésta mide que el camino de producción no se caiga contra su propio suelo.
+   */
+  /**
+   * Un post mortem con EXPEDIENTE: el tablero de conciliación de una design version y la
+   * lectura de un criterio. Es lo mínimo que C7 necesita para tener algo que leer.
+   *
+   * Se monta con el propietario y no por el camino del producto a propósito: llegar hasta aquí
+   * por la app son siete gates, un registry firmado y una ventana de medición cerrada, y eso ya
+   * lo prueban los casos de CTX-05 y CTX-06. Lo que estos casos miden es C7 sobre un expediente
+   * REAL —filas de verdad, leídas por las mismas funciones que lee el tablero de G7—, no cómo
+   * se llega a tenerlo.
+   */
+  async function postMortemConExpediente(
+    wsC: string,
+    retoC: string,
+    servicioC: string,
+    actorId: string,
+    opciones: { desviado?: boolean } = {},
+  ): Promise<{ reviewId: string; elementoId: string; criterioId: string }> {
+    const admin = sqlAdmin();
+    const [p] = await admin`insert into proyecto
+      (workspace_id, reto_id, codigo, titulo, estado, perfil, creado_por)
+      values (${wsC}, ${retoC}, 'P-C7', 'Proyecto del post mortem', 'activo', 'rapido', ${actorId})
+      returning id`;
+    const proyectoId = p!.id as string;
+    /*
+     * Aprobar es INSEPARABLE de congelar: el CHECK de la tabla no admite `aprobada` sin
+     * snapshot, aprobador y fecha (RF-06.3). Así que la versión nace borrador y se aprueba
+     * después con su snapshot, que es también el orden real.
+     */
+    const [jr] = await admin`insert into journey
+      (workspace_id, servicio_id, tipo, nombre, descripcion, creado_por)
+      values (${wsC}, ${servicioC}, 'to-be', 'Journey del post mortem',
+              'El recorrido que la design version cambia', ${actorId}) returning id`;
+    const [dv] = await admin`insert into design_version
+      (workspace_id, proyecto_id, servicio_id, journey_id, titulo, resumen, creado_por)
+      values (${wsC}, ${proyectoId}, ${servicioC}, ${jr!.id as string}, 'Verificación asistida',
+              'Resuelve la verificación dentro de la app', ${actorId}) returning id`;
+    const dvId = dv!.id as string;
+    const [el] = await admin`insert into elemento_cambio
+      (workspace_id, design_version_id, tipo, operacion, titulo, detalle, orden, creado_por)
+      values (${wsC}, ${dvId}, 'touchpoint', 'agrega', 'Verificación en video',
+              'Sustituye la carga del documento', 0, ${actorId}) returning id`;
+    const elementoId = el!.id as string;
+    /*
+     * Y ahora sí la aprobación, con dos condiciones que el guard impone y que valen la pena
+     * decir porque las dos costaron una vuelta: una design version no se aprueba SIN
+     * ELEMENTOS —de ahí que esto vaya detrás del elemento— y «aprobar congela el to-be de
+     * AHORA», así que el snapshot tiene que tomarse en la MISMA transición. De ahí el CTE: en
+     * dos sentencias son dos transacciones y el guard lo ve.
+     */
+    await admin`
+      with s as (
+        insert into journey_snapshot
+          (workspace_id, journey_id, motivo, grafo, congelado_por)
+        values (${wsC}, ${jr!.id as string}, 'Aprobación de la DV del post mortem',
+                jsonb_build_object('nodos', '[]'::jsonb, 'aristas', '[]'::jsonb), ${actorId})
+        returning id
+      )
+      update design_version
+      set estado = 'aprobada', snapshot_id = (select id from s), aprobada_por = ${actorId},
+          aprobada_en = now()
+      where id = ${dvId}`;
+    /*
+     * El release nace PLANIFICADO y se despliega después, que es el orden real y el único que
+     * la base admite: «ese release ya salió: su alcance es fijo» (SYS-06) impide asignarle
+     * elementos una vez desplegado. Crearlo ya verificado era mi atajo, y el guard lo dijo.
+     */
+    const [rl] = await admin`insert into release
+      (workspace_id, design_version_id, titulo, responsable, fecha_objetivo, creado_por)
+      values (${wsC}, ${dvId}, 'Verificación en la app', 'Equipo de canales', '2026-08-10',
+              ${actorId}) returning id`;
+    const releaseId = rl!.id as string;
+    await admin`insert into release_elemento (elemento_id, release_id, workspace_id, creado_por)
+      values (${elementoId}, ${releaseId}, ${wsC}, ${actorId})`;
+    await admin`update release set estado = 'desplegado', desplegado_en = '2026-08-10'
+      where id = ${releaseId}`;
+    /*
+     * Y la constatación ANTES de verificar: «verificar exige constatar TODOS los elementos del
+     * release» (RF-06.6). El orden del método es desplegar → constatar → verificar, y la base
+     * no admite otro — que es justo lo que hace fiable al tablero que C7 lee.
+     */
+    const [es] = await admin`insert into effective_state
+      (workspace_id, servicio_id, release_id, resumen, constatado_por, constatado_en)
+      values (${wsC}, ${servicioC}, ${releaseId}, 'Opera desde el 10 de agosto',
+              ${actorId}, '2026-08-20') returning id`;
+    const desviado = opciones.desviado ?? true;
+    await admin`insert into constatacion
+      (workspace_id, effective_state_id, elemento_id, resultado, que_quedo_distinto, razon,
+       creado_por)
+      values (${wsC}, ${es!.id as string}, ${elementoId},
+              ${desviado ? 'desviado' : 'como-aprobado'},
+              ${desviado ? 'Salió sin el aviso previo' : ''},
+              ${desviado ? 'El proveedor de video no lo soportaba a tiempo' : ''},
+              ${actorId})`;
+    await admin`update release set estado = 'verificado' where id = ${releaseId}`;
+    const criterioId = await criterioDelReto(wsC, retoC, actorId);
+    const [rev] = await admin`insert into outcome_review
+      (workspace_id, reto_id, estado, creado_por)
+      values (${wsC}, ${retoC}, 'borrador', ${actorId}) returning id`;
+    const reviewId = rev!.id as string;
+    await admin`insert into resultado_criterio
+      (workspace_id, review_id, criterio_id, sin_datos_motivo)
+      values (${wsC}, ${reviewId}, ${criterioId},
+              'La serie del proveedor se cortó en agosto y no hay lectura final')`;
+    return { reviewId, elementoId, criterioId };
+  }
+
+  /**
+   * C7 por el camino real: el material sale de las MISMAS funciones que dibujan el tablero de
+   * G7, y aceptar escribe los cuatro campos narrativos del post mortem que ya existía.
+   *
+   * Lo que este caso sujeta y no sujetaba ninguna otra capacidad: que el ancla y el objeto sean
+   * la misma fila. No nace nada al aceptar — se EDITA—, así que se comprueba por el otro lado:
+   * los cuatro campos dicen lo que decía la propuesta, el sello de procedencia queda puesto, y
+   * lo que C7 no propone —el veredicto y la casilla del diseño experimental— sigue intacto.
+   */
+  it('C7 redacta el post mortem sobre el tablero, y aceptar escribe SOLO su narrativa', async () => {
+    await enWorkspaceLimpio('c7-camino-real', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId, elementoId } = await postMortemConExpediente(
+        wsC,
+        retoC,
+        servicioId,
+        curadorId,
+      );
+      // El post mortem trae ya un veredicto puesto a mano: C7 no lo toca, y esa es la mitad
+      // que hay que medir — el dictamen lo firma quien cierra (RF-07.8).
+      await sqlAdmin()`update outcome_review
+        set veredicto = 'parcialmente-logrado', diseno_experimental_suficiente = true,
+            diseno_experimental_justificacion = 'Hubo grupo de control en dos sucursales'
+        where id = ${reviewId}`;
+
+      const propuesta = {
+        contribucion:
+          'La verificación en video salió en agosto; la serie del criterio se cortó ese mismo mes.',
+        factoresExternos: 'El proveedor de video no soportaba el aviso previo a tiempo.',
+        hipotesisAbiertas: 'Queda sin saber si el aviso previo habría movido la lectura.',
+        aprendizajes: 'Lo que depende de un tercero se planifica con su calendario, no con el nuestro.',
+        desviaciones: [
+          {
+            elementoId,
+            lectura: 'Salió sin el aviso previo, que era la mitad de lo que el elemento prometía.',
+          },
+        ],
+        citas: [
+          { fragmento: 'Salió sin el aviso previo', localizacion: 'conciliación del elemento' },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+      await conProveedor(
+        {
+          ok: true,
+          datos: propuesta as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C7',
+            anclaId: reviewId,
+          }),
+      );
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C7');
+      expect(p, 'la propuesta de C7 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('outcome-review');
+      expect(p!.anclaEstado).toBe('disponible');
+      // La cita se copió del tablero, así que se mide presente contra el material real.
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+
+      // El rastro ANTES de aceptar: el expediente se montó escribiendo en el review —el
+      // veredicto a mano, más arriba—, así que contar desde cero mediría la sonda y no la
+      // aceptación. Lo que se mide es el DELTA.
+      const [antesDeAceptar] = await conUsuario(curadorId, (tx) => tx`
+        select count(*)::int as n from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'OutcomeReviewEditado'`);
+      const edicionesAntes = antesDeAceptar!.n as number;
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+      // El objeto ES el ancla: no nació ninguna fila.
+      expect(objetoId).toBe(reviewId);
+
+      const [rev] = await conUsuario(curadorId, (tx) => tx`
+        select contribucion, factores_externos, hipotesis_abiertas, aprendizajes, veredicto,
+               diseno_experimental_suficiente, diseno_experimental_justificacion, propuesta_ai_id
+        from outcome_review where id = ${reviewId}`);
+      expect(rev!.contribucion).toBe(propuesta.contribucion);
+      expect(rev!.factores_externos).toBe(propuesta.factoresExternos);
+      expect(rev!.hipotesis_abiertas).toBe(propuesta.hipotesisAbiertas);
+      expect(rev!.aprendizajes).toBe(propuesta.aprendizajes);
+      // Y lo que C7 NO propone sigue como estaba: el veredicto y la casilla causal son de quien
+      // firma, y aceptar un borrador no los toca ni para ponerlos ni para borrarlos.
+      expect(rev!.veredicto).toBe('parcialmente-logrado');
+      expect(rev!.diseno_experimental_suficiente).toBe(true);
+      expect(rev!.diseno_experimental_justificacion).toBe('Hubo grupo de control en dos sucursales');
+      // El sello lo escribe el guard: la columna está fuera del grant de la aplicación.
+      expect(rev!.propuesta_ai_id).toBe(p!.id);
+
+      /*
+       * Y el RASTRO cuenta UNA escritura, no dos.
+       *
+       * La aceptación escribe la narrativa —`OutcomeReviewEditado`, correcto— y después el
+       * guard diferido le escribe su `propuesta_ai_id`, que no es un campo de la narrativa.
+       * Ese segundo UPDATE dejaba otro `OutcomeReviewEditado` con el «antes» idéntico al
+       * «después»: una edición que nadie hizo, apuntada en el rastro de la pieza de la que sale
+       * el veredicto de un reto. Es el mismo caso que C6 ya había curado en la rama de al lado.
+       */
+      const eventos = await conUsuario(curadorId, (tx) => tx`
+        select payload from evento_dominio
+        where workspace_id = ${wsC} and tipo = 'OutcomeReviewEditado'
+        order by creado_en`);
+      expect(
+        eventos.length - edicionesAntes,
+        'la aceptación de C7 dejó más de una edición en el rastro',
+      ).toBe(1);
+      expect(eventos.at(-1)!.payload).toMatchObject({ contribucion: propuesta.contribucion });
+    });
+  });
+
+  /**
+   * Los ELEMENTOS que señala una desviación no se corrigen; su lectura sí.
+   *
+   * La distinción no es de estilo. La `lectura` es lo que el modelo dice, y revisarla es
+   * exactamente para lo que está quien revisa. El `elementoId` no dice nada: APUNTA a una fila
+   * del tablero determinista, y esa correspondencia se comprobó una sola vez, al generar,
+   * contra el material de entonces. La corrección llega después y por otra puerta —la frontera
+   * solo exige que cada id sea un uuid—, así que un cliente que no fuera el formulario de la
+   * casa podía reapuntar la desviación a cualquier elemento y sellarlo como contenido aceptado.
+   *
+   * Se mide en los dos sentidos, que es lo que distingue «los ids están blindados» de «C7 no
+   * admite correcciones»: cambiar el TEXTO de la lectura pasa.
+   */
+  it('C7 no deja reapuntar una desviación al corregir, y sí reescribir su lectura', async () => {
+    await enWorkspaceLimpio(
+      'c7-desviacion-testimonio',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        const original = {
+          contribucion: 'El servicio movió la aguja a medias.',
+          factoresExternos: '',
+          hipotesisAbiertas: '',
+          aprendizajes: 'Conviene constatar antes de verificar.',
+          desviaciones: [{ elementoId, lectura: 'Salió sin el aviso previo.' }],
+          citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+          confianzaPropuesta: 'media' as const,
+        };
+        const pedir = async () => {
+          await conProveedor(
+            { ok: true, datos: original, intentos: [intento({ uso: null })] },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          );
+          const panel = await panelPropuestas(curadorId, wsC);
+          return panel.pendientes.find((x) => x.capacidad === 'C7')!.id;
+        };
+
+        const primera = await pedir();
+        await expect(
+          aceptarPropuesta(curadorId, {
+            workspaceId: wsC,
+            propuestaId: primera,
+            correccion: {
+              ...original,
+              // Un uuid con forma buena que NO es el elemento del tablero.
+              desviaciones: [
+                { elementoId: '00000000-0000-4000-8000-0000000c4c4c', lectura: 'Lo mismo.' },
+              ],
+            },
+          }),
+        ).rejects.toThrow(/no se corrigen/i);
+
+        // Y el otro sentido: la LECTURA sí se reescribe, que es para lo que está la revisión.
+        const { objetoId } = await aceptarPropuesta(curadorId, {
+          workspaceId: wsC,
+          propuestaId: primera,
+          correccion: {
+            ...original,
+            desviaciones: [
+              { elementoId, lectura: 'Salió sin el aviso previo, y eso costó dos semanas.' },
+            ],
+          },
+        });
+        expect(objetoId).toBe(reviewId);
+      },
+    );
+  });
+
+  /**
+   * Una desviación sobre un elemento que no estaba en el tablero tumba la respuesta ENTERA.
+   *
+   * No lo cubre ninguna clave ajena —las desviaciones no se materializan, viven en el
+   * contenido— así que si no lo comprueba el servicio no lo comprueba nadie. Y lo que se evita
+   * es de las averías caras: mandar a alguien a revisar un release que estaba bien, con la
+   * firma de un post mortem detrás.
+   */
+  it('C7 no guarda un borrador que señale un elemento fuera de la conciliación', async () => {
+    await enWorkspaceLimpio('c7-elemento-ajeno', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              contribucion: 'Algo se movió.',
+              factoresExternos: '',
+              hipotesisAbiertas: '',
+              aprendizajes: 'Algo se aprendió.',
+              desviaciones: [
+                {
+                  /* Un uuid con forma buena que el tablero no nombra. */
+                  elementoId: '00000000-0000-4000-8000-00000000c7c7',
+                  lectura: 'Este elemento no existe en la conciliación de este reto.',
+                },
+              ],
+              citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+              confianzaPropuesta: 'baja',
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: reviewId,
+            }),
+        ),
+      ).rejects.toThrow(/no se sostienen en el tablero|el elemento no está en él/i);
+    });
+  });
+
+  /**
+   * Un elemento que el recorte dejó fuera no admite desviación, y el rechazo es DE CONTRATO.
+   *
+   * Dos cosas en una sonda porque son dos mitades del mismo acto. El elemento existe, su estado
+   * admite lectura, y aun así la desviación que lo nombra se escribió sin verlo: el cuerpo se
+   * corta entero a `MAX_MATERIAL` y con una conciliación grande la cola se queda fuera. Es la
+   * misma puerta que C3 le pone a sus insights.
+   *
+   * Y el rechazo se apunta como salida FUERA DE CONTRATO, que es lo que la instrumentación lee:
+   * con el error genérico, el último intento quedaba apuntado como `salida-valida` aunque no
+   * naciera ninguna propuesta, y la métrica de calidad del proveedor decía que había respondido
+   * bien. La sonda lo mide en `llamada_ai`, no en el mensaje.
+   */
+  /**
+   * Y el corte se cuenta AL CARÁCTER.
+   *
+   * `cuerpoDePostMortem` lleva el largo del texto ya unido incrementalmente —sumando el '\n'
+   * que une cada línea a la anterior— en vez de rehacer el `join` una vez por elemento, que era
+   * cuadrático sobre una conciliación que la base no acota: 1,7 ms con 100 elementos y 46 ms
+   * con 800, pagados en CADA render, el del prompt y el del panel.
+   *
+   * Un contador incremental es exactamente donde se cuela un off-by-one, y un off-by-one aquí
+   * no rompe nada visible: deja pasar un elemento cuya última línea se quedó fuera por un
+   * carácter, que es la avería que la puerta existe para cortar. Así que se mide EN LA
+   * FRONTERA: creciendo el material carácter a carácter, el conjunto de los que llegaron tiene
+   * que encoger de uno en uno y nunca saltarse ninguno.
+   */
+  it('el corte del post mortem se cuenta al carácter, no por aproximación', () => {
+    const conRelleno = (n: number) => ({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D'.repeat(n),
+      metricaObjetivo: 'M',
+      lecturas: [],
+      conciliacion: [
+        {
+          proyectoCodigo: 'P-01',
+          designVersionCodigo: 'DV-01',
+          elementos: Array.from({ length: 40 }, (_, i) => ({
+            elementoId: `a7b8c9d0-0000-4000-8000-${String(i).padStart(12, '0')}`,
+            elementoTitulo: `Elemento ${i}`,
+            tipo: 'pantalla',
+            operacion: 'alta',
+            estado: 'desviado',
+            releaseCodigo: 'REL-3',
+            releaseResponsable: 'Equipo de alta',
+            releaseFecha: '2026-04-02',
+            queQuedoDistinto: 'Salió sin el paso de explicación',
+            // ÚNICA por elemento, y la ÚLTIMA línea que aporta: es el ancla contra la que se
+            // contrasta. Con un texto repetido, buscarla en el bloque no distinguiría de cuál.
+            razonDesviacion: `Se cortó por plazo, caso ${i}`,
+          })),
+        },
+      ],
+    });
+    /*
+     * La referencia no se recalcula con la misma aritmética que se está midiendo —eso sería
+     * escribir el error dos veces y llamarlo prueba—: se lee del TEXTO QUE SE ENTREGA. Un
+     * elemento llegó entero si su última línea aparece completa en el bloque que ve el modelo.
+     */
+    const losQueSeVen = (e: ReturnType<typeof conRelleno>) => {
+      const { bloque } = materialDePostMortem(e);
+      return e.conciliacion[0]!.elementos.filter((x) =>
+        bloque.includes(`  Razón registrada: ${x.razonDesviacion}`),
+      ).map((x) => x.elementoId);
+    };
+    // La frontera: el relleno máximo con el que todavía llegan los cuarenta.
+    let todos = 0;
+    let ninguno = MAX_MATERIAL;
+    while (ninguno - todos > 1) {
+      const medio = (todos + ninguno) >> 1;
+      if (losQueSeVen(conRelleno(medio)).length === 40) todos = medio;
+      else ninguno = medio;
+    }
+    expect(losQueSeVen(conRelleno(todos)).length).toBe(40);
+    // Y desde ahí, carácter a carácter: lo que la función dice tiene que ser exactamente lo que
+    // se ve en el bloque. Un off-by-one en cualquiera de los dos sentidos rompe la igualdad.
+    let bajadas = 0;
+    let anterior = 40;
+    for (let n = todos; n <= todos + 400; n++) {
+      const e = conRelleno(n);
+      const visto = losQueSeVen(e);
+      expect(elementosQueLlegaronAlModelo(e).ids).toEqual(visto);
+      if (visto.length < anterior) bajadas = bajadas + 1;
+      anterior = visto.length;
+    }
+    // Y que la sonda haya recorrido de verdad la frontera, no un tramo llano.
+    expect(bajadas).toBeGreaterThan(1);
+  });
+
+  /**
+   * Y antes de rechazar, DECIRLO: el prompt avisa cuando el tablero se truncó.
+   *
+   * C7 era la única capacidad cuyo prompt no daba ese aviso. La puerta de arriba solo puede
+   * rechazar lo que ya llegó —con el lote pagado—; el aviso es lo único que puede cambiar lo
+   * que el modelo devuelve. Y avisa de dos cosas, no de una: no señalar lo que no ve, y no dar
+   * por completo ningún recuento de lo desviado. La segunda no la corta ninguna puerta —«tres
+   * de doce elementos se desviaron» sobre una cola truncada es una frase entera y falsa—, así
+   * que si el aviso no la nombra, no la nombra nadie.
+   */
+  it('el prompt del post mortem avisa de que el tablero se truncó, y de qué falta', () => {
+    const expediente = (n: number): ExpedienteDePostMortem => ({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D',
+      metricaObjetivo: 'M',
+      lecturas: [],
+      conciliacion: [
+        {
+          proyectoCodigo: 'P-01',
+          designVersionCodigo: 'DV-01',
+          elementos: Array.from({ length: n }, (_, i) => ({
+            elementoId: `a7b8c9d0-0000-4000-8000-${String(i).padStart(12, '0')}`,
+            elementoTitulo: `Elemento ${i}`,
+            tipo: 'pantalla',
+            operacion: 'alta',
+            estado: 'desviado',
+            releaseCodigo: 'REL-3',
+            releaseResponsable: 'Equipo de alta',
+            releaseFecha: '2026-04-02',
+            queQuedoDistinto: 'Salió sin el paso de explicación',
+            razonDesviacion: 'Se cortó por plazo',
+          })),
+        },
+      ],
+    });
+    // Sin recorte no hay aviso: un aviso que sale siempre no dice nada.
+    const corto = promptPostMortem(expediente(2));
+    expect(materialDePostMortem(expediente(2)).truncado).toBe(false);
+    expect(corto.usuario).not.toContain('se truncó');
+    expect(corto.alcanceResumen).not.toContain('truncado');
+
+    // Y con el tablero recortado, el aviso y sus dos mitades.
+    const largo = promptPostMortem(expediente(400));
+    expect(materialDePostMortem(expediente(400)).truncado).toBe(true);
+    expect(largo.usuario).toContain('se truncó');
+    expect(largo.usuario).toContain('COLA DEL TABLERO');
+    expect(largo.usuario).toContain('no señales desviaciones ni cites lecturas que no ves');
+    expect(largo.usuario).toContain('no des por completo ningún recuento');
+    // El resumen de alcance también lo dice: es lo que queda en el lineage.
+    expect(largo.alcanceResumen).toContain('truncado');
+
+    /*
+     * Y el aviso nombra LA SECCIÓN QUE DE VERDAD SE CORTÓ. «La cola del tablero» es cierto casi
+     * siempre —la conciliación va la última— y deja de serlo cuando el corte cae ANTES, dentro
+     * de las lecturas: entonces el tablero no llega ni a empezar y decir que falta su cola le
+     * asegura al modelo que las lecturas que ve son todas, que es la afirmación falsa que este
+     * aviso existe para impedir.
+     */
+    const conLecturasLargas = {
+      ...expediente(2),
+      lecturas: Array.from({ length: 40 }, (_, i) => ({
+        criterioId: `c3d4e5f6-0000-4000-8000-${String(i).padStart(12, '0')}`,
+        kpi: 'Tiempo de verificación',
+        objetivo: 'o'.repeat(600),
+        ventanaDias: 90,
+        lectura: '5 minutos',
+        sinDatosMotivo: '',
+      })),
+    };
+    expect(seccionesQueLlegaronAlPostMortem(conLecturasLargas).lecturas).toBe(false);
+    const cortadoAntes = promptPostMortem(conLecturasLargas);
+    expect(cortadoAntes.usuario).toContain('parte de las LECTURAS DE CRITERIO');
+    expect(cortadoAntes.usuario).toContain('TABLERO de conciliación ENTERO');
+    expect(cortadoAntes.usuario).not.toContain('COLA DEL TABLERO');
+  });
+
+  it('C7 no admite una desviación sobre un elemento que el recorte no dejó llegar', async () => {
+    await enWorkspaceLimpio(
+      'c7-elemento-recortado',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        // El corte se empuja a propósito: una descripción de reto más larga que el techo se
+        // lleva por delante TODO lo que el render pone detrás, la conciliación incluida.
+        await admin`update reto set descripcion = ${'x'.repeat(MAX_MATERIAL + 1000)}
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        await expect(
+          conProveedor(
+            {
+              ok: true,
+              datos: {
+                contribucion: 'Algo se movió.',
+                factoresExternos: '',
+                hipotesisAbiertas: '',
+                aprendizajes: 'Algo se aprendió.',
+                desviaciones: [
+                  { elementoId, lectura: 'Sobre un elemento que el modelo no llegó a ver.' },
+                ],
+                citas: [{ fragmento: 'x', localizacion: 'cabecera' }],
+                confianzaPropuesta: 'baja',
+              },
+              intentos: [intento({ uso: null })],
+            },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          ),
+        ).rejects.toThrow(/no se sostienen en el tablero|el recorte del material lo dejó fuera/i);
+        // Y la llamada consta como lo que fue: una salida fuera de contrato.
+        const [linea] = await conUsuario(curadorId, (tx) => tx`
+          select resultado from llamada_ai
+          where workspace_id = ${wsC} and capacidad = 'C7'
+          order by creado_en desc limit 1`);
+        expect(linea!.resultado).toBe('fuera-de-contrato');
+      },
+    );
+  });
+
+  /**
+   * Y dos desviaciones sobre el MISMO elemento tumban la respuesta igual, aunque el elemento
+   * exista.
+   *
+   * Es el hueco que deja la sonda de arriba: la pertenencia al tablero se comprueba elemento a
+   * elemento, así que un id repetido la pasa dos veces. Lo que queda entonces es un borrador
+   * con dos lecturas del mismo hecho y nada que diga cuál vale —quien revisa no puede elegir, y
+   * el panel las pinta como dos filas con el mismo rótulo—.
+   *
+   * Se corta en el CONTRATO y no en el servicio, y ahí está la diferencia con el elemento
+   * ajeno: aquello necesita el material delante para saberse; esto se ve en la forma de la
+   * respuesta, sin consultar nada. Por eso lo rechaza el parseo, con el motivo genérico de una
+   * respuesta fuera de forma —el detalle va al diagnóstico, no a quien revisa—.
+   */
+  it('C7 no guarda un borrador que lea dos veces el mismo elemento', async () => {
+    await enWorkspaceLimpio('c7-elemento-repetido', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId, elementoId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              contribucion: 'Algo se movió.',
+              factoresExternos: '',
+              hipotesisAbiertas: '',
+              aprendizajes: 'Algo se aprendió.',
+              /* El MISMO elemento, y con dos lecturas distintas: si sólo se comparara la
+               * desviación entera, este par pasaría. La unidad es la fila del tablero. */
+              desviaciones: [
+                { elementoId, lectura: 'Quedó distinto y eso explica el resultado.' },
+                { elementoId, lectura: 'Quedó distinto y eso no explica nada.' },
+              ],
+              citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+              confianzaPropuesta: 'baja',
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: reviewId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+    });
+  });
+
+  /**
+   * Un DISEÑADOR no puede pedir C7, y el «no» llega antes de gastar.
+   *
+   * `outcome_review` es la única tabla de destino cuya política de escritura pide
+   * `lead-boutique` —las otras cinco admiten `disenador`—, así que la puerta uniforme de
+   * `rolCurador` dejaba a un diseñador apartar presupuesto, pagar la llamada y llegar a una
+   * propuesta que RLS no le dejaba aceptar nunca. El gasto ya hecho, y un 42501 por toda
+   * explicación.
+   *
+   * Se mide en los dos sentidos, que es lo que separa «C7 está acotada» de «este usuario no
+   * cura»: el mismo diseñador SÍ pasa la puerta de C2, y falla por otro sitio.
+   */
+  it('C7 la piden solo los lead: un diseñador no gasta en algo que no podría aceptar', async () => {
+    await enWorkspaceLimpio('c7-rol', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${`${marca}-c7-disenador@test.demo`}, 'Diseñador', 'activo') returning id`;
+      const disenadorId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${disenadorId}, 'Diseñador',
+                ${`${marca}-c7-disenador@test.demo`}, 'disenador')`;
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        generarPropuestas(disenadorId, { workspaceId: wsC, capacidad: 'C7', anclaId: reviewId }),
+      ).rejects.toThrow(/la pide y la acepta lead-boutique/i);
+      // Y el otro sentido: el mismo diseñador pasa la puerta del rol en C2. Sin esta mitad, un
+      // usuario mal montado —sin rol de curador— daría el mismo verde a la sonda de arriba.
+      await expect(
+        generarPropuestas(disenadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      ).rejects.not.toThrow(/la pide y la acepta/i);
+    });
+  });
+
+  /**
+   * La huella del material de C7 se toma sobre el EXPEDIENTE, no sobre su render recortado.
+   *
+   * Las otras capacidades huellan lo que se le manda al modelo, que ya viene cortado a
+   * `MAX_MATERIAL`, y para ellas responde a la pregunta buena. Aquí no: una narrativa de post
+   * mortem se firma CONTRA UN TABLERO, y el tablero es el objeto entero. Con la huella del
+   * texto, un criterio más allá del corte podía cambiar entre generar y aceptar sin disparar
+   * `conciliacion-cambiada`.
+   *
+   * La sonda empuja el corte a propósito: una descripción de reto más larga que `MAX_MATERIAL`
+   * se lleva por delante TODO lo que el render pone detrás —las lecturas y la conciliación—,
+   * así que mover una lectura no cambia ni un carácter del texto recortado. Si la huella
+   * saliera de ahí, esta comparación daría igual a igual.
+   */
+  it('la huella de C7 ve lo que el recorte del prompt deja fuera', async () => {
+    await enWorkspaceLimpio(
+      'c7-huella-recorte',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const admin = sqlAdmin();
+        const { reviewId, criterioId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+        );
+        await admin`update reto set descripcion = ${'x'.repeat(MAX_MATERIAL + 1000)}
+          where id = ${retoC} and workspace_id = ${wsC}`;
+        const antes = await conUsuario(curadorId, (tx) =>
+          huellaDelMaterialDelPostMortem(tx, wsC, reviewId),
+        );
+        // El render, para dejar constancia de que el corte ocurre de verdad: si esto dejara de
+        // ser cierto la sonda seguiría pasando sin medir nada.
+        expect(materialDePostMortem(antes.expediente!).truncado).toBe(true);
+        const textoAntes = materialDePostMortem(antes.expediente!).texto;
+        await admin`update resultado_criterio
+          set sin_datos_motivo = 'La serie se recuperó y la lectura final llegó en septiembre'
+          where review_id = ${reviewId} and criterio_id = ${criterioId}`;
+        const despues = await conUsuario(curadorId, (tx) =>
+          huellaDelMaterialDelPostMortem(tx, wsC, reviewId),
+        );
+        // El texto NO se movió —lo que cambió cae detrás del corte— y la huella SÍ.
+        expect(materialDePostMortem(despues.expediente!).texto).toBe(textoAntes);
+        expect(despues.huella).not.toBe(antes.huella);
+      },
+    );
+  });
+
+  /**
+   * Un elemento que el tablero da por CONSTATADO no admite lectura de desviación.
+   *
+   * `constatado` significa que alguien lo miró y salió exactamente como se aprobó: el dato
+   * determinista ya dijo que ahí no hubo discrepancia. Señalarlo como desviación contradice al
+   * tablero en el mismo expediente donde el tablero está impreso, que es la tesis de C7 al
+   * revés — el post mortem se redacta SOBRE lo constatado, no contra ello.
+   *
+   * La sonda usa el MISMO elemento que la conciliación nombra, así que no la puede pasar por
+   * «no está en el material»: lo que la mueve es el estado, y solo el estado.
+   */
+  it('C7 no guarda un borrador que llame desviación a un elemento constatado', async () => {
+    await enWorkspaceLimpio(
+      'c7-constatado',
+      async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+        const { reviewId, elementoId } = await postMortemConExpediente(
+          wsC,
+          retoC,
+          servicioId,
+          curadorId,
+          { desviado: false },
+        );
+        await expect(
+          conProveedor(
+            {
+              ok: true,
+              datos: {
+                contribucion: 'Algo se movió.',
+                factoresExternos: '',
+                hipotesisAbiertas: '',
+                aprendizajes: 'Algo se aprendió.',
+                desviaciones: [
+                  { elementoId, lectura: 'Esto quedó distinto y explica el resultado.' },
+                ],
+                citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+                confianzaPropuesta: 'baja',
+              },
+              intentos: [intento({ uso: null })],
+            },
+            () =>
+              generarPropuestas(curadorId, {
+                workspaceId: wsC,
+                capacidad: 'C7',
+                anclaId: reviewId,
+              }),
+          ),
+        ).rejects.toThrow(/da por constatado|no se sostienen en el tablero/i);
+      },
+    );
+  });
+
+  /**
+   * Un post mortem sin nada que leer no se ofrece, y uno completado deja de ofrecerse.
+   *
+   * La primera mitad es la regla de «datos deterministas» aplicada al revés: sin lecturas ni
+   * elementos conciliados, la única salida posible es prosa inventada con aspecto de post
+   * mortem —cara, y peor que no tener ninguna porque parece trabajo hecho—.
+   */
+  it('C7 no se ofrece sobre un post mortem vacío, y uno completado cierra la puerta', async () => {
+    await enWorkspaceLimpio('c7-sin-expediente', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const [vacio] = await admin`insert into outcome_review
+        (workspace_id, reto_id, estado, creado_por)
+        values (${wsC}, ${retoC}, 'borrador', ${curadorId}) returning id`;
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: CONTENIDO_POR_CAPACIDAD.C7 as unknown as Record<string, unknown>,
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: vacio!.id as string,
+            }),
+        ),
+      ).rejects.toThrow(/no tiene todavía nada que leer/);
+
+      // Y con expediente: nace, y se cierra la puerta al completarse el post mortem. El vacío
+      // se retira primero porque `outcome_review` es único por reto — un reto tiene UN post
+      // mortem, que es lo correcto y lo que obliga a montar los dos casos en secuencia.
+      await admin`delete from outcome_review where id = ${vacio!.id as string}`;
+      const { reviewId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await conProveedor(
+        {
+          ok: true,
+          datos: CONTENIDO_POR_CAPACIDAD.C7 as unknown as Record<string, unknown>,
+          intentos: [intento({ uso: null })],
+        },
+        () =>
+          generarPropuestas(curadorId, {
+            workspaceId: wsC,
+            capacidad: 'C7',
+            anclaId: reviewId,
+          }),
+      );
+      const antes = await panelPropuestas(curadorId, wsC);
+      expect(antes.pendientes.find((x) => x.capacidad === 'C7')!.anclaEstado).toBe('disponible');
+
+      /* Completar exige el dictamen firmado Y la narrativa escrita: un post mortem cerrado en
+       * blanco no es un post mortem. Se rellena a mano porque lo que este caso mide es la
+       * PUERTA, no cómo se llegó a la narrativa. */
+      await admin`update outcome_review
+        set estado = 'completado', veredicto = 'no-concluyente', completado_por = ${curadorId},
+            completado_en = now(), contribucion = 'Escrita a mano para cerrar',
+            aprendizajes = 'Escritos a mano para cerrar'
+        where id = ${reviewId}`;
+      const despues = await panelPropuestas(curadorId, wsC);
+      const p = despues.pendientes.find((x) => x.capacidad === 'C7');
+      expect(p!.anclaEstado).toBe('post-mortem-cerrado');
+      await expect(
+        aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: p!.id }),
+      ).rejects.toThrow(/ya se completó/);
+    });
+  });
+
+  it('C3 propone HMW por el camino real y aceptar materializa la oportunidad con su traza', async () => {
+    await enWorkspaceLimpio('c3-camino-real', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const evId = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      const insA = await insightValidadoDelReto(wsC, evId, curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      const insB = await insightValidadoDelReto(wsC, evId, curadorId, {
+        titulo: 'El aviso del documento llega cuando ya es tarde',
+        resumen: 'El recordatorio sale cuando la persona ya cerró la aplicación.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      await criterioDelReto(wsC, retoC, curadorId);
+
+      // Dos citas a DOS insights distintos: la traza que debe nacer tiene dos filas, y así el
+      // «exactamente los citados» se mide contra un conjunto y no contra un elemento.
+      const propuesta = {
+        pregunta: '¿Cómo podríamos verificar sin pedir un documento que no está a mano?',
+        prioridad: 700,
+        prioridadRazon: 'Mueve el criterio del tiempo de verificación: es donde se pierde la mayoría.',
+        citas: [
+          { insightId: insA, fragmento: 'Quien no lleva el documento encima', localizacion: 'resumen' },
+          // Una segunda cita AL MISMO insight: la traza va por `insightId` DISTINTO, así que
+          // esto no puede producir una tercera fila ni tumbar la comprobación por conteo.
+          { insightId: insA, fragmento: 'abandona y no vuelve', localizacion: 'resumen' },
+          { insightId: insB, fragmento: 'ya cerró la aplicación', localizacion: 'resumen' },
+        ],
+        confianzaPropuesta: 'media' as const,
+      };
+
+      const generadas = await conProveedor(
+        {
+          ok: true,
+          datos: { oportunidades: [propuesta] },
+          intentos: [intento({ modelo: 'modelo-de-prueba', latenciaMs: 190, uso: null })],
+        },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C3', anclaId: retoC }),
+      );
+      expect(generadas.generadas).toBe(1);
+
+      const admin = sqlAdmin();
+      const [nacida] = await admin`
+        select p.estado, p.destino, p.reto_id, p.oportunidad_id, p.alcance_insights,
+               l.capacidad as llamada_capacidad, l.reto_id as llamada_reto
+        from propuesta_ai p
+        join llamada_ai l on l.id = p.llamada_id and l.workspace_id = p.workspace_id
+        where p.workspace_id = ${wsC} and p.capacidad = 'C3'`;
+      expect(nacida!.estado).toBe('propuesta');
+      expect(nacida!.destino).toBe('oportunidad');
+      expect(nacida!.reto_id).toBe(retoC);
+      // Pendiente todavía no tiene objeto: la HMW nace al aceptar, no al proponer.
+      expect(nacida!.oportunidad_id).toBeNull();
+      // El alcance guarda lo que el modelo LEYÓ, y los dos insights caben de sobra.
+      expect([...(nacida!.alcance_insights as string[])].sort()).toEqual([insA, insB].sort());
+      expect(nacida!.llamada_capacidad).toBe('C3');
+      expect(nacida!.llamada_reto).toBe(retoC);
+
+      const panel = await panelPropuestas(curadorId, wsC);
+      const p = panel.pendientes.find((x) => x.capacidad === 'C3');
+      expect(p, 'la propuesta de C3 no llegó al panel').toBeDefined();
+      expect(p!.destino).toBe('oportunidad');
+      expect(p!.anclaEstado).toBe('disponible');
+      // Las tres citas se leen donde están —en `contenido.citas`, con `insightId`— y se miden
+      // contra el material que se le dio al modelo, no contra el texto de la propuesta.
+      expect(p!.citas.map((c) => c.presenteLiteral)).toEqual([true, true, true]);
+
+      const { objetoId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsC,
+        propuestaId: p!.id,
+      });
+
+      const [hmw] = await conUsuario(curadorId, (tx) => tx`
+        select pregunta, prioridad, prioridad_razon, estado, creado_por, propuesta_ai_id
+        from oportunidad where id = ${objetoId}`);
+      expect(hmw!.pregunta).toBe(propuesta.pregunta);
+      expect(hmw!.prioridad).toBe(propuesta.prioridad);
+      expect(hmw!.prioridad_razon).toBe(propuesta.prioridadRazon);
+      // Nace POR DECIDIR: aceptar la propuesta de la AI no la mete en el portafolio, que es
+      // una segunda decisión humana con su propio veredicto.
+      expect(hmw!.estado).toBe('propuesta');
+      // El autor es el humano que aceptó, no la AI (I4/SYS-18)…
+      expect(hmw!.creado_por).toBe(curadorId);
+      // …y el sello de procedencia lo escribe el guard: la columna está fuera de todo grant.
+      expect(hmw!.propuesta_ai_id).toBe(p!.id);
+
+      // La traza: DOS filas, una por insight citado, ni una por cita.
+      const traza = await conUsuario(curadorId, (tx) => tx`
+        select insight_id from oportunidad_insight where oportunidad_id = ${objetoId}`);
+      expect(traza.map((t) => t.insight_id as string).sort()).toEqual([insA, insB].sort());
+
+      const [decidida] = await conUsuario(curadorId, (tx) => tx`
+        select estado, revisada_por, oportunidad_id from propuesta_ai where id = ${p!.id}`);
+      expect(decidida!.estado).toBe('aceptada');
+      expect(decidida!.revisada_por).toBe(curadorId);
+      expect(decidida!.oportunidad_id).toBe(objetoId);
+    });
+  });
+
+  /**
+   * Y el TIEMPO, que es lo que separa proponer de aceptar, por sus dos filos.
+   *
+   * Entre las dos cosas caben días, y lo que pasa en ellos es justo lo que invalida la
+   * propuesta. Los dos filos son distintos y por eso se miden en el mismo caso, con el mismo
+   * montaje, cambiando solo qué se mueve en medio:
+   *
+   *   · LA VENTANA se CIERRA. Firmar G3 certifica el portafolio tal como está; sellar después
+   *     mete una HMW en un portafolio que un gate ya dio por bueno, sin que su guard vuelva a
+   *     correr para desmentirlo.
+   *   · EL ALCANCE se QUEDA CORTO. Validar un insight nuevo del reto deja la pregunta escrita
+   *     sin conocer parte de lo que el reto ya sabe —posiblemente lo que la reformularía—, y
+   *     quien revisa no puede compensarlo leyendo la propuesta: lo que falta no está en ella.
+   *
+   * En los dos casos el panel lo DICE en vez de ofrecer un botón que siempre vuelve, y aceptar
+   * falla de verdad: un estado que no se corresponde con el suelo es peor que no tenerlo.
+   */
+  it('C3: una HMW propuesta caduca si se firma su G3 o si el reto valida un insight nuevo', async () => {
+    const admin = sqlAdmin();
+
+    await enWorkspaceLimpio('c3-ventana', async (ctx) => {
+      const { propuestaId } = await propuestaC3Pendiente(ctx);
+      const gateId = await puertaDeG3(ctx.ws, ctx.retoId, ctx.curadorId);
+      // Con la puerta montada pero SIN firmar, la propuesta sigue viva: sin esta mitad, un
+      // panel que dijera «cerrado» por el mero hecho de haber un G3 pasaría la de abajo sin
+      // medir nada, y lo que cierra la ventana es la FIRMA, no la puerta.
+      const antes = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(antes.anclaEstado).toBe('disponible');
+
+      await admin.begin((tx) => firmaDeG3(tx, ctx.ws, gateId, ctx.curadorId));
+
+      const p = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(p.anclaEstado, 'el panel ofrece aceptar algo que no se puede aceptar').toBe(
+        'portafolio-cerrado',
+      );
+      // Quien para esto por el camino real es la COMPROBACIÓN DEL SERVICIO, no el guard: la
+      // firma ya estaba cometida cuando la aceptación empieza, así que se ve en la primera
+      // lectura y el mensaje que llega es el suyo. El guard diferido cubre el otro caso —una
+      // firma que llega EN VUELO—, y ése se mide con su carrera, más abajo.
+      await expect(
+        aceptarPropuesta(ctx.curadorId, { workspaceId: ctx.ws, propuestaId }),
+      ).rejects.toThrow(/El portafolio de ese reto está cerrado/);
+      // Rechazar SÍ sigue abierto: bloquear también esa salida dejaría la fila muerta y su
+      // ancla retenida para siempre.
+      await rechazarPropuesta(ctx.curadorId, { workspaceId: ctx.ws, propuestaId });
+      const [tras] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+      expect(tras!.estado).toBe('rechazada');
+    });
+
+    await enWorkspaceLimpio('c3-alcance', async (ctx) => {
+      const { evId, propuestaId } = await propuestaC3Pendiente(ctx);
+      // Un insight que se VALIDA después de generar, colgado del mismo reto por la misma
+      // evidencia: entra en `insights_validados_del_reto` y no está en `alcance_insights`.
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'El aviso del documento llega cuando ya es tarde',
+        resumen: 'El recordatorio sale cuando la persona ya cerró la aplicación.',
+        fragmento: 'El 71% de los abandonos',
+      });
+
+      const p = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(p.anclaEstado, 'el panel ofrece aceptar algo que no se puede aceptar').toBe(
+        'alcance-incompleto',
+      );
+      // Otra vez es el SERVICIO quien lo para: la validación ya estaba cometida cuando la
+      // aceptación empieza a leer. El guard queda debajo para lo que el servicio no puede ver,
+      // y ése es el caso que mide la sonda de la firma entre medias.
+      await expect(
+        aceptarPropuesta(ctx.curadorId, { workspaceId: ctx.ws, propuestaId }),
+      ).rejects.toThrow(/Los insights validados de ese reto cambiaron/);
+    });
+  });
+
+  /**
+   * Y la firma que llega ENTRE MEDIAS, que es para lo que existe el guard DIFERIDO.
+   *
+   * El caso de arriba lo para la comprobación del servicio, porque la firma ya estaba cometida
+   * cuando la aceptación empieza a leer. Éste es el otro, y hay que montarlo con cuidado
+   * porque la carrera obvia NO lo produce: medido, con la firma en vuelo sujeta por un candado
+   * y la aceptación real corriendo contra ella, la aceptación SELLA — y con razón. El guard
+   * toma el candado del RETO y la firma escribe en `gate_instancia`, que son filas distintas:
+   * no hay conflicto, nadie espera a nadie, y la aceptación commitea ANTES que la firma. Ése
+   * es el orden benigno: la HMW ya estaba dentro cuando G3 se firmó, así que G3 la vio.
+   *
+   * El orden que sí hace daño es el contrario, y no es una carrera sino una secuencia: la
+   * aceptación INSERTA la HMW con el portafolio abierto —y la política del insert, que corre
+   * con el snapshot de esa sentencia, la deja pasar—, la firma se cometea desde otra conexión,
+   * y solo después se sella la propuesta. Ahí el guard diferido es lo único que queda debajo:
+   * corre en el COMMIT, donde una firma que llegó en medio sí se ve, y es lo que impide meter
+   * una HMW en un portafolio que un gate acaba de dar por bueno.
+   *
+   * Es el mismo eje TIEMPO que ya obligó a C2 a volver a mirar los derechos de sus citas y a
+   * C6 la firma de su registry, en su tercer instante: no el de generar ni el de guardar, sino
+   * el de sellar.
+   */
+  /**
+   * Y el SELECTOR no ofrece un reto sin criterios, que es lo que pasó a no poder generarse.
+   *
+   * La lista de candidatas ya exigía portafolio abierto e insights validados, con el argumento
+   * escrito de que ofrecer lo que el guard va a rechazar es ofrecer una llamada pagada para
+   * nada. Desde que la prioridad se argumenta contra los criterios, «sin criterios» entra en
+   * esa misma categoría: `PREPARAR` rechaza siempre, así que el reto no puede ofrecerse.
+   *
+   * Lo que este filtro NO cubre —y por eso `PREPARAR` conserva su comprobación— es que los
+   * criterios existan pero no QUEPAN: eso depende del presupuesto de caracteres, y no hay SQL
+   * que lo sepa sin rehacer el recorte dentro de la consulta.
+   */
+  it('C3 no ofrece como candidato un reto sin criterios de éxito', async () => {
+    await enWorkspaceLimpio('c3-candidatas-sin-criterios', async (ctx) => {
+      const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      // Con insight validado y portafolio abierto, pero SIN criterio: todo lo demás que la
+      // consulta exige está puesto, así que lo único que puede dejarlo fuera es el filtro nuevo.
+      const sinCriterio = await panelPropuestas(ctx.curadorId, ctx.ws);
+      expect(
+        sinCriterio.candidatas.C3.lista.map((a) => a.id),
+        'el selector ofrece un reto sobre el que generar falla siempre',
+      ).not.toContain(ctx.retoId);
+
+      // Y con el criterio puesto SÍ aparece: sin esta mitad, una consulta que no devolviera
+      // nunca nada pasaría la de arriba sin medir nada.
+      await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+      const conCriterio = await panelPropuestas(ctx.curadorId, ctx.ws);
+      expect(conCriterio.candidatas.C3.lista.map((a) => a.id)).toContain(ctx.retoId);
+    });
+  });
+
+  /**
+   * CENSO: todo estado de ancla que el SQL del panel emite tiene que estar en el registro.
+   *
+   * Éste es el agujero por el que C3 se coló: su CASE devolvía `portafolio-cerrado` e
+   * `insight-no-validado`, que no estaban en `ESTADOS_ANCLA`. Nadie se enteró porque el valor
+   * llega desde SQL como texto y `filaDePanel` lo mete al tipo con un cast: el compilador no
+   * ve nada, la aceptación queda deshabilitada —eso sí funcionaba— y `MOTIVO_ANCLA[estado]`
+   * devuelve `undefined`, así que quien revisa se queda sin explicación ni salida.
+   *
+   * Se mide sobre el TEXTO del registro y no llamando a los callbacks: `estado` devuelve un
+   * fragmento de plantilla, no una cadena, y ejecutarlo pediría una conexión por capacidad
+   * para no leer, al final, más que estos literales. Lo que devuelve `estadoDeLaFila` no hace
+   * falta censarlo: eso sí está tipado como `EstadoAncla` y lo sujeta el compilador.
+   *
+   * El modo de fallo está invertido a propósito, que es la lección del censo de husos: si la
+   * extracción deja de encontrar literales, la prueba CAE en vez de pasar en vacío.
+   */
+  it('todo estado de ancla que emite el SQL del panel está declarado en ESTADOS_ANCLA', async () => {
+    const fuente = await readFile(
+      new URL('../../lib/ai/ai.servicio.ts', import.meta.url),
+      'utf8',
+    );
+    const desde = fuente.indexOf('const CAPACIDAD_EN_EL_PANEL');
+    expect(desde, 'no se encontró el registro del panel: el censo no mide nada').toBeGreaterThan(
+      -1,
+    );
+    const region = fuente.slice(desde, fuente.indexOf('\n};', desde));
+    const emitidos = [
+      ...new Set([...region.matchAll(/(?:then|else)\s+'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]!)),
+    ].sort();
+    // Sin esto, una extracción rota devolvería la lista vacía y el censo pasaría en vacío.
+    expect(
+      emitidos.length,
+      'la extracción no encontró literales: el censo dejó de medir',
+    ).toBeGreaterThan(8);
+    expect(emitidos.filter((e) => !ESTADOS_ANCLA.includes(e as EstadoAncla))).toEqual([]);
+  });
+
+  /**
+   * Y el material que CAMBIA sin que cambie el conjunto de ids.
+   *
+   * La formulación del reto, el título o el resumen de un insight ya validado, o el texto de
+   * un criterio: nada de eso mueve `insights_validados_del_reto`, así que el CASE del panel
+   * —que mira ese conjunto— seguía diciendo `disponible`. Pero la huella del material sí se
+   * mueve, y la comprobación de la aceptación la compara: el botón se ofrecía y aceptar
+   * fallaba SIEMPRE. Es la tarjeta que se puede pulsar y nunca funciona, el mismo defecto que
+   * C6 corrigió con su `estadoDeLaFila`.
+   *
+   * Y «no se sabe» tiene motivo propio: si la propuesta viene de otro render del prompt, decir
+   * «los insights cambiaron» sería inventarse una alarma y mandar a quien revisa a buscar una
+   * edición que nadie hizo. La salida es la misma —rechazar y pedir otro lote—, el motivo no.
+   */
+  it('C3: si el material cambia bajo una propuesta pendiente, el panel deja de ofrecerla', async () => {
+    const admin = sqlAdmin();
+    await enWorkspaceLimpio('c3-material-cambiado', async (ctx) => {
+      const { insightId, propuestaId } = await propuestaC3Pendiente(ctx);
+      // Antes de tocar nada: sin esta mitad, un panel que dijera siempre «cambiados» pasaría
+      // la de abajo sin medir nada.
+      const antes = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(antes.anclaEstado).toBe('disponible');
+
+      // El resumen del insight, que NO mueve el conjunto de ids validados y SÍ la huella.
+      await admin`update insight set resumen = 'Otro resumen, entero y distinto.'
+        where id = ${insightId}`;
+
+      const p = (await panelPropuestas(ctx.curadorId, ctx.ws)).pendientes.find(
+        (x) => x.capacidad === 'C3',
+      )!;
+      expect(p.anclaEstado, 'el panel ofrece aceptar algo que no se puede aceptar').toBe(
+        'insights-cambiados',
+      );
+      // Y no es decoración: aceptar falla de verdad, que es lo que el estado anuncia.
+      await expect(
+        aceptarPropuesta(ctx.curadorId, { workspaceId: ctx.ws, propuestaId }),
+      ).rejects.toThrow(/Los insights validados de ese reto cambiaron/);
+    });
+  });
+
+  /**
+   * C3 no se pide sobre un material que no cabe entero, ni sobre uno que no trae contra qué
+   * priorizar. Las dos son la misma regla: no se pregunta lo que no se ha enseñado.
+   *
+   *   · UN SOLO insight fuera basta. `alcance_insights` guarda solo los que llegaron enteros
+   *     —tiene que ser honesto, ésa fue la corrección de C2— y el suelo exige que ese conjunto
+   *     CONTENGA todos los validados del reto. Con uno fuera es un subconjunto estricto desde
+   *     el primer instante: el panel la marca `alcance-incompleto` nada más nacer y aceptarla
+   *     no puede prosperar NUNCA. Lo que quedaba era una tarjeta que solo se puede rechazar,
+   *     con la llamada ya pagada. El caso de «ninguno cabe» era esto mismo visto en su extremo.
+   *
+   *   · Y SIN CRITERIOS no hay prioridad que argumentar. El sistema exige que cada razón
+   *     nombre el criterio que la pregunta movería, y `prioridadRazon` es prosa libre: sin
+   *     criterios delante el modelo cumple inventándose uno, y lo inventado se materializa con
+   *     aspecto de argumento. Es la misma puerta que C6 cierra sobre un reto sin criterios.
+   *
+   * En los dos casos se comprueba además que NO se apuntó llamada: el corte va antes de pagar,
+   * que es la mitad que convierte «se rechaza igual» en «no se gastó».
+   */
+  it('C3 no se despacha con un insight recortado ni sin criterios contra los que priorizar', async () => {
+    const admin = sqlAdmin();
+    await enWorkspaceLimpio('c3-insight-recortado', async (ctx) => {
+      const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      // Sin éste, el lote saldría: es el que no cabe, y basta con él.
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'El relato largo del participante',
+        resumen: 'Relato sin parar. '.repeat(MAX_MATERIAL / 10),
+        fragmento: 'El 71% de los abandonos',
+      });
+
+      await conProveedor(
+        { ok: true, datos: { oportunidades: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(ctx.curadorId, {
+              workspaceId: ctx.ws,
+              capacidad: 'C3',
+              anclaId: ctx.retoId,
+            }),
+          ).rejects.toThrow(/no caben enteros en el material/);
+        },
+      );
+      const [n] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${ctx.ws}`;
+      expect(n!.n, 'se apuntó una llamada que no se hizo').toBe(0);
+    });
+
+    await enWorkspaceLimpio('c3-sin-criterios', async (ctx) => {
+      const evId = await evidenciaDelReto(ctx.ws, ctx.retoId, ctx.curadorId, {
+        titulo: 'Abandono en verificación',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento de identidad.',
+      });
+      await insightValidadoDelReto(ctx.ws, evId, ctx.curadorId, {
+        titulo: 'La verificación excluye a quien no tiene el documento a mano',
+        resumen: 'Quien no lleva el documento encima abandona y no vuelve.',
+        fragmento: 'El 71% de los abandonos',
+      });
+      // Con insight y SIN criterio: lo único que falta es contra qué priorizar.
+      await conProveedor(
+        { ok: true, datos: { oportunidades: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          await expect(
+            generarPropuestas(ctx.curadorId, {
+              workspaceId: ctx.ws,
+              capacidad: 'C3',
+              anclaId: ctx.retoId,
+            }),
+          ).rejects.toThrow(/no tiene criterios de éxito/);
+        },
+      );
+      const [n] = await admin`select count(*)::int as n from llamada_ai
+        where workspace_id = ${ctx.ws}`;
+      expect(n!.n, 'se apuntó una llamada que no se hizo').toBe(0);
+      // Y con el criterio puesto SÍ sale: sin esta mitad, un corte que rechazara siempre
+      // pasaría la de arriba sin medir nada.
+      await criterioDelReto(ctx.ws, ctx.retoId, ctx.curadorId);
+      await conProveedor(
+        { ok: true, datos: { oportunidades: [] }, intentos: [intento({ uso: null })] },
+        async () => {
+          const r = await generarPropuestas(ctx.curadorId, {
+            workspaceId: ctx.ws,
+            capacidad: 'C3',
+            anclaId: ctx.retoId,
+          });
+          expect(r.generadas).toBe(0);
+        },
+      );
+    });
+  });
+
+  /**
+   * Y la función que lo decide, medida aparte: los criterios de C3 van DETRÁS de los insights,
+   * así que son los primeros que el recorte se come.
+   *
+   * Hermana y no la misma que la de C6 —allí los criterios SON el material y van delante—: son
+   * dos cuerpos distintos y se recortan en sitios distintos, así que una sola función mediría
+   * un texto que en la otra capacidad nadie manda.
+   */
+  it('C3: el recorte del material decide si queda algún criterio contra el que priorizar', () => {
+    const criterio = {
+      id: 'c3d4e5f6-0000-4000-8000-00000000000b',
+      kpi: 'K',
+      definicion: 'D',
+      objetivo: 'O',
+      ventanaDias: 30,
+      lineaBasePlan: 'P',
+    };
+    const reto = {
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'x'.repeat(MAX_MATERIAL),
+      insights: [{ id: 'c3d4e5f6-0000-4000-8000-00000000000c', titulo: 'I', resumen: 'R' }],
+      criterios: [criterio],
+    };
+    // Con la descripción ocupando el presupuesto entero no llega NINGUNO.
+    const recortado = criteriosQueLlegaronConLasOportunidades(reto);
+    expect(recortado.ids).toEqual([]);
+    expect(recortado.fuera).toBe(1);
+    // Y sin recorte llegan enteros, que es la otra mitad: sin ella, una función que devolviera
+    // siempre la lista vacía pasaría igual.
+    const llano = criteriosQueLlegaronConLasOportunidades({ ...reto, descripcion: 'D' });
+    expect(llano.ids).toEqual([criterio.id]);
+    expect(llano.fuera).toBe(0);
+  });
+
+  it('C3: una firma de G3 cometida entre el insert y el sello impide materializar la HMW', async () => {
+    await enWorkspaceLimpio('c3-firma-entre-medias', async (ctx) => {
+      const admin = sqlAdmin();
+      const { insightId, propuestaId } = await propuestaC3Pendiente(ctx);
+      const gateId = await puertaDeG3(ctx.ws, ctx.retoId, ctx.curadorId);
+      const contenido = CONTENIDO_C3(insightId);
+
+      await expect(
+        conUsuario(ctx.curadorId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ctx.ws}, ${ctx.retoId}, ${contenido.pregunta}, ${contenido.prioridad},
+                    ${contenido.prioridadRazon}, ${ctx.curadorId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ctx.ws}, ${o!.id as string}, ${insightId})`;
+          // La firma, desde OTRA conexión y ya cometida, justo aquí.
+          await admin.begin((t2) => firmaDeG3(t2, ctx.ws, gateId, ctx.curadorId));
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${ctx.curadorId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ctx.ws}`;
+        }),
+      ).rejects.toThrow(/el portafolio de ese reto se cerró mientras esta HMW esperaba revisión/);
+
+      // Y no queda nada a medias: la transacción entera se fue, así que ni HMW ni traza.
+      const filas = await admin`select 1 from oportunidad where workspace_id = ${ctx.ws}`;
+      expect(filas.length).toBe(0);
+      const [sigue] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+      expect(sigue!.estado).toBe('propuesta');
+    });
+  });
+
   /** Las señales que la validación produce sobre un journey, pedidas a la MISMA función que
    * las produce en producción. Se usa para armar informes completos sin copiar el catálogo. */
   async function senalesDe(
@@ -7935,6 +9568,178 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
 
       const filas = await admin`select 1 from propuesta_ai
         where workspace_id = ${wsD} and capacidad = 'C0'`;
+      expect(filas.length).toBe(0);
+    });
+  }, 20000);
+
+  /**
+   * Y lo que el registry YA MEDÍA también caduca en vuelo, por las dos puertas.
+   *
+   * El prompt de C6 lleva dos cosas de naturaleza distinta: el MATERIAL —el reto y sus
+   * criterios, aquello contra lo que se propone— y el estado del CONTRATO —lo que ya se mide,
+   * para no repetirlo—. La huella del material ya se comprobaba antes de despachar y antes de
+   * guardar; la otra mitad no se comprobaba en ninguna de las dos, así que una `entrada_kpi`
+   * añadida en ese rato dejaba al lote proponiéndola otra vez. Y ese duplicado, si es un
+   * SINÓNIMO y no el mismo nombre, no lo detecta nadie: `nombre-ocupado` compara nombres.
+   *
+   * La huella de las entradas va APARTE de `huella_material` y, sobre todo, NO se persiste —y
+   * eso no es una omisión, es lo que la hace segura—. Aceptar una fila del lote inserta una
+   * entrada, así que las entradas cambian fila a fila: una huella guardada y comprobada al
+   * aceptar dejaría a la segunda fila sin poder aceptarse en cuanto se acepta la primera. La
+   * tercera mitad de esta sonda es justamente ésa.
+   */
+  it('C6: una entrada añadida en vuelo para el lote, y aceptar una fila no tumba a su hermana', async () => {
+    await enWorkspaceLimpio('c6-entradas-en-vuelo', async ({ ws: wsV, curadorId, retoId: retoV }) => {
+      const admin = sqlAdmin();
+      const [crit] = await admin`insert into criterio_exito
+        (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan,
+         creado_por)
+        values (${wsV}, ${retoV}, 'Tiempo de verificación', 'Definición', 'Objetivo', 30, 'Plan',
+                ${curadorId}) returning id`;
+      const criterioV = crit!.id as string;
+      const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+        values (${wsV}, ${retoV}, ${curadorId}) returning id`;
+      const registryV = mr!.id as string;
+
+      // Una entrada que el prompt SÍ verá: el lote nace sabiendo que existe.
+      const entrar = (nombre: string) => admin`insert into entrada_kpi
+        (workspace_id, registry_id, criterio_id, nombre, definicion, frecuencia, creado_por)
+        values (${wsV}, ${registryV}, ${criterioV}, ${nombre}, 'Definición previa', 'mensual',
+                ${curadorId})`;
+      await entrar('Minutos de verificación');
+
+      const RESPUESTA_C6 = {
+        ok: true as const,
+        datos: {
+          entradas: [
+            { ...CONTENIDO_C6(criterioV), nombre: 'Tasa en móvil' },
+            { ...CONTENIDO_C6(criterioV), nombre: 'Tasa en tableta' },
+          ],
+        },
+        intentos: [intento({ modelo: MODELO_PRIMARIO, latenciaMs: 12, uso: null })],
+      };
+      const pedirLote = () =>
+        generarPropuestas(curadorId, { workspaceId: wsV, capacidad: 'C6', anclaId: registryV });
+
+      // ── 1. Añadida ANTES del despacho: no se llama al proveedor ──
+      let despachos = 0;
+      await conProveedor(RESPUESTA_C6, async () => {
+        proveedor.antesDelApunte = async () => {
+          await entrar('Abandono en la carga');
+        };
+        proveedor.duranteLlamada = async () => {
+          despachos += 1;
+        };
+        try {
+          await expect(pedirLote()).rejects.toThrow(/entradas de ese Metric Registry cambiaron/i);
+        } finally {
+          proveedor.antesDelApunte = null;
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(despachos, 'el material salió hacia el proveedor con el contrato ya movido').toBe(0);
+      expect(
+        (await admin`select 1 as x from llamada_ai where workspace_id = ${wsV}`).length,
+        'se abrió línea de gasto para una llamada que no ocurrió',
+      ).toBe(0);
+
+      // ── 2. Añadida EN VUELO: la llamada se paga, pero el lote no se guarda ──
+      await conProveedor(RESPUESTA_C6, async () => {
+        proveedor.duranteLlamada = async () => {
+          await entrar('Reintentos por expediente');
+        };
+        try {
+          await expect(pedirLote()).rejects.toThrow(/entradas de ese Metric Registry cambiaron/i);
+        } finally {
+          proveedor.duranteLlamada = null;
+        }
+      });
+      expect(
+        (await admin`select 1 as x from propuesta_ai where workspace_id = ${wsV}`).length,
+        'se guardó un lote armado sin saber lo que el registry ya medía',
+      ).toBe(0);
+
+      // ── 3. Y la mitad que sostiene la decisión de no persistir esa huella ──
+      // Sin nada moviéndose, el lote nace; y ACEPTAR la primera fila —que crea una entrada, o
+      // sea que mueve las entradas— tiene que dejar aceptable a la segunda. Sin esto, todo lo
+      // de arriba podría estar escrito comprobando la huella también al aceptar, y el lote
+      // sería irrevisable a partir de la primera fila.
+      await conProveedor(RESPUESTA_C6, pedirLote);
+      const pendientes = await admin`select id from propuesta_ai
+        where workspace_id = ${wsV} and estado = 'propuesta' order by creado_en asc, id asc`;
+      expect(pendientes.length).toBe(2);
+      for (const fila of pendientes) {
+        const r = await aceptarPropuesta(curadorId, {
+          workspaceId: wsV,
+          propuestaId: fila.id as string,
+        });
+        expect(r.estado).toBe('aceptada');
+      }
+      const nombres = await admin`select nombre from entrada_kpi
+        where workspace_id = ${wsV} and registry_id = ${registryV} order by nombre asc`;
+      expect(nombres.map((n) => n.nombre as string)).toContain('Tasa en móvil');
+      expect(nombres.map((n) => n.nombre as string)).toContain('Tasa en tableta');
+    });
+  }, 30000);
+
+  /**
+   * Y el archivado en vuelo también ordena una propuesta de C6, cuyo reto vive DETRÁS del
+   * registry.
+   *
+   * `propuesta_ai_un_ancla` deja `reto_id` nulo cuando el ancla es el registry, así que el
+   * guard del INSERT preguntaba por una columna vacía y se saltaba el candado entero: ni la
+   * clave de aviso del reto, ni el `for share` sobre su fila. Y el estado del reto sí decide
+   * aquí, porque `registry_admite_entradas` lo mira por dentro. Medido contra la base: con un
+   * archivado en vuelo la propuesta de C6 NACE —no espera a nadie— y queda en el panel
+   * imposible de aceptar, con la llamada ya pagada. Es exactamente lo que las dos sondas de
+   * arriba impiden para el ancla que sí es un reto.
+   *
+   * El reto se resuelve por `metric_registry.reto_id`, que es la relación de verdad; copiarlo
+   * en la propuesta sería un segundo sitio donde puede decir otra cosa.
+   */
+  it('el archivado en vuelo también ordena una propuesta de C6, anclada en el registry', async () => {
+    await enWorkspaceLimpio('c6-archivado-al-persistir', async ({ ws: wsE, curadorId, retoId: retoE }) => {
+      const admin = sqlAdmin();
+      const [crit] = await admin`insert into criterio_exito
+        (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan,
+         creado_por)
+        values (${wsE}, ${retoE}, 'KPI', 'Definición', 'Objetivo', 30, 'Plan', ${curadorId})
+        returning id`;
+      const [mr] = await admin`insert into metric_registry (workspace_id, reto_id, creado_por)
+        values (${wsE}, ${retoE}, ${curadorId}) returning id`;
+      const registryE = mr!.id as string;
+      const [l] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, registry_id, modelo, origen_key, resultado, creado_por)
+        values (${wsE}, 'C6', ${registryE}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId}) returning id`;
+      const contenido = CONTENIDO_C6(crit!.id as string);
+
+      const archivado = await candadoEnVuelo((tx) => tx`update reto set estado = 'archivado'
+          where id = ${retoE} and workspace_id = ${wsE}`);
+
+      const persistencia = conUsuario(curadorId, (tx) => tx`
+        insert into propuesta_ai
+          (workspace_id, capacidad, destino, registry_id, contenido, contenido_original,
+           confianza, modelo, prompt_version, alcance_resumen, huella_material, origen_key,
+           llamada_id, creado_por)
+        values (${wsE}, 'C6', 'entrada-kpi', ${registryE}, ${tx.json(contenido as never)},
+                ${tx.json(contenido as never)}, 0.6, ${MODELO_PRIMARIO}, ${PROMPT_VERSION},
+                'alcance', 'huella', 'entorno', ${l!.id as string}, ${curadorId})`);
+      const veredicto = persistencia.then(
+        () => 'nació',
+        (e: Error) => `rechazó: ${e.message}`,
+      );
+
+      await archivado.esperaAQueAlguienEspere();
+      archivado.soltar();
+      await archivado.terminado;
+
+      expect(
+        await veredicto,
+        'nació una propuesta de C6 sobre un reto que se estaba archivando',
+      ).toMatch(/archivado/);
+      const filas = await admin`select 1 from propuesta_ai
+        where workspace_id = ${wsE} and capacidad = 'C6'`;
       expect(filas.length).toBe(0);
     });
   }, 20000);
@@ -10546,4 +12351,884 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await expect(escribir('una huella cualquiera')).resolves.toBeDefined();
     });
   });
+
+  /**
+   * C6 — el borrador del Metric Registry, propuesto contra los criterios que promete medir.
+   *
+   * Cinco puertas, y cada una es una regla que la capacidad no comparte con sus hermanas:
+   * dónde cuelga, contra qué se mide una cita, qué exige materializar, qué la deja obsoleta y
+   * qué NO propone.
+   */
+  /**
+   * La huella REAL del material de un registry, escrita sobre una propuesta del fixture.
+   *
+   * `nuevaPropuesta` escribe `'huella-del-material'` a propósito —componer el material a mano
+   * sería fijar en el fixture el prompt que se está probando—, y eso valía mientras la huella
+   * solo apagara el verde de la presencia literal. Desde que además BLOQUEA la aceptación de
+   * C6, una propuesta con huella falsa no se puede aceptar y las sondas del pipeline medirían
+   * el bloqueo en vez de lo suyo.
+   *
+   * Se compone llamando a la MISMA función que usa el servicio, no copiándola: lo que el
+   * fixture no puede hacer es inventarse el texto, y esto no se lo inventa.
+   */
+  const conHuellaReal = async (propuestaId: string) => {
+    const { huella } = await conUsuario(leadId, (tx) =>
+      huellaDelMaterialDelRegistry(tx, ws, registryId),
+    );
+    await sqlAdmin()`update propuesta_ai set huella_material = ${huella}
+      where id = ${propuestaId}`;
+    return propuestaId;
+  };
+
+  it('C6: la entrada del registry nace del criterio que cita, y se sella con su procedencia', async () => {
+    const admin = sqlAdmin();
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+    );
+
+    // 1. El ANCLA es el registry, no el reto: la fila cuelga de la columna que su capacidad
+    //    declara, y de ninguna otra. Es lo que `propuesta_ai_un_ancla` impone y lo que el
+    //    insert generado desde `COLUMNAS_DE_ANCLA` escribe sin que nadie lo enumere.
+    const [fila] = await admin`select registry_id, reto_id, item_id, gate_id, journey_id, destino
+      from propuesta_ai where id = ${propuestaId}`;
+    expect(fila!.registry_id).toBe(registryId);
+    expect([fila!.reto_id, fila!.item_id, fila!.gate_id, fila!.journey_id]).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+    expect(fila!.destino).toBe('entrada-kpi');
+
+    // 2. Aceptarla crea la entrada, con los seis campos copiados TAL CUAL y los demás
+    //    vacíos: el dueño del dato, la línea base y la ventana no los propone la AI.
+    const r = await aceptarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [entrada] = await admin`select * from entrada_kpi where id = ${r.objetoId}`;
+    expect(entrada!.registry_id).toBe(registryId);
+    expect(entrada!.criterio_id).toBe(criterioDelRegistryId);
+    expect(entrada!.nombre).toBe('Tasa de verificación completada en móvil');
+    expect(entrada!.frecuencia).toBe('mensual');
+    expect(
+      [
+        entrada!.propietario_miembro_id,
+        entrada!.linea_base_valor,
+        entrada!.linea_base_fecha,
+        entrada!.ventana_inicio,
+        entrada!.fecha_post_mortem,
+      ],
+      'la AI rellenó un compromiso que nadie adquirió',
+    ).toEqual([null, null, null, null, null]);
+    // 3. Y el SELLO de procedencia, que es la mitad permanente de SYS-19: de qué propuesta
+    //    salió esta fila. Lo escribe el guard, no la aplicación — la columna no está en el
+    //    grant.
+    expect(entrada!.propuesta_ai_id).toBe(propuestaId);
+    const [sellada] = await admin`select estado, entrada_kpi_id from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(sellada!.estado).toBe('aceptada');
+    expect(sellada!.entrada_kpi_id).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el criterio al que responde una entrada NO se corrige.
+   *
+   * Aquí hubo una contradicción mía: `TESTIMONIO_ADICIONAL.C6` decía `null` —«elegir el
+   * criterio equivocado es el error que más se corrige»— y a la vez `CITAS_DEL_CONTENIDO.C6`
+   * deriva de ese campo el `alcanceId` de cada cita, que la comparación de la corrección SÍ
+   * compara. Las dos reglas decían cosas opuestas y la que ganaba lo hacía por accidente, con
+   * el mensaje equivocado: «las citas no se corrigen» sobre una corrección que no las tocaba.
+   *
+   * Gana el blindaje, y no por resolver el empate hacia el lado estricto: los fragmentos se
+   * copiaron de UN criterio, y reapuntarlos a otro conservándolos es quedarse con el sostén de
+   * A para afirmar sobre B. Es lo mismo que C2 hace con el `evidenciaId` de sus citas.
+   */
+  it('C6: el criterio de una entrada no se reapunta al corregir, y el resto sí', async () => {
+    const admin = sqlAdmin();
+    // Un segundo criterio REAL del mismo reto: el destino al que un revisor querría reapuntar.
+    const [otro] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Otro criterio', 'Definición', 'Objetivo', 30, 'Plan', ${leadId})
+      returning id`;
+    // Con nombre propio: `unique (registry_id, nombre)` es real, y el caso de arriba ya dejó
+    // materializada una entrada con el del fixture. Compartir registry entre casos es lo que
+    // hace que esa colisión sea una conducta de verdad y no una molestia del arnés.
+    const inicial = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en escritorio',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido: inicial,
+      }),
+    );
+
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...inicial, criterioId: otro!.id as string },
+      }),
+    ).rejects.toThrow(/no se corrige/i);
+
+    // Y lo que SÍ es redacción se corrige, que es la otra mitad: sin ella, este caso pasaría
+    // igual con la corrección entera tapiada.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: { ...inicial, definicion: 'Verificaciones completas / iniciadas, en móvil' },
+    });
+    expect(r.estado).toBe('corregida');
+    const [entrada] = await admin`select definicion, criterio_id from entrada_kpi
+      where id = ${r.objetoId}`;
+    expect(entrada!.definicion).toBe('Verificaciones completas / iniciadas, en móvil');
+    expect(entrada!.criterio_id).toBe(criterioDelRegistryId);
+
+    // Y el evento de la revisión NOMBRA el objeto creado. La lista de columnas del payload se
+    // quedó corta cuando llegó C2 y se volvió a quedar corta con esta: `jsonb_strip_nulls` se
+    // lleva las nulas, así que un objeto sin su clave es un registro que no documenta nada.
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
+        and payload->>'propuestaId' = ${propuestaId}`;
+    expect((evento!.payload as Record<string, unknown>).entradaKpiId).toBe(r.objetoId);
+
+    // Y el SELLO no es una edición. La aceptación inserta la entrada —`EntradaKpiAgregada`,
+    // correcto— y el guard diferido le escribe después su `propuesta_ai_id`, que dispara la
+    // rama de UPDATE del mismo trigger de auditoría. Medido antes de arreglarlo: cada
+    // aceptación de C6 dejaba un `EntradaKpiEditada` con el «antes» idéntico al «después», o
+    // sea una edición que nadie hizo, en la única tabla cuyo rastro sirve para decir quién
+    // movió el contrato de medición.
+    const rastro = await admin`select tipo from evento_dominio
+      where workspace_id = ${ws} and payload->>'entradaId' = ${r.objetoId}
+      order by creado_en`;
+    expect(
+      rastro.map((f) => f.tipo),
+      'el sello de procedencia se apuntó como una edición del contrato',
+    ).toEqual(['EntradaKpiAgregada']);
+  });
+
+  /**
+   * Y una entrada no puede responder a un criterio que el modelo no llegó a ver ENTERO.
+   *
+   * El cuerpo es la formulación del reto más todos los criterios, y se recorta ENTERO a
+   * `MAX_MATERIAL`: con una descripción larga por delante, la cola se queda fuera —el criterio
+   * donde cae el corte, a medias; los siguientes, del todo—. Un `criterioId` de uno de ésos
+   * pasa el suelo de la base —el criterio ES del reto del registry, y eso sigue siendo cierto—
+   * y sin embargo el KPI no pudo leer la promesa que dice medir.
+   *
+   * Se mide sobre la función que lo decide y sobre las dos puertas que la consumen.
+   */
+  it('C6: el recorte del material decide qué criterios se pueden responder', async () => {
+    const largo = 'x'.repeat(MAX_MATERIAL);
+    const conRecorte = {
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: largo,
+      criterios: [
+        {
+          id: 'c3d4e5f6-0000-4000-8000-00000000000a',
+          kpi: 'K',
+          definicion: 'D',
+          objetivo: 'O',
+          ventanaDias: 30,
+          lineaBasePlan: 'P',
+        },
+      ],
+    };
+    // Con la descripción ocupando el presupuesto entero, NINGÚN criterio llega: la lista de
+    // los que se pueden responder está vacía y el conteo de los que se quedaron fuera es 1.
+    const recortado = criteriosQueLlegaronAlModelo(conRecorte);
+    expect(recortado.ids).toEqual([]);
+    expect(recortado.fuera).toBe(1);
+    // Y sin recorte llegan enteros, que es la otra mitad: sin ella, una función que devolviera
+    // siempre la lista vacía pasaría igual.
+    const llano = criteriosQueLlegaronAlModelo({ ...conRecorte, descripcion: 'D' });
+    expect(llano.ids).toEqual(['c3d4e5f6-0000-4000-8000-00000000000a']);
+    expect(llano.fuera).toBe(0);
+  });
+
+  /**
+   * Y el registry FIRMADO cierra la puerta en los dos momentos que importan: al proponer y al
+   * aceptar. Son dos escrituras distintas y entre ellas cabe la firma entera, que es el acto
+   * de G6 — una entrada colada en un contrato ya firmado es un KPI que nadie acordó dentro de
+   * lo que sí se acordó.
+   */
+  it('C6: un registry firmado no admite propuestas nuevas ni deja aceptar las pendientes', async () => {
+    const admin = sqlAdmin();
+    // Una propuesta que nace ANTES de la firma, para medir la segunda mitad.
+    const pendiente = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+
+    await admin`update metric_registry set estado = 'firmado', firmado_por = ${leadId},
+      firmado_en = now() where id = ${registryId}`;
+    try {
+      // Al PROPONER: el guard del insert lo rechaza aunque la fila venga por SQL directo.
+      await expect(
+        nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+      ).rejects.toThrow(/ya no admite entradas/);
+
+      // Y al ACEPTAR: la propuesta que ya existía queda obsoleta y solo se puede rechazar.
+      await expect(
+        aceptarPropuesta(leadId, { workspaceId: ws, propuestaId: pendiente }),
+      ).rejects.toThrow(/ya no admite entradas/);
+
+      // Rechazar SÍ sigue abierto: bloquear también esa salida dejaría la fila muerta y su
+      // ancla retenida para siempre.
+      await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId: pendiente });
+      const [tras] = await admin`select estado from propuesta_ai where id = ${pendiente}`;
+      expect(tras!.estado).toBe('rechazada');
+    } finally {
+      await admin`update metric_registry set estado = 'borrador', firmado_por = null,
+        firmado_en = null where id = ${registryId}`;
+    }
+  });
+
+  /**
+   * C3 — LA TRAZA ES LA CITA, comprobado en los dos sentidos.
+   *
+   * `oportunidad_insight` se materializa desde los `insightId` distintos de las citas: no hay
+   * una segunda lista que declare el apoyo. Por la superficie SQL concedida se puede escribir
+   * la oportunidad y sus enlaces a mano, así que el guard diferido tiene que comprobar que
+   * sean EXACTAMENTE los citados — ni uno más ni uno menos.
+   *
+   * Los dos sentidos importan por razones distintas y por eso se miden por separado:
+   *   · uno de MÁS es apoyo que nadie citó, o sea inventado, y el evento lo archiva como si la
+   *     AI lo hubiera propuesto;
+   *   · uno de MENOS deja la HMW apoyada en menos de lo que su propio texto dice, y ahí lo que
+   *     se pierde es la traza que G3 certifica.
+   */
+  it('C3: la traza de una oportunidad es exactamente lo que citó, ni de más ni de menos', async () => {
+    const admin = sqlAdmin();
+    // Un segundo insight validado del reto, para poder enlazar «de más».
+    const [otro] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'El aviso llega tarde', 'El recordatorio sale cuando ya se fue.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const otroInsight = otro!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${ws}, ${otroInsight}, 0, 'El recordatorio sale tarde', false) returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${ws}, ${af!.id as string}, ${evidenciaDelRetoId}, 'El 71% de los abandonos',
+              'resumen', ${leadId})`;
+
+    // Se sella a mano, por la superficie concedida: lo que se mide es el SUELO, no que el
+    // servicio se porte bien. `enlaces` decide qué traza se escribe.
+    const sellarConTraza = async (enlaces: string[]) => {
+      const propuestaId = await nuevaPropuesta(leadId, {
+        capacidad: 'C3',
+        anclas: { reto_id: retoId },
+      });
+      try {
+        await conUsuario(leadId, async (tx) => {
+          // Copiada TAL CUAL de la propuesta: desde que el guard comprueba también la
+          // proyección —pregunta, prioridad y razón—, una HMW con texto de relleno cae ahí
+          // antes de llegar a la traza, y este caso mediría esa otra regla.
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${CONTENIDO_C3(insightValidadoDelRetoId).pregunta},
+                    ${CONTENIDO_C3(insightValidadoDelRetoId).prioridad},
+                    ${CONTENIDO_C3(insightValidadoDelRetoId).prioridadRazon}, ${leadId})
+            returning id`;
+          for (const insightId of enlaces) {
+            await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+              values (${ws}, ${o!.id as string}, ${insightId})`;
+          }
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        });
+        return 'selló';
+      } catch (e) {
+        return `rechazó: ${(e as Error).message.slice(0, 80)}`;
+      } finally {
+        // El orden lo imponen las dos FK, que apuntan en sentidos opuestos: la propuesta a la
+        // oportunidad (el objeto materializado) y la oportunidad a la propuesta (el sello de
+        // procedencia). Se suelta el sello, se borra la propuesta —que es quien apunta al
+        // objeto— y después el objeto. Soltar `oportunidad_id` a secas no vale: el CHECK
+        // «decidida ⇒ exactamente un objeto» lo rechaza mientras el estado siga aceptada.
+        await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+        await admin`delete from propuesta_ai where id = ${propuestaId}`;
+        await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+        await admin`delete from oportunidad where workspace_id = ${ws}`;
+      }
+    };
+
+    // El contenido del fixture cita SOLO a `insightValidadoDelRetoId`.
+    expect(await sellarConTraza([insightValidadoDelRetoId, otroInsight])).toMatch(/no es la de sus citas/);
+    expect(await sellarConTraza([])).toMatch(/al menos un insight|no es la de sus citas/);
+    // Y la buena: exactamente el citado. Sin esta mitad, un guard que rechazara SIEMPRE
+    // pasaría las dos de arriba.
+    expect(await sellarConTraza([insightValidadoDelRetoId])).toBe('selló');
+
+    await admin`delete from cita where afirmacion_id = ${af!.id as string}`;
+    await admin`delete from afirmacion where id = ${af!.id as string}`;
+    await admin`delete from insight where id = ${otroInsight}`;
+  });
+
+  /**
+   * Y la PROCEDENCIA: la oportunidad y su traza nacen en la aceptación.
+   *
+   * `xmin` dice «esta transacción escribió esta versión» y NO distingue insertar de
+   * actualizar, y `oportunidad` sí admite un UPDATE que conserva el estado —repriorizar—. Por
+   * eso el guard exige además `creado_en = now()`, que la base pone y ningún grant mueve: sin
+   * él, repriorizar una HMW vieja dentro de la aceptación la sellaría como recién nacida, y lo
+   * que quedaría mal atribuido es que una pregunta escrita A MANO conste como propuesta por la
+   * AI — que es de lo que viven la tasa de corrección y el rastro de quién produjo qué.
+   */
+  it('C3: una oportunidad que ya existía no se puede sellar, ni repriorizándola aquí', async () => {
+    const admin = sqlAdmin();
+    const [vieja] = await admin`insert into oportunidad
+      (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+      values (${ws}, ${retoId}, '¿Cómo podríamos hacer esto a mano?', 3, 'la escribió una
+              persona', ${leadId})
+      returning id`;
+    const viejaId = vieja!.id as string;
+    await admin`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+      values (${ws}, ${viejaId}, ${insightValidadoDelRetoId})`;
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C3',
+      anclas: { reto_id: retoId },
+    });
+    try {
+      // Apropiársela tal cual.
+      await expect(
+        conUsuario(leadId, (tx) => tx`update propuesta_ai
+          set estado = 'aceptada', revisada_por = ${leadId},
+              oportunidad_id = ${viejaId}
+          where id = ${propuestaId} and workspace_id = ${ws}`),
+      ).rejects.toThrow(/haber NACIDO en esta misma aceptación/);
+      // Y tocándola en la misma transacción, que es lo que `xmin` solo no distingue.
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          await tx`update oportunidad set prioridad = 9
+            where id = ${viejaId} and workspace_id = ${ws}`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${viejaId}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/haber NACIDO en esta misma aceptación/);
+      // Y la propuesta sigue por revisar: la transacción entera se fue.
+      const [sigue] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+      expect(sigue!.estado as string).toBe('propuesta');
+    } finally {
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from oportunidad_insight where oportunidad_id = ${viejaId}`;
+      await admin`delete from oportunidad where id = ${viejaId}`;
+    }
+  });
+
+  /**
+   * Y el PARECIDO: la HMW sellada tiene que decir lo que dice la propuesta.
+   *
+   * Los otros cuatro destinos ya lo comprueban —evidencia, criterio, insight y entrada KPI—, y
+   * la oportunidad se había quedado solo con su PREDICADO: cuelga del reto, la firma quien
+   * aceptó, nace por decidir y su traza es la citada. Todo eso lo cumple una HMW que pregunte
+   * OTRA COSA. Por la superficie SQL concedida —o por un camino futuro del servicio que
+   * construya mal la transacción— quedaba una propuesta constando como aceptada mientras el
+   * objeto que se le atribuye dice algo distinto: procedencia corrupta, y la tasa de
+   * corrección midiendo texto que el modelo no escribió.
+   *
+   * Los tres campos que la propuesta DICTA, y solo esos: la pregunta, la prioridad y su razón.
+   * El veredicto y su razón no se comparan porque la propuesta no los dice — nacen vacíos y
+   * los pone la decisión humana, que es otra puerta.
+   */
+  it('C3: la HMW materializada tiene que decir lo que dice la propuesta', async () => {
+    const admin = sqlAdmin();
+    const contenido = CONTENIDO_C3(insightValidadoDelRetoId);
+    // `campos` decide qué se escribe en la fila; lo que no venga, se copia de la propuesta.
+    const sellarConCampos = async (campos: {
+      pregunta?: string;
+      prioridad?: number;
+      prioridadRazon?: string;
+    }) => {
+      const propuestaId = await nuevaPropuesta(leadId, {
+        capacidad: 'C3',
+        anclas: { reto_id: retoId },
+      });
+      try {
+        await conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${campos.pregunta ?? contenido.pregunta},
+                    ${campos.prioridad ?? contenido.prioridad},
+                    ${campos.prioridadRazon ?? contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${insightValidadoDelRetoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        });
+        return 'selló';
+      } catch (e) {
+        return `rechazó: ${(e as Error).message.slice(0, 80)}`;
+      } finally {
+        await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+        await admin`delete from propuesta_ai where id = ${propuestaId}`;
+        await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+        await admin`delete from oportunidad where workspace_id = ${ws}`;
+      }
+    };
+
+    // Los tres, uno a uno: cada campo por separado, o un guard que solo mirara la pregunta
+    // pasaría los otros dos sin que nadie lo notara.
+    expect(await sellarConCampos({ pregunta: '¿Cómo podríamos preguntar otra cosa?' })).toMatch(
+      /no dice lo que dice la propuesta/,
+    );
+    expect(await sellarConCampos({ prioridad: 1 })).toMatch(/no dice lo que dice la propuesta/);
+    expect(await sellarConCampos({ prioridadRazon: 'Otra razón cualquiera' })).toMatch(
+      /no dice lo que dice la propuesta/,
+    );
+    // Y la buena: copiada tal cual, sella. Sin esta mitad, un guard que rechazara SIEMPRE
+    // pasaría las tres de arriba.
+    expect(await sellarConCampos({})).toBe('selló');
+  });
+
+
+  /**
+   * Y la MISMA regla al INSERTAR, que es lo que cierra la carrera con la validación.
+   *
+   * El servicio comprueba el material después de la llamada, pero esa lectura y el INSERT son
+   * dos momentos: `validarInsight` toma «designio:insight:<id>» y no la clave del reto, así
+   * que una validación puede cometearse justo en medio. Lo que se guardaba entonces era una
+   * propuesta con la llamada YA PAGADA y un alcance al que le falta un insight: nace
+   * `alcance-incompleto` y no se puede aceptar nunca — otra vez la tarjeta que solo se puede
+   * rechazar.
+   *
+   * El guard del INSERT sí lo ve, porque tiene el `for share` del reto tomado. La carrera se
+   * mide aquí por su EFECTO y no con dos transacciones: lo que la carrera produce es un INSERT
+   * cuyo alcance no es el del reto, y eso se escribe directamente. Montar la ventana exacta
+   * pediría un hueco dentro de `generarPropuestas` que no existe, y mediría el arnés en vez de
+   * la regla.
+   */
+  it('C3: no se guarda una propuesta cuyo alcance no es el del reto al insertarla', async () => {
+    const admin = sqlAdmin();
+    const [otro] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'Validado mientras el proveedor respondía', 'Llegó tarde al material.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const nuevoId = otro!.id as string;
+    const [af] = await admin`insert into afirmacion
+      (workspace_id, insight_id, orden, texto, es_hipotesis)
+      values (${ws}, ${nuevoId}, 0, 'Llegó tarde', false) returning id`;
+    await admin`insert into cita
+      (workspace_id, afirmacion_id, evidencia_id, fragmento, localizacion, creado_por)
+      values (${ws}, ${af!.id as string}, ${evidenciaDelRetoId}, 'El 71% de los abandonos',
+              'resumen', ${leadId})`;
+    try {
+      // El alcance de ANTES: solo el que ya estaba, sin el que acaba de validarse. Es
+      // exactamente lo que la carrera deja escrito.
+      await expect(
+        nuevaPropuesta(leadId, {
+          capacidad: 'C3',
+          anclas: { reto_id: retoId },
+          alcanceInsights: [insightValidadoDelRetoId],
+        }),
+      ).rejects.toThrow(/el alcance que trae no es el que el reto tiene ahora/);
+      // Y con el alcance al día SÍ entra: sin esta mitad, un guard que rechazara siempre
+      // pasaría la de arriba sin medir nada.
+      const alDia = await nuevaPropuesta(leadId, {
+        capacidad: 'C3',
+        anclas: { reto_id: retoId },
+        alcanceInsights: [insightValidadoDelRetoId, nuevoId],
+      });
+      await admin`delete from propuesta_ai where id = ${alDia}`;
+    } finally {
+      await admin`delete from cita where afirmacion_id = ${af!.id as string}`;
+      await admin`delete from afirmacion where id = ${af!.id as string}`;
+      await admin`delete from insight where id = ${nuevoId}`;
+    }
+  });
+
+  /**
+   * El alcance declarado tiene que ser EL DEL RETO, no un superconjunto suyo.
+   *
+   * Con la cota escrita solo como «no falta ninguno», el array se podía PREDECLARAR: meter hoy
+   * un id ajeno y esperar a que ese insight pase a ser del reto —basta con enlazar su
+   * evidencia a un arquetipo suyo—. Entonces el conjunto real crece hasta caber dentro de lo
+   * declarado, la comprobación pasa POR HABERLO ANTICIPADO, y la HMW se sella sin haber visto
+   * un insight que el reto ya tiene. Es el agujero que esa comprobación existía para tapar,
+   * abierto desde el otro lado, y ni siquiera hace falta citar el ajeno: basta con declararlo.
+   *
+   * Por eso la cota es una IGUALDAD. Declarar de más no es un caso legítimo: el servicio
+   * escribe exactamente los que llegaron enteros, y desde que no se despacha con ninguno
+   * recortado eso es todo el conjunto.
+   */
+  it('C3: el alcance de una propuesta no puede declarar insights que no son del reto', async () => {
+    const admin = sqlAdmin();
+    const [aj] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'Un insight que aún no es del reto', 'Se enlazará después.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const ajenoId = aj!.id as string;
+    // La propuesta CITA solo el legítimo: lo que sobra está en el alcance, no en las citas.
+    const contenido = CONTENIDO_C3(insightValidadoDelRetoId);
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C3',
+      anclas: { reto_id: retoId },
+      contenido,
+    });
+    try {
+      // Predeclarado: el array lo escribe quien inserta, así que puede anticipar un id.
+      await admin`update propuesta_ai
+        set alcance_insights = alcance_insights || ${ajenoId}::uuid
+        where id = ${propuestaId}`;
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${contenido.pregunta}, ${contenido.prioridad},
+                    ${contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${insightValidadoDelRetoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/el alcance declarado por esa propuesta no es el del reto/);
+    } finally {
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+      await admin`delete from oportunidad where workspace_id = ${ws}`;
+      await admin`delete from insight where id = ${ajenoId}`;
+    }
+  });
+
+  /**
+   * Y lo CITADO tiene que caber dentro del alcance sellado.
+   *
+   * El alcance se comprobaba en un solo sentido —que estuvieran TODOS los validados del reto—
+   * y esa mitad sola no dice nada de lo que la propuesta cita. La política de
+   * `oportunidad_insight` admite cualquier insight VALIDADO DEL WORKSPACE, no del reto, así
+   * que por la superficie concedida se podía citar uno ajeno, enlazarlo, entregar un
+   * `alcance_insights` completo —lo es: contiene todos los del reto— y sellar. La HMW quedaba
+   * atribuida a material que el modelo nunca recibió, con la traza y el alcance diciendo cada
+   * uno una verdad distinta.
+   *
+   * El caso se monta con un insight validado que no cuelga de NINGÚN reto —sin afirmación ni
+   * cita, `insights_validados_del_reto` no lo devuelve para ninguno—, que es la forma más
+   * limpia de «ajeno» y la que la política sí deja enlazar.
+   */
+  it('C3: una HMW no puede citar un insight que no entró en su alcance', async () => {
+    const admin = sqlAdmin();
+    const [aj] = await admin`insert into insight
+      (workspace_id, titulo, resumen, estado, validado_por, validado_en, creado_por)
+      values (${ws}, 'Un insight de otro sitio', 'No cuelga de ningún reto.',
+              'validado', ${leadId}, now(), ${leadId})
+      returning id`;
+    const ajenoId = aj!.id as string;
+    const contenido = CONTENIDO_C3(ajenoId);
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C3',
+      anclas: { reto_id: retoId },
+      contenido,
+    });
+    try {
+      // El alcance que se guardó es COMPLETO —tiene todos los validados del reto—, así que la
+      // comprobación de «no falta ninguno» pasa: lo único que puede parar esto es la otra
+      // mitad.
+      const [p] = await admin`select alcance_insights from propuesta_ai where id = ${propuestaId}`;
+      expect(p!.alcance_insights as string[]).toContain(insightValidadoDelRetoId);
+      expect(p!.alcance_insights as string[]).not.toContain(ajenoId);
+
+      await expect(
+        conUsuario(leadId, async (tx) => {
+          const [o] = await tx`insert into oportunidad
+            (workspace_id, reto_id, pregunta, prioridad, prioridad_razon, creado_por)
+            values (${ws}, ${retoId}, ${contenido.pregunta}, ${contenido.prioridad},
+                    ${contenido.prioridadRazon}, ${leadId})
+            returning id`;
+          await tx`insert into oportunidad_insight (workspace_id, oportunidad_id, insight_id)
+            values (${ws}, ${o!.id as string}, ${ajenoId})`;
+          await tx`update propuesta_ai
+            set estado = 'aceptada', revisada_por = ${leadId},
+                oportunidad_id = ${o!.id as string}
+            where id = ${propuestaId} and workspace_id = ${ws}`;
+        }),
+      ).rejects.toThrow(/cita insights que no entraron en el material/);
+
+
+      /*
+       * La otra mitad —inflar el alcance y citar lo inflado— ya no llega hasta aquí: desde que
+       * el alcance tiene que ser IGUAL al del reto, esa fila cae antes por la igualdad, y su
+       * caso vive ahora en la sonda de al lado. Mantenerla aquí mediría esa otra regla creyendo
+       * medir ésta. Lo que esta sonda sujeta es lo que la igualdad NO cubre: citar un ajeno sin
+       * declararlo, que deja el alcance cuadrando y la cita fuera del reto igual.
+       */
+    } finally {
+      await admin`update oportunidad set propuesta_ai_id = null where workspace_id = ${ws}`;
+      await admin`delete from propuesta_ai where id = ${propuestaId}`;
+      await admin`delete from oportunidad_insight where workspace_id = ${ws}`;
+      await admin`delete from oportunidad where workspace_id = ${ws}`;
+      await admin`delete from insight where id = ${ajenoId}`;
+    }
+  });
+
+  /**
+   * Y la entrada que salió de una propuesta SIGUE pudiendo quitarse del borrador.
+   *
+   * `entrada_kpi` es el primero de los cuatro destinos cuyo objeto tiene un camino de BORRADO
+   * en el producto: `borrarEntrada` existe porque una entrada que sobra —o que se pactó y
+   * después no— bloquearía la firma del contrato, y firmar es lo que hace G6. Los otros tres
+   * no se borran nunca, así que el enlace del sello nunca había chocado con nada.
+   *
+   * Con el sello puesto sí choca, y hacia el lado peor: la salida que existe para no bloquear
+   * la firma se cierra JUSTO para las entradas que propuso la AI, y el mensaje que llega es una
+   * violación de clave ajena. La forma de la regla queda dicha por sus dos mitades: la entrada
+   * se va, y la propuesta se queda —aceptada, con su rastro—.
+   */
+  it('C6: una entrada del registry se puede quitar del borrador aunque la haya propuesto la AI', async () => {
+    const admin = sqlAdmin();
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, { capacidad: 'C6', anclas: { registry_id: registryId } }),
+    );
+    // Con nombre propio: el registry del fixture es uno solo —`metric_registry` es único por
+    // reto— y `unique (registry_id, nombre)` no admite dos entradas iguales.
+    const r = await aceptarPropuesta(leadId, {
+      workspaceId: ws,
+      propuestaId,
+      correccion: {
+        ...CONTENIDO_C6(criterioDelRegistryId),
+        nombre: 'Tasa de verificación completada en tableta',
+      },
+    });
+
+    await borrarEntrada(leadId, { workspaceId: ws, entradaId: r.objetoId });
+    const quedan = await admin`select id from entrada_kpi where id = ${r.objetoId}`;
+    expect(quedan.length, 'la salida que existe para no bloquear la firma').toBe(0);
+
+    // Y la propuesta se queda: quitar la entrada no borra que se aceptó, ni quién la aceptó.
+    // El puntero se va con el objeto —no queda a qué apuntar—, y el hecho vive donde tiene que
+    // vivir: en el evento, que es append-only y sí conserva el id.
+    const [tras] = await admin`select estado, revisada_por, entrada_kpi_id from propuesta_ai
+      where id = ${propuestaId}`;
+    expect(tras!.estado).toBe('corregida');
+    expect(tras!.revisada_por).toBe(leadId);
+    expect(tras!.entrada_kpi_id).toBeNull();
+    const [evento] = await admin`select payload from evento_dominio
+      where workspace_id = ${ws} and tipo = 'PropuestaAICorregida'
+        and payload->>'propuestaId' = ${propuestaId}`;
+    expect(
+      (evento!.payload as Record<string, unknown>).entradaKpiId,
+      'el rastro de qué objeto creó esta propuesta no se borra con el objeto',
+    ).toBe(r.objetoId);
+  });
+
+  /**
+   * Y el criterio tampoco se reapunta por SQL DIRECTO, que es donde la regla tenía que estar.
+   *
+   * La ronda anterior blindó `criterioId` en `TESTIMONIO_ADICIONAL.C6` y eso cierra el
+   * formulario. Pero el guard de la base comparaba contra `contenido_original` solo las citas
+   * de primer nivel y la confianza, y `criterioId` no es ninguna de las dos: por la superficie
+   * SQL concedida, una «corrección» podía reapuntar la entrada a otro criterio CONSERVANDO las
+   * citas, y el resto del suelo no lo veía —el criterio nuevo es del reto del registry, y la
+   * proyección compara contra `contenido`, que es el ya corregido—. La entrada quedaba sellada
+   * respondiendo a una promesa cuyos fragmentos nunca se leyeron.
+   *
+   * La comparación se añade SIN condicionar al destino, como la de las citas y por lo mismo:
+   * para las capacidades cuyo contenido no lleva `criterioId` los dos lados son nulos y la
+   * regla no dice nada, así que atarla a C6 solo la dejaría corta ante la siguiente.
+   */
+  it('C6: reapuntar el criterio por SQL directo tampoco sella la entrada', async () => {
+    const admin = sqlAdmin();
+    const [otro] = await admin`insert into criterio_exito
+      (workspace_id, reto_id, kpi, definicion, objetivo, ventana_dias, linea_base_plan, creado_por)
+      values (${ws}, ${retoId}, 'Criterio de al lado', 'Definición', 'Objetivo', 30, 'Plan',
+              ${leadId}) returning id`;
+    const otroId = otro!.id as string;
+    const propuestaId = await nuevaPropuesta(leadId, {
+      capacidad: 'C6',
+      anclas: { registry_id: registryId },
+    });
+    // El contenido con el criterio cambiado y las citas INTACTAS: es la forma que el guard de
+    // las citas no ve, porque no toca ninguna cita.
+    const corregido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      criterioId: otroId,
+      nombre: 'Tasa de verificación completada en quiosco',
+    };
+
+    await expect(
+      conUsuario(leadId, async (tx) => {
+        const [entrada] = await tx`insert into entrada_kpi
+          (workspace_id, registry_id, criterio_id, nombre, definicion, fuente, dimensiones,
+           frecuencia, dashboard_url, creado_por)
+          values (${ws}, ${registryId}, ${otroId}, ${corregido.nombre}, ${corregido.definicion},
+                  ${corregido.fuente}, ${corregido.dimensiones}, ${corregido.frecuencia}, '',
+                  ${leadId}) returning id`;
+        await tx`update propuesta_ai
+          set estado = 'corregida', revisada_por = ${leadId},
+              contenido = ${tx.json(corregido)}::jsonb,
+              entrada_kpi_id = ${entrada!.id as string}
+          where id = ${propuestaId} and workspace_id = ${ws}`;
+      }),
+    ).rejects.toThrow(/no se corrige|no se reapunta/i);
+
+    // Y la propuesta sigue pendiente: la transacción entera se fue, entrada incluida.
+    const [tras] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(tras!.estado).toBe('propuesta');
+    const restos = await admin`select id from entrada_kpi
+      where registry_id = ${registryId} and criterio_id = ${otroId}`;
+    expect(restos.length).toBe(0);
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+  });
+
+  /**
+   * Y un criterio que se MUEVE después de la llamada cierra la aceptación.
+   *
+   * La huella del material se guardaba y solo la leía el panel, para apagar el verde de la
+   * presencia literal. Pero un registry en borrador se abre ANTES de G0, y hasta G0 los
+   * criterios se editan: entre generar el lote y revisarlo, `editarCriterio` puede cambiar la
+   * definición, el objetivo o la ventana del criterio al que la entrada responde. Medido: la
+   * propuesta seguía `disponible` y la aceptación materializaba el KPI — un contrato de
+   * medición, permanente y atado a ese criterio, escrito contra una promesa que ya no existe.
+   *
+   * Se cierra en los DOS sitios donde se puede: el panel lo dice con su motivo, y el
+   * materializador lo rechaza. En la base no tiene suelo, y eso va escrito en la tabla de
+   * precondiciones: el material es el texto ya compuesto y recortado, así que no hay SQL que
+   * lo recalcule. Por eso no basta con el panel — un aviso de pantalla lo salta cualquier
+   * cliente que hable con la server function.
+   */
+  it('C6: si los criterios se mueven después de la llamada, la entrada ya no se acepta', async () => {
+    const admin = sqlAdmin();
+    // Nombre propio, como las demás: el registry del fixture es uno solo y los casos de
+    // arriba ya dejaron entradas materializadas dentro.
+    const contenido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en tótem',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido,
+      }),
+    );
+    // Con el material intacto, la propuesta está disponible: sin esta mitad, un panel que
+    // dijera siempre «cambiado» pasaría igual.
+    const antes = (await panelPropuestas(leadId, ws)).pendientes.find((x) => x.id === propuestaId);
+    expect(antes!.anclaEstado).toBe('disponible');
+
+    // El criterio se mueve. Es el acto legítimo que abre el hueco: hasta G0 se editan, y el
+    // registry en borrador existe antes de G0.
+    await admin`update criterio_exito set objetivo = 'Bajar de 8 a 3 minutos'
+      where id = ${criterioDelRegistryId}`;
+
+    const tras = (await panelPropuestas(leadId, ws)).pendientes.find((x) => x.id === propuestaId);
+    expect(tras!.anclaEstado, 'el panel seguía diciendo disponible').toBe('criterios-cambiados');
+    // Y el verde de la presencia literal se apaga: contra un material que el modelo no leyó,
+    // «aparece» o «no aparece» son las dos respuestas equivocadas.
+    expect(tras!.citas.map((c) => c.presenteLiteral)).toEqual(tras!.citas.map(() => null));
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/cambiaron después de que el modelo los leyera/);
+    // Y corregir el texto tampoco la salva: lo que se movió está fuera de la propuesta.
+    await expect(
+      aceptarPropuesta(leadId, {
+        workspaceId: ws,
+        propuestaId,
+        correccion: { ...contenido, definicion: 'Otra definición del mismo KPI' },
+      }),
+    ).rejects.toThrow(/cambiaron después de que el modelo los leyera/);
+
+    // RECHAZAR sigue abierto, que es la asimetría que sostiene la tabla entera: si el bloqueo
+    // alcanzara al rechazo, la fila quedaría muerta reteniendo su ancla.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [fin] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(fin!.estado).toBe('rechazada');
+  });
+
+  /**
+   * Y un despliegue del PROMPT no apaga la comprobación: la deja en «no se sabe», y eso no
+   * es permiso.
+   *
+   * La huella es del texto YA COMPUESTO, así que un cambio del renderizador la mueve sin que
+   * nadie haya tocado un criterio; por eso la comparación se hace solo contra el mismo
+   * `prompt_version`. Pero «no se puede comparar» no puede resolverse aceptando: una propuesta
+   * de C6 que sobreviva a un despliegue quedaba sin ninguna comprobación del material, y a
+   * partir de ahí editar el criterio y aceptar volvía a materializar un KPI contra una promesa
+   * distinta — el mismo daño de la ronda anterior, por la puerta que abrió su mitigación.
+   *
+   * El MISMO desconocimiento se resuelve de tres formas distintas, y las tres están dichas
+   * donde toca: en la presencia literal no puede volverse un veredicto (verde ni rojo), en el
+   * estado de la fila de C5 no puede volverse una alarma —C5 no materializa nada—, y aquí no
+   * puede volverse un permiso, porque lo que se firma es un contrato de medición permanente.
+   *
+   * Y el panel lo dice con su propio motivo: `criterios-cambiados` afirma que se movieron, y
+   * eso aquí sería inventarse una alarma. La salida es la misma —rechazar y pedir otro lote—,
+   * pero el motivo que se enseña tiene que ser el que ocurrió.
+   */
+  it('C6: una propuesta de otro render del prompt no se acepta, y el panel dice por qué', async () => {
+    const admin = sqlAdmin();
+    const contenido = {
+      ...CONTENIDO_C6(criterioDelRegistryId),
+      nombre: 'Tasa de verificación completada en caja',
+    };
+    const propuestaId = await conHuellaReal(
+      await nuevaPropuesta(leadId, {
+        capacidad: 'C6',
+        anclas: { registry_id: registryId },
+        contenido,
+      }),
+    );
+    // El despliegue: la fila se queda con la versión con la que nació y el código avanza. Se
+    // simula moviendo la de la FILA, que es lo mismo visto desde la comparación.
+    await admin`update propuesta_ai set prompt_version = 'ai-2000-01-01.1'
+      where id = ${propuestaId}`;
+
+    const enPanel = (await panelPropuestas(leadId, ws)).pendientes.find(
+      (x) => x.id === propuestaId,
+    );
+    expect(enPanel!.anclaEstado).toBe('material-no-comparable');
+    await expect(
+      aceptarPropuesta(leadId, { workspaceId: ws, propuestaId }),
+    ).rejects.toThrow(/no se puede comprobar/i);
+
+    // Y rechazar sigue abierto, como en todas las filas de la tabla de precondiciones.
+    await rechazarPropuesta(leadId, { workspaceId: ws, propuestaId });
+    const [fin] = await admin`select estado from propuesta_ai where id = ${propuestaId}`;
+    expect(fin!.estado).toBe('rechazada');
+  });
+
+  /**
+   * Y la entrada materializada tiene que haber NACIDO en esa aceptación.
+   *
+   * `xmin` dice «esta transacción escribió esta versión de la fila» y no distingue insertar de
+   * actualizar, así que una entrada vieja EDITADA aquí pasaría como recién nacida — y con ella
+   * quedaría atribuido a la AI un KPI escrito a mano. El insight cerró ese hueco con «y sigue
+   * propuesto»; `entrada_kpi` no tiene estado con el que decirlo, así que lo dice su fecha:
+   * `creado_en` la pone la base y está fuera del grant, de modo que ningún UPDATE concedido la
+   * mueve.
+   *
+   * Se mide por lo que de verdad lo sostiene: que la columna NO se pueda escribir.
+   */
+  it('C6: `creado_en` de una entrada KPI no está al alcance del rol de aplicación', async () => {
+    const admin = sqlAdmin();
+    const [grant] = await admin`select bool_or(privilege_type = 'INSERT') as puede
+      from information_schema.column_privileges
+      where table_name = 'entrada_kpi' and column_name = 'creado_en'
+        and grantee = 'designio_app'`;
+    expect(
+      grant?.puede ?? false,
+      'con creado_en en el grant, «nació en esta aceptación» deja de ser comprobable',
+    ).toBe(false);
+    const [gid] = await admin`select bool_or(privilege_type = 'INSERT') as puede
+      from information_schema.column_privileges
+      where table_name = 'entrada_kpi' and column_name = 'id' and grantee = 'designio_app'`;
+    expect(gid?.puede ?? false).toBe(false);
+  });
+
 });

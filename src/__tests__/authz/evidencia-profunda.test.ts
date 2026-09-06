@@ -576,10 +576,15 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       'arquetipo_evidencia',
       'checklist_item',
       'cita',
+      // La quinta, con la etapa 4: la evidencia de test de un concepto es respaldo
+      // PROBATORIO por el mismo argumento que la del arquetipo —su enlace decide si un gate
+      // pasa (allí G2 con los confirmados, aquí G4 con SYS-13) y su título se lee en el
+      // tablero de gobernanza—, así que entra con guard y no con motivo.
+      'concepto_evidencia',
       'journey_nodo_evidencia',
     ]);
 
-    // La otra mitad del inventario: de las DIEZ tablas con `evidencia_id`, las cuatro de
+    // La otra mitad del inventario: de las ONCE tablas con `evidencia_id`, las cinco de
     // arriba llevan guard y las seis restantes quedan fuera con motivo. Se comprueba
     // contra las columnas REALES para que una tabla nueva con `evidencia_id` obligue a
     // decidir en vez de heredar el silencio.
@@ -2507,13 +2512,16 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
     const [fa] = await admin`select pg_get_functiondef('gate_faltas_para_aprobar'::regproc) as def`;
     const faltas = fa!.def as string;
 
-    // Las dos rutas —checklist y G5— toman los candados con la misma función, y las
-    // faltas se preguntan UNA vez. Ni una más ni una menos: una tercera llamada sería una
-    // ruta nueva que hay que mirar; ninguna, un guard que volvió a decidir por su cuenta.
-    expect((guard.match(/razonamiento_candados\(/g) ?? []).length).toBe(2);
+    // Las TRES rutas que consumen razonamiento toman los candados con la misma función —el
+    // checklist, el diseño de G5 y, desde 20260905130000, el portafolio de G3—, y las faltas
+    // se preguntan UNA vez. Ni una más ni una menos: una llamada nueva es una ruta nueva que
+    // hay que mirar (se miró: G3 certifica «dónde jugamos» sobre HMW trazadas a insights, así
+    // que consume razonamiento igual que las otras dos y entra por el mismo protocolo), y
+    // ninguna sería un guard que volvió a decidir por su cuenta.
+    expect((guard.match(/razonamiento_candados\(/g) ?? []).length).toBe(3);
     expect((guard.match(/gate_faltas_para_aprobar\(/g) ?? []).length).toBe(1);
-    // Y en las faltas, las dos rutas preguntan al MISMO predicado.
-    expect((faltas.match(/razonamiento_sin_respaldo\(/g) ?? []).length).toBe(2);
+    // Y en las faltas, las tres rutas preguntan al MISMO predicado.
+    expect((faltas.match(/razonamiento_sin_respaldo\(/g) ?? []).length).toBe(3);
 
     // Y el guard ya no recorre ni decide sobre razonamiento: ni sigue `decision_insight`
     // —el eslabón por el que se llega a los insights de una decisión— ni bloquea decisiones

@@ -24,6 +24,23 @@ export const RegistrarDecisionSchema = z.object({
   fundamento: z.string().trim().max(4000).default(''),
   /** Sin insights que la sostengan no hay decisión trazable: el servicio lo exige. */
   insightIds: z.array(z.string().uuid()).min(1, 'Enlaza al menos un insight').max(20),
+  /**
+   * Qué concepto se decide, cuando la decisión es un pasa/muere (RF-04.10).
+   *
+   * Opcional en el TIPO y obligatorio en el REFINE, que no es lo mismo: el resto de tipos no
+   * decide ningún concepto, y un pasa/muere sin concepto no es una decisión incompleta, es un
+   * pasa/muere que no dice sobre qué. La compatibilidad que las filas antiguas necesitan es
+   * que la COLUMNA admita nulos —hay decisiones 'pasa-muere' anteriores a que la tabla
+   * existiera—, y eso no obliga a seguir aceptando altas nuevas sin él.
+   *
+   * La atadura al revés —un concepto solo cuelga de una decisión de ese tipo— es un CHECK de
+   * la base; aquí se anticipan las dos para que la pantalla diga qué pasa en vez de enseñar
+   * un 23514.
+   */
+  conceptoId: z.string().uuid().optional(),
+}).refine((d) => (d.tipo === 'pasa-muere') === (d.conceptoId !== undefined), {
+  path: ['conceptoId'],
+  message: 'Una decisión pasa/muere decide un concepto, y solo ella lo decide',
 });
 export type RegistrarDecision = z.infer<typeof RegistrarDecisionSchema>;
 
@@ -148,4 +165,21 @@ export type GobernanzaDeProyecto = {
   reaperturas: ReaperturaDeProyecto[];
   /** Segmentos del workspace: el mapeo n:m del arquetipo se elige entre estos (RF-01.7). */
   segmentosDisponibles: { id: string; nombre: string }[];
+  /**
+   * Conceptos del reto: sobre uno de ellos decide un pasa/muere (RF-04.10).
+   *
+   * Con el estado dentro porque la pantalla lo enseña: elegir «El que ya murió» para un
+   * pasa/muere es raro pero no imposible —la decisión y el veredicto son dos escrituras del
+   * mismo acto y pueden llegar en cualquier orden—, y quien decide tiene que ver cuál es cuál.
+   */
+  conceptos: { id: string; titulo: string; estado: EstadoConcepto }[];
+};
+
+/** El ciclo de vida de un concepto, tal como lo escribe su tabla. */
+export const ESTADOS_CONCEPTO = ['candidato', 'pasa', 'muere'] as const;
+export type EstadoConcepto = (typeof ESTADOS_CONCEPTO)[number];
+export const ETIQUETA_ESTADO_CONCEPTO: Record<EstadoConcepto, string> = {
+  candidato: 'candidato',
+  pasa: 'pasa',
+  muere: 'muere',
 };

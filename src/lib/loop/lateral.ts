@@ -24,6 +24,7 @@ export type RutaDelWorkspace =
   | '/aprobaciones'
   | '/evidencia'
   | '/insights'
+  | '/oportunidades'
   | '/biblioteca'
   | '/journeys'
   | '/design-versions'
@@ -122,6 +123,8 @@ export function agruparLateral({
         ...devueltos,
         { to: '/evidencia', etiqueta: 'Evidencia y derechos de uso', abrev: 'EVI' },
         { to: '/insights', etiqueta: 'Insights y citas', abrev: 'INS' },
+        // El portafolio de HMW (etapa 3) sale de los insights: es razonamiento, no diseño.
+        { to: '/oportunidades', etiqueta: 'Oportunidades HMW', abrev: 'HMW' },
         { to: '/segmentos', etiqueta: 'Segmentos', abrev: 'SEG' },
       ],
     },

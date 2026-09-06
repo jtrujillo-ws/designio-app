@@ -9,12 +9,17 @@ import { z } from 'zod';
  * validadores de contenido estaban en el chunk de `/propuestas` desde antes de esta rama, sin
  * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
  */
+import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
   ContenidoAsistenteGate,
   ContenidoCriterio,
+  ContenidoEntradaKpi,
   ContenidoExtraccion,
   ContenidoInsight,
+  ContenidoOportunidad,
+  ContenidoPostMortem,
   ContenidoPropuesta,
   ContenidoRemediacionJourney,
 } from './ai.contenido';
@@ -76,10 +81,23 @@ export type PropuestaAI = z.infer<typeof PropuestaAISchema>;
  * INFORMATIVA (RF-08.4) y ése es justamente su contrato — reporta huecos citando objetos y
  * carece de acción «aprobar».
  */
-export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5'] as const;
+export const CAPACIDADES_ACTIVAS = ['CI', 'C0', 'CT', 'C2', 'C5', 'C6', 'C3', 'C7'] as const;
 export type CapacidadActiva = (typeof CAPACIDADES_ACTIVAS)[number];
 
-export const DestinoSchema = z.enum(['evidencia', 'criterio-exito', 'insight']);
+export const DestinoSchema = z.enum([
+  'evidencia',
+  'criterio-exito',
+  'insight',
+  'entrada-kpi',
+  'oportunidad',
+  /*
+   * El séptimo, y el primero que NO crea una fila: aceptar una propuesta de C7 escribe los
+   * cuatro campos narrativos del post mortem que ya existe. El ancla y el objeto son la misma
+   * fila, así que no hay columna de objeto materializado que le corresponda — ver la migración
+   * de C7, que lo explica donde se comprueba.
+   */
+  'outcome-review',
+]);
 export type Destino = z.infer<typeof DestinoSchema>;
 
 
@@ -131,6 +149,33 @@ export const MAX_CRITERIOS_POR_LOTE = 4;
 export const MAX_INSIGHTS_POR_LOTE = 4;
 
 /**
+ * Cuántas entradas KPI se le piden a C6 de una vez.
+ *
+ * El techo lo pone aquí el DOMINIO y no la comodidad de la revisión: una entrada del registry
+ * responde a UN criterio de éxito del reto (ADR-0007), y G0 congela como mucho unos pocos
+ * criterios por reto. Pedir más entradas que criterios hay solo puede producir dos entradas
+ * para la misma promesa, que es lo que `unique (registry_id, nombre)` acaba rechazando después
+ * de haber pagado la llamada. Seis deja margen para un reto ancho sin invitar a inventar.
+ */
+export const MAX_ENTRADAS_KPI_POR_LOTE = 6;
+
+/**
+ * Cuántas oportunidades HMW se le piden a C3 de una vez.
+ *
+ * Aquí el techo no lo pone la revisión ni el dominio, sino LO QUE UNA ETAPA PUEDE TRABAJAR.
+ * La etapa 3 no produce un catálogo de preguntas: produce el puñado que el equipo va a
+ * explorar en la 4, y cada una arrastra su prioridad, su razón y la traza a los insights que
+ * la sostienen. Un lote de doce se acepta entero sin leerlo, que es la forma que tiene esta
+ * capacidad de fallar sin que nadie lo note — y lo que quedaría es un portafolio inflado que
+ * G3 certifica igual, porque el gate mira la traza y no el tamaño.
+ *
+ * Cinco: uno más que los criterios y los insights, porque una HMW es más corta de leer que un
+ * insight con sus citas, y bastantes menos que las entradas KPI, que responden una a una a
+ * criterios que ya existen.
+ */
+export const MAX_OPORTUNIDADES_POR_LOTE = 5;
+
+/**
  * Cuántas remediaciones puede llevar UN informe de C5 — que es lo mismo que decir cuántas
  * señales abiertas admite un journey para poder pedirlo.
  *
@@ -153,7 +198,7 @@ export const MAX_REMEDIACIONES = 20;
  */
 export type AnclaCapacidad = {
   /** La columna donde cuelga en `reserva_ai`, `llamada_ai` y `propuesta_ai`. */
-  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id';
+  columna: 'item_id' | 'reto_id' | 'gate_id' | 'journey_id' | 'registry_id' | 'outcome_review_id';
   /** El título del selector en la pantalla. */
   etiqueta: string;
   /** Cómo se nombra en prosa, en minúscula, dentro de una frase. */
@@ -264,6 +309,25 @@ export type DefinicionCapacidad = {
    * que llegar hasta `propuesta_ai.es_simulacion` sin que nadie se acuerde de ponerla.
    */
   esSimulacion: boolean;
+  /**
+   * QUIÉN puede pedir y aceptar propuestas de esta capacidad.
+   *
+   * Casi siempre es `ROLES_CURADORES` —los mismos que curan la bandeja piden y revisan—, y
+   * durante seis capacidades esa respuesta fue tan uniforme que estaba escrita una sola vez,
+   * en el `rolCurador` del servicio, sin preguntar de qué capacidad se hablaba.
+   *
+   * C7 la rompe, y no por un capricho suyo: su destino es `outcome_review`, la ÚNICA tabla de
+   * destino cuya política de escritura pide `lead-boutique` —medido contra `pg_policy`: las
+   * otras cinco admiten `disenador`—. Con la puerta uniforme, un diseñador generaba una
+   * propuesta de C7 con toda la ceremonia (presupuesto apartado, llamada pagada, propuesta en
+   * la bandeja) y al aceptarla se topaba con un 42501 de RLS: dinero gastado en algo que nunca
+   * podría cerrar, y un mensaje que no dice por qué.
+   *
+   * Se declara aquí y no se deriva de la base porque lo que la base tiene son políticas por
+   * TABLA, y la pregunta que hay que responder antes de gastar es por CAPACIDAD. Que las dos
+   * respuestas coincidan es lo que comprueban las sondas.
+   */
+  roles: readonly string[];
 };
 
 /**
@@ -281,6 +345,8 @@ const ANCLA_DECLARADA: Record<AnclaCapacidad['columna'], true> = {
   reto_id: true,
   gate_id: true,
   journey_id: true,
+  registry_id: true,
+  outcome_review_id: true,
 };
 export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad['columna'][];
 
@@ -291,11 +357,32 @@ export const COLUMNAS_DE_ANCLA = Object.keys(ANCLA_DECLARADA) as AnclaCapacidad[
  */
 export const COLUMNA_DE_DESTINO: Record<
   Destino,
-  'evidencia_id' | 'criterio_id' | 'insight_id'
+  | 'evidencia_id'
+  | 'criterio_id'
+  | 'insight_id'
+  | 'entrada_kpi_id'
+  | 'oportunidad_id'
+  | 'outcome_review_id'
 > = {
   evidencia: 'evidencia_id',
   'criterio-exito': 'criterio_id',
   insight: 'insight_id',
+  'entrada-kpi': 'entrada_kpi_id',
+  oportunidad: 'oportunidad_id',
+  /*
+   * La MISMA columna que su ancla, y es la única que se repite entre los dos mapas. No es un
+   * atajo: el objeto que C7 materializa es el post mortem que ya era su ancla, así que la
+   * respuesta a «dónde está el id del objeto» y a «dónde está el id del ancla» es la misma
+   * casilla. Inventar `outcome_review_materializado_id` habría creado una columna cuyo único
+   * contenido posible es una copia de la de al lado, y dos columnas que tienen que coincidir
+   * acaban no coincidiendo.
+   *
+   * Lo que eso obliga a decir en la base está dicho allí: «aceptada ⇔ hay objeto» habla de
+   * objetos que NACEN al aceptar, y el de C7 existe desde antes — lo que para las otras
+   * garantiza esa restricción, para C7 lo garantizan la procedencia y la proyección del guard
+   * diferido.
+   */
+  'outcome-review': 'outcome_review_id',
 };
 
 export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
@@ -318,6 +405,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     lote: null,
     exigeConsentimiento: true,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C0: {
     etiqueta: 'Borrador de reto → criterio de éxito',
@@ -342,6 +430,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
     lote: { campo: 'criterios', minimo: 1, maximo: MAX_CRITERIOS_POR_LOTE },
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   CT: {
     etiqueta: 'Asistente de gates → qué falta para este gate',
@@ -383,6 +472,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C2: {
     etiqueta: 'Insights del reto → insight con afirmaciones citadas',
@@ -436,6 +526,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
   C5: {
     etiqueta: 'Remediación del grafo → cómo cerrar lo que la validación señala',
@@ -475,6 +566,162 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * personas por ningún lado — eso entra por `item_importacion`, que es otra ancla. */
     exigeConsentimiento: false,
     esSimulacion: false,
+    roles: ROLES_CURADORES,
+  },
+  C6: {
+    etiqueta: 'Borrador del Metric Registry → entrada KPI',
+    destino: 'entrada-kpi',
+    /*
+     * El REGISTRY, y no el reto, aunque el material salga del reto. `entrada_kpi.registry_id`
+     * es NOT NULL, así que una propuesta anclada en el reto no sabría en qué registry
+     * materializarse mientras el reto no tenga uno — y el registry es 1:1 con el reto pero
+     * puede no existir todavía. El ancla es el objeto del que se deriva el prompt Y aquel
+     * sobre el que se escribe: aquí es el mismo, y sus criterios se leen por `registry → reto`.
+     */
+    ancla: {
+      columna: 'registry_id',
+      etiqueta: 'Metric Registry en borrador',
+      enProsa: 'registry en borrador',
+      buscar: 'Buscar por código o título del reto…',
+      vacia:
+        'No hay Metric Registries en borrador. El contrato de medición se abre desde el proyecto, y hasta entonces no hay dónde proponer KPIs.',
+      hayMas: (n) =>
+        `Hay más registries en borrador de los que caben aquí: se listan los ${n} primeros por ` +
+        'código de reto. Uno sale de la lista mientras sus entradas propuestas esperan ' +
+        'revisión; para uno concreto, búscalo por el código o el título de su reto.',
+      enCurso:
+        'Ese registry ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese registry ya tiene entradas KPI propuestas esperando revisión: decídelas antes de pedir otras',
+    },
+    /*
+     * LOTE, como C0 y C2: una llamada propone varias entradas y cada una se acepta o se
+     * descarta por separado (SPEC-08 §3). CERO es legítimo — un reto cuyos criterios no dan
+     * para un KPI medible es una respuesta, y el prompt pide expresamente que no se proponga
+     * lo que no se sostiene.
+     */
+    lote: { campo: 'entradas', minimo: 0, maximo: MAX_ENTRADAS_KPI_POR_LOTE },
+    /*
+     * El material son los CRITERIOS DE ÉXITO del reto: KPI, definición, objetivo, ventana y
+     * plan de línea base. Frases del método, no material de personas — eso entra por
+     * `item_importacion`, que es otra ancla, y el registro lo sujeta por el otro lado: quien
+     * exige consentimiento tiene que anclar en `item_id`.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+    roles: ROLES_CURADORES,
+  },
+  C7: {
+    etiqueta: 'Conciliación del reto → borrador del post mortem',
+    destino: 'outcome-review',
+    /*
+     * EL POST MORTEM EN BORRADOR, y no el reto, por lo mismo que C6 se ancla en el registry: la
+     * fila tiene que existir para que haya dónde materializar, y la política que la crea es la
+     * que sabe CUÁNDO hay algo que redactar —«el outcome review se habilita al cerrar la
+     * ventana del último criterio» (RF-07.7)—. Anclando en el reto, C7 se ofrecería sobre
+     * retos que todavía están midiendo y no tendría dónde escribir.
+     *
+     * Y con una diferencia respecto a las seis anteriores que vale la pena decir aquí, porque
+     * es lo que hace distinta a esta capacidad: aquí el ancla y el objeto materializado son la
+     * MISMA fila. Aceptar no crea nada; escribe los cuatro campos narrativos del post mortem
+     * que ya estaba abierto.
+     */
+    ancla: {
+      columna: 'outcome_review_id',
+      etiqueta: 'Post mortem en borrador',
+      enProsa: 'post mortem en borrador',
+      buscar: 'Buscar por código o título del reto…',
+      vacia:
+        'No hay post mortems en borrador. El outcome review se abre cuando cierra la ventana del último criterio del reto, y hasta entonces no hay nada que redactar.',
+      hayMas: (n) =>
+        `Hay más post mortems en borrador de los que caben aquí: se listan los ${n} primeros por ` +
+        'código de reto. Uno sale de la lista mientras su borrador espera revisión; para uno ' +
+        'concreto, búscalo por el código o el título de su reto.',
+      enCurso:
+        'Ese post mortem ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese post mortem ya tiene un borrador esperando revisión: decídelo antes de pedir otro',
+    },
+    /*
+     * SIN LOTE. Un post mortem es UN documento: sus cuatro campos se leen juntos —la
+     * contribución explica la lectura de los KPIs, los aprendizajes salen de las desviaciones—
+     * y aceptar media narrativa no describe ningún caso. Misma forma que C5 y CT, y por la
+     * misma razón que ellas: no hay revisión por elemento que proteger.
+     */
+    lote: null,
+    /*
+     * El material son el TABLERO DE CONCILIACIÓN del reto y las lecturas por criterio. Filas
+     * del método, no material de personas — eso entra por `item_importacion`, que es otra
+     * ancla, y el registro lo sujeta por el otro lado: quien exige consentimiento tiene que
+     * anclar en `item_id`.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+    /*
+     * La excepción, y la única de las ocho. Su destino es `outcome_review`, cuya política
+     * `review_completar` pide `lead-boutique`: un diseñador podía pedir el borrador y no
+     * podía aceptarlo nunca. Se cierra ANTES de apartar presupuesto, que es donde el error
+     * todavía no ha costado nada.
+     */
+    roles: ['lead-boutique'] as const,
+  },
+  C3: {
+    etiqueta: 'Oportunidades del reto → pregunta HMW trazada a insights',
+    destino: 'oportunidad',
+    /*
+     * El RETO, la TERCERA capacidad que comparte esta columna —con C0 y C2—. Que sean tres y
+     * no dos importa poco por sí mismo; lo que importa es que ninguna de las tres comparte
+     * puertas con las otras, y por eso cada regla se escribe por DESTINO: C0 se congela con
+     * el G0 (SYS-22), C2 no se congela con nada de eso y cita evidencia, y C3 vive dentro de
+     * la ventana del portafolio —que abre y cierra la etapa 3 con su G3— y cita insights.
+     *
+     * `oportunidad.reto_id` es NOT NULL y el portafolio es del reto, así que el objeto del que
+     * sale el material y aquel sobre el que se escribe son el mismo. No hay aquí la vuelta que
+     * obligó a C6 a anclar en el registry.
+     */
+    ancla: {
+      columna: 'reto_id',
+      etiqueta: 'Reto con insights validados',
+      enProsa: 'reto con insights validados',
+      buscar: 'Buscar por código o título…',
+      vacia:
+        'No hay retos con insights validados y portafolio abierto. Una HMW se apoya en lo que ya se sabe: valida insights en la etapa 2 y el reto aparecerá aquí.',
+      hayMas: (n) =>
+        `Hay más retos con insights validados de los que caben aquí: se listan los ${n} ` +
+        'primeros por código. Un reto sale de la lista mientras sus oportunidades propuestas ' +
+        'esperan revisión; para uno concreto, búscalo por su código o su título.',
+      enCurso:
+        'Ese reto ya tiene una generación AI en curso: espera a que termine antes de pedir otra',
+      pendiente:
+        'Ese reto ya tiene oportunidades propuestas esperando revisión: decídelas antes de pedir otras',
+    },
+    /*
+     * LOTE, y la revisión es POR ELEMENTO: cada HMW se acepta o se descarta por separado, que
+     * es lo que pide SPEC-08 §3 y lo que la etapa 3 hace de todas formas — un portafolio se
+     * arma pregunta a pregunta.
+     *
+     * CERO es una respuesta legítima, como en C2: los insights validados de un reto pueden no
+     * dar para ninguna pregunta que valga la pena explorar, y el prompt pide expresamente que
+     * no se proponga lo que no se sostiene. Una lista vacía es mejor respuesta que cinco
+     * preguntas de relleno que después alguien tiene que descartar una a una — y que, hasta
+     * que las descarte, bloquean el G3 de su proyecto.
+     */
+    lote: { campo: 'oportunidades', minimo: 0, maximo: MAX_OPORTUNIDADES_POR_LOTE },
+    /*
+     * El material son INSIGHTS, que son conclusiones del equipo y no material de personas.
+     * El consentimiento se registra sobre `item_importacion` —por donde ese material entra— y
+     * se comprueba allí; lo que C3 lee ya pasó por esa puerta dos veces, porque un insight
+     * cita evidencia y esa evidencia salió de un item consentido.
+     *
+     * Es la misma respuesta que dio C2 y por el mismo motivo, con la salvedad que allí quedó
+     * apuntada: una revocación posterior sobre el item de origen no retira la evidencia ya
+     * materializada ni el insight que la cita. Eso es una regla de retención sobre
+     * `evidencia`, no una puerta de esta capacidad, y arreglarla aquí sería taparla en un
+     * tercer sitio en vez de en el suyo.
+     */
+    exigeConsentimiento: false,
+    esSimulacion: false,
+    roles: ROLES_CURADORES,
   },
 };
 
@@ -570,6 +817,19 @@ export const ESTADOS_ANCLA = [
   'evidencia-no-citable',
   'alcance-incompleto',
   'journey-cambiado',
+  'registry-cerrado',
+  'criterio-ausente',
+  'nombre-ocupado',
+  'criterios-cambiados',
+  'insights-cambiados',
+  'portafolio-cerrado',
+  'insight-no-validado',
+  'material-no-comparable',
+  /* Los dos de C7: el post mortem que ya se completó —lleva veredicto firmado y su narrativa
+   * no se reescribe— y el tablero que se movió mientras el borrador esperaba, que en la etapa
+   * 7 es trabajo perfectamente normal: constatar elementos y registrar lecturas ES la etapa. */
+  'post-mortem-cerrado',
+  'conciliacion-cambiada',
   'ancla-ausente',
 ] as const;
 export type EstadoAncla = (typeof ESTADOS_ANCLA)[number];

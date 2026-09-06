@@ -2,6 +2,17 @@ import { z } from 'zod';
 import { FechaCalendarioSchema } from '@/lib/evidencia/evidencia.schemas';
 import { CODIGOS_SENAL } from '@/lib/journey/journey.schemas';
 import {
+  MAX_DEFINICION_KPI,
+  MAX_DIMENSIONES_KPI,
+  MAX_FUENTE_KPI,
+  MAX_NOMBRE_KPI,
+} from '@/lib/medicion/medicion.schemas';
+// Los topes de la HMW salen del contrato de `oportunidad`, no de aquí: escribirlos a mano es
+// cómo se separan, y con una pregunta más larga la propuesta pasaría este esquema para morir
+// en el CHECK de la tabla con la llamada ya pagada.
+import { TOPE_NARRATIVA } from '@/lib/medicion/medicion.schemas';
+import { MAX_PREGUNTA, MAX_RAZON } from '@/lib/servicio/oportunidad.schemas';
+import {
   CONFIANZA_PROPUESTA,
   MAX_REMEDIACIONES,
   type CapacidadActiva,
@@ -21,6 +32,20 @@ import {
  * validador está en el chunk, su marca está con él.
  */
 export const MARCA_CONTENIDO_SOLO_SERVIDOR = 'designio:contenido-ai-solo-servidor';
+
+/*
+ * Los dos topes de C7 que NO salen de ningún contrato de tabla, porque lo que acotan no se
+ * materializa: la lectura de una desviación y cuántas caben. Viven aquí por eso mismo — un
+ * tope de contenido cuyo destino existe se copia del destino (`TOPE_NARRATIVA`), y uno cuyo
+ * destino no existe se decide donde se usa, que es este fichero.
+ *
+ * El techo de la lista existe por lo que cuesta una respuesta sin él: la conciliación de un
+ * reto grande puede traer decenas de elementos, y un modelo que comente todos devuelve un
+ * informe que nadie lee y una factura que sí se nota. Cincuenta es más de lo que ninguna
+ * design version del piloto tiene, así que recorta sin quitar nada real.
+ */
+export const MAX_LECTURA_DESVIACION = 1000;
+export const MAX_DESVIACIONES_LEIDAS = 50;
 
 const CitasSchema = z
   .array(
@@ -141,6 +166,29 @@ const IdCopiadoDelMaterial = z
   .string()
   .uuid()
   .transform((s) => s.toLowerCase());
+
+/**
+ * Las citas de C3, cada una con el insight del que copia.
+ *
+ * No reusa `CitasSchema` porque su forma es distinta —lleva un id— y no lo envuelve con un
+ * `.and()` porque el id es de la cita, no un añadido: leerlo como «citas + algo» invitaría a
+ * tratarlo como opcional el día que se toque.
+ *
+ * El techo son SEIS, como el resto: un fragmento por insight y margen para dos por uno de
+ * ellos. Y el mínimo es UNO, que es lo que hace que SYS-15 salga de la forma del contenido —
+ * una HMW sin citas no puede existir, así que tampoco una sin traza.
+ */
+const CitasConInsightSchema = z
+  .array(
+    z.object({
+      /* El insight del que se copia el fragmento, POR SU ID: del material, no inventado. */
+      insightId: IdCopiadoDelMaterial,
+      fragmento: z.string().trim().min(1).max(600),
+      localizacion: z.string().trim().min(1).max(200),
+    }),
+  )
+  .min(1)
+  .max(6);
 
 /**
  * CT — qué falta para un gate, con los huecos citados (RF-08.4, SPEC-08 §30).
@@ -332,7 +380,10 @@ export type ContenidoPropuesta =
   | ContenidoCriterio
   | ContenidoAsistenteGate
   | ContenidoInsight
-  | ContenidoRemediacionJourney;
+  | ContenidoRemediacionJourney
+  | ContenidoEntradaKpi
+  | ContenidoOportunidad
+  | ContenidoPostMortem;
 
 /**
  * El contrato de la salida del modelo para UNA propuesta, por capacidad.
@@ -354,6 +405,221 @@ export type ContenidoPropuesta =
  * con `default()` tiene un tipo de entrada distinto del de salida — pedirle que coincidan
  * rechazaría justo a los que traen valores por omisión.
  */
+/**
+ * C6 — una entrada del Metric Registry: qué se va a medir para saber si el reto se logró
+ * (SPEC-07 RF-07.1, ADR-0007).
+ *
+ * `criterioId` es el campo que hace de esto una propuesta y no una ocurrencia: cada entrada
+ * responde a UN criterio de éxito REAL del reto, y un KPI que no responde a ninguno es
+ * telemetría, no medición de impacto. El id se copia del material y un guard comprueba
+ * después que sea un criterio de ese reto — la misma verificación que C2 hace con la
+ * evidencia de sus citas.
+ *
+ * Y las CITAS son del texto de ese criterio. Aquí no son adorno ni copia del `criterioId`:
+ * son lo que distingue «este KPI mide la promesa que dice» de «este KPI suena a esa promesa».
+ * El criterio trae KPI, definición, objetivo, ventana y plan de línea base, y el fragmento
+ * citado tiene que aparecer LITERAL en alguno — es la señal de grounding que el panel mide
+ * (I3), y sin ella la única prueba de que el modelo leyó el criterio sería que copió su id.
+ *
+ * LO QUE NO ESTÁ, y no por olvido: el dueño del dato, la línea base, el inicio de la ventana,
+ * el dashboard y la fecha del post mortem. Los tres primeros son COMPROMISOS —una persona del
+ * cliente se obliga a aportar un dato— y los otros son datos que constan o no constan.
+ * Proponerlos es inventarlos, y aceptarlos los firmaría. La entrada nace incompleta a
+ * propósito: `entrada_kpi` admite entradas incompletas porque el registry se redacta
+ * iterando, y la completitud la exige la FIRMA.
+ */
+/*
+ * Los TOPES de los cuatro campos de texto salen del editor del registry, no de aquí.
+ *
+ * Escritos a mano coincidían en dos y eran más anchos en los otros dos, y esa diferencia no
+ * era inofensiva: una entrada materializada con 400 caracteres de `fuente` pasaba este
+ * esquema y después el editor —que hidrata su formulario con esos valores— rechazaba TODA
+ * guarda hasta acortarla. Como el editor es por donde se rellenan el dueño del dato, la línea
+ * base y la ventana, la entrada quedaba bloqueando la firma de su propio contrato.
+ *
+ * Un límite propio solo tendría sentido si dijera algo que el editor no dice; aquí decía lo
+ * mismo con otro número.
+ */
+export const ContenidoEntradaKpiSchema = z
+  .object({
+    /* El criterio de éxito al que responde, POR SU ID: copiado del material, no inventado. */
+    criterioId: IdCopiadoDelMaterial,
+    /*
+     * El nombre es la CLAVE de la entrada dentro del registry (`unique (registry_id, nombre)`),
+     * así que dos propuestas del mismo lote con el mismo nombre no pueden materializarse las
+     * dos. Rechazarlo aquí no está en manos de este esquema —valida una entrada, no el lote—;
+     * lo hace el servicio al comprobar el lote, que es quien las ve juntas.
+     */
+    nombre: z.string().trim().min(1).max(MAX_NOMBRE_KPI),
+    /* Qué mide exactamente y cómo se calcula: sin esto un KPI es un rótulo. */
+    definicion: z.string().trim().min(1).max(MAX_DEFINICION_KPI),
+    /* De dónde sale el dato. Texto, no una URL: el dashboard es otra columna y la pone quien
+     * lo tiene. */
+    fuente: z.string().trim().min(1).max(MAX_FUENTE_KPI),
+    /* Cortes del KPI. Puede venir vacío: no todo indicador se desagrega. */
+    dimensiones: z.string().trim().max(MAX_DIMENSIONES_KPI).default(''),
+    /* El vocabulario es el de la columna, no uno propio: `entrada_kpi.frecuencia` tiene su
+     * CHECK y una lista distinta aquí produciría propuestas que el suelo rechaza. */
+    frecuencia: z.enum(['semanal', 'mensual', 'trimestral', 'unica']),
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoEntradaKpi = z.infer<typeof ContenidoEntradaKpiSchema>;
+
+/**
+ * C3 — una oportunidad HMW: la pregunta que abre la etapa 4 y los insights que la sostienen
+ * (CTX-04, SYS-15).
+ *
+ * ── LA TRAZA ES LA CITA ──
+ *
+ * Este contenido NO lleva una lista de `insightIds` junto a las citas, y esa ausencia es la
+ * decisión de diseño de la capacidad. Serían dos fuentes de verdad para el mismo hecho —«en
+ * qué se apoya esta pregunta»— y se separan a la primera propuesta que declare tres insights
+ * y cite dos. La traza se DERIVA de las citas: `oportunidad_insight` se materializa con los
+ * `insightId` distintos que aparecen aquí, y el guard diferido lo comprueba en los dos
+ * sentidos.
+ *
+ * Lo que eso compra: SYS-15 sale de la forma del contenido en vez de ser una regla aparte
+ * —≥1 cita ⇒ ≥1 insight—, no se puede declarar apoyo en un insight del que no se copió nada,
+ * y la traza hereda la inmutabilidad de las citas (SYS-17).
+ *
+ * ── LA PRIORIDAD VIENE CON SU RAZÓN, Y CONTRA QUÉ ──
+ *
+ * `prioridad` sin `prioridadRazon` sería un número que nadie puede discutir. La columna existe
+ * en `oportunidad` precisamente porque un portafolio priorizado sin motivos es una lista
+ * ordenada por quien la escribió último. Y el prompt pide que la razón hable de los CRITERIOS
+ * DE ÉXITO del reto, que es lo que ata la etapa 3 a la promesa de la 0.
+ *
+ * ── LO QUE NO ESTÁ ──
+ *
+ * El VEREDICTO. Aceptar una propuesta de C3 mete la HMW en el portafolio `propuesta`, por
+ * decidir; aprobarla o descartarla es un acto humano con su propia puerta —que re-comprueba
+ * el razonamiento vivo— y su propia razón. Proponer el veredicto y aceptarlo lo firmaría.
+ */
+export const ContenidoOportunidadSchema = z
+  .object({
+    /*
+     * La pregunta. El techo sale del contrato de `oportunidad` y no de aquí: escribirlo a
+     * mano es cómo los dos números se separan, y con una pregunta de 600 caracteres la
+     * propuesta pasaría este esquema para morir en el CHECK de la tabla con la llamada ya
+     * pagada. Es la misma lección que los cuatro topes de C6.
+     *
+     * Que empiece por «¿Cómo podríamos…?» lo pide el prompt y NO lo comprueba nadie: la base
+     * tampoco lo hace, y por el mismo motivo — exigir el prefijo impondría un idioma a un
+     * producto que se usa en español y en inglés, y una regla que se rodea escribiendo el
+     * prefijo delante no es una regla.
+     */
+    pregunta: z.string().trim().min(1).max(MAX_PREGUNTA),
+    /* El rango es el de la columna, no uno propio: `oportunidad.prioridad` tiene su CHECK. */
+    prioridad: z.number().int().min(0).max(1000),
+    /* Y su porqué, obligatorio aunque la columna admita vacío: el vacío existe para las HMW
+     * que escribe una persona sin priorizar todavía, no para las que propone un modelo — que
+     * está proponiendo justamente un orden. */
+    prioridadRazon: z.string().trim().min(1).max(MAX_RAZON),
+    citas: CitasConInsightSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoOportunidad = z.infer<typeof ContenidoOportunidadSchema>;
+
+/**
+ * C7 — el borrador del post mortem, escrito sobre datos deterministas (SPEC-08 §C7).
+ *
+ * ── LAS DISCREPANCIAS VIVEN AQUÍ, Y NO SON UN OBJETO NUEVO ──
+ *
+ * SPEC-08 pide «discrepancias propuestas» y «narrativa del outcome review». La primera lectura
+ * fue que la discrepancia era un objeto que la AI propondría —una constatación— y eso es justo
+ * lo que no puede hacer: una constatación es el testimonio de quien MIRÓ qué quedó
+ * funcionando, y el modelo no miró nada. Además llegan como ENTRADA («DV vs. constataciones»):
+ * ya están registradas cuando C7 corre.
+ *
+ * Así que las discrepancias son la lectura del modelo SOBRE el tablero, y viajan en el
+ * contenido como las remediaciones de C5: cada una nombra un elemento de cambio POR SU ID
+ * copiado del material, y el servicio comprueba que esté entre los que produjo la MISMA
+ * lectura de la conciliación con la que se armó el prompt. Una desviación sobre un elemento
+ * inexistente es una avería inventada, y de las caras: manda a alguien a revisar un release
+ * que estaba bien.
+ *
+ * ── LOS CUATRO CAMPOS QUE SE MATERIALIZAN, Y LOS DOS QUE NO ──
+ *
+ * Se proponen contribución, factores externos, hipótesis abiertas y aprendizajes. No se
+ * propone el VEREDICTO —`logrado / parcialmente-logrado / no-logrado / no-concluyente` es el
+ * dictamen, y RF-07.8 lo pone en manos de quien firma— ni la casilla del diseño experimental
+ * con su justificación: es la única que habilita lenguaje causal (SYS-24), y su justificación
+ * es la afirmación de un humano sobre el diseño de SU medición. Dejársela al modelo sería
+ * abrir la puerta trasera que esa invariante existe para cerrar, y encima con una firma que no
+ * es de nadie.
+ *
+ * ── LOS TOPES ──
+ *
+ * `TOPE_NARRATIVA` es el del formulario de la etapa 7, no uno propio: escribir aquí otro
+ * número es cómo los dos se separan, y con una narrativa de 9000 caracteres la propuesta
+ * pasaría este esquema para morir después con la llamada ya pagada. Misma lección que los
+ * cuatro topes de C6, que la aprendieron en una ronda de revisión.
+ */
+export const ContenidoPostMortemSchema = z
+  .object({
+    /*
+     * La contribución y los aprendizajes, obligatorios: son lo que un post mortem dice. Un
+     * borrador que llegara vacío en los dos es una llamada pagada que no contesta.
+     */
+    contribucion: z.string().trim().min(1).max(TOPE_NARRATIVA),
+    aprendizajes: z.string().trim().min(1).max(TOPE_NARRATIVA),
+    /*
+     * Los factores externos y las hipótesis abiertas PUEDEN venir vacíos, y eso es una
+     * respuesta: un reto donde no hubo nada externo que contar, o donde no quedó ninguna
+     * pregunta abierta, existe. Obligarlos sería pedirle al modelo que rellene, que es
+     * exactamente cómo se fabrica una narrativa que no se sostiene.
+     */
+    factoresExternos: z.string().trim().max(TOPE_NARRATIVA),
+    hipotesisAbiertas: z.string().trim().max(TOPE_NARRATIVA),
+    desviaciones: z
+      .array(
+        z.object({
+          /* El elemento de cambio, por su id copiado del tablero de conciliación. */
+          elementoId: z.string().uuid(),
+          /* Qué dice el modelo sobre él: la discrepancia leída, no la constatación. */
+          lectura: z.string().trim().min(1).max(MAX_LECTURA_DESVIACION),
+        }),
+      )
+      /*
+       * Puede venir VACÍA, al revés que las remediaciones de C5. Un reto cuyos elementos
+       * salieron todos «como aprobado» es un resultado legítimo y además el bueno, y C7 se
+       * ofrece sobre cualquier post mortem en borrador —no solo sobre los que tienen
+       * desviaciones—, así que la lista vacía sí describe un caso real.
+       */
+      .max(MAX_DESVIACIONES_LEIDAS)
+      /*
+       * UNA por elemento. La unidad de esta lista es la FILA DEL TABLERO: cada desviación dice
+       * qué se leyó sobre un elemento de la conciliación, y dos lecturas del mismo elemento no
+       * son una lectura más rica —son dos versiones de un mismo hecho, sin nada que diga cuál
+       * vale—. Quien revisa se queda con la contradicción y el panel las pinta como dos filas
+       * con el mismo rótulo.
+       *
+       * La diferencia con las `contradicciones` de C2, que se cortan por lo mismo: allí lo que
+       * cierra el hueco de todas formas es un `unique` de la base, y el contrato solo adelanta
+       * el motivo. Aquí no hay red debajo —las desviaciones no se materializan, viven en el
+       * `contenido`—, así que este `refine` no adelanta la comprobación: ES la comprobación.
+       */
+      .refine(
+        (xs) => new Set(xs.map((x) => x.elementoId)).size === xs.length,
+        'dos desviaciones no pueden leer el mismo elemento del tablero: quien revisa se queda con dos versiones del mismo hecho y ninguna manera de elegir',
+      ),
+    /*
+     * Y las citas, SIN `alcanceId`: el material de C7 es UN documento —el expediente del post
+     * mortem, con el tablero de conciliación y las lecturas por criterio dentro—, así que la
+     * presencia literal se mide contra él entero y no hay documento vecino del que un
+     * fragmento pueda salir prestado. Es la forma de C0 y CI, no la de C2/C3/C6, y la
+     * diferencia no es de estilo: allí el material son VARIOS documentos y por eso cada cita
+     * tiene que decir de cuál sale.
+     */
+    citas: CitasSchema,
+    confianzaPropuesta: z.enum(CONFIANZA_PROPUESTA),
+  })
+  .describe(MARCA_CONTENIDO_SOLO_SERVIDOR);
+export type ContenidoPostMortem = z.infer<typeof ContenidoPostMortemSchema>;
+
 export const ESQUEMA_DE_CONTENIDO: Record<
   CapacidadActiva,
   z.ZodType<ContenidoPropuesta, z.ZodTypeDef, unknown>
@@ -363,6 +629,9 @@ export const ESQUEMA_DE_CONTENIDO: Record<
   CT: ContenidoAsistenteGateSchema,
   C2: ContenidoInsightSchema,
   C5: ContenidoRemediacionJourneySchema,
+  C6: ContenidoEntradaKpiSchema,
+  C3: ContenidoOportunidadSchema,
+  C7: ContenidoPostMortemSchema,
 };
 
 /**
@@ -417,6 +686,33 @@ export const CITAS_DEL_CONTENIDO: Record<
   // C5 las guarda arriba, como las tres primeras: sus remediaciones no son el sujeto de las
   // citas —lo es el grafo entero—, así que no hay nada que anidar.
   C5: (c) => (c as ContenidoRemediacionJourney).citas,
+  /*
+   * C6 cita contra los CRITERIOS del reto, que son varios documentos como la evidencia de
+   * C2 — así que el trozo del material contra el que se mide la presencia literal tiene que
+   * decirse, o el fragmento saldría PRESENTE por estar en el criterio de al lado. Y no hace
+   * falta preguntarlo por cita: la entrada entera responde a UN criterio, así que el suyo es
+   * el de la propuesta. Preguntarlo dos veces abriría la posibilidad de que discreparan.
+   */
+  C6: (c) =>
+    (c as ContenidoEntradaKpi).citas.map((x) => ({
+      ...x,
+      alcanceId: (c as ContenidoEntradaKpi).criterioId,
+    })),
+  /*
+   * C3 cita contra los INSIGHTS validados del reto, que son varios documentos. Y aquí el
+   * `alcanceId` se pregunta POR CITA y no una vez por propuesta, al revés que en C6: una
+   * entrada KPI responde a UN criterio, pero una HMW puede nacer del cruce de dos o tres
+   * insights —es justo lo que hace buena a una pregunta de la etapa 3—, así que cada cita
+   * nombra el suyo.
+   *
+   * Y esa lista es además la TRAZA: los `insightId` distintos de aquí son los enlaces que la
+   * aceptación materializa. Por eso no hay riesgo de que dos redacciones discrepen — solo hay
+   * una.
+   */
+  C3: (c) =>
+    (c as ContenidoOportunidad).citas.map((x) => ({ ...x, alcanceId: x.insightId })),
+  /* C7 cita contra un solo documento —el expediente del post mortem—, así que sin alcance. */
+  C7: (c) => (c as ContenidoPostMortem).citas,
 };
 
 /**
@@ -440,6 +736,16 @@ export const TESTIMONIO_ADICIONAL: Record<
   CI: null,
   C0: null,
   CT: null,
+  /*
+   * C3 no añade nada, y eso es una respuesta y no un hueco: lo único que en esta capacidad es
+   * testimonio del modelo —a qué insights se apoya— vive DENTRO de las citas, que ya son
+   * intocables por `CITAS_DEL_CONTENIDO`. Justo por eso la traza no es un campo aparte.
+   *
+   * Y lo que queda fuera sí se corrige, que es la otra mitad: la pregunta se reescribe, la
+   * prioridad se mueve y su razón también. Es lo que quien revisa está para hacer — una HMW
+   * bien fundada pero mal formulada se arregla, no se tira.
+   */
+  C3: null,
   C2: {
     parte: (c) => (c as ContenidoInsight).contradicciones,
     /*
@@ -455,6 +761,60 @@ export const TESTIMONIO_ADICIONAL: Record<
   // C5 no guarda nada aparte de sus citas: sus remediaciones son el consejo, y ése SÍ se
   // corrige —para eso está la revisión humana—.
   C5: null,
+  C7: {
+    parte: (c) => (c as ContenidoPostMortem).desviaciones.map((d) => d.elementoId),
+    /*
+     * LOS IDS, no las desviaciones enteras — y aquí hay una corrección mía que conviene dejar
+     * escrita, porque el razonamiento que la sostenía era casi bueno.
+     *
+     * Puse `null` argumentando que las desviaciones son la LECTURA del modelo sobre el tablero,
+     * y que una lectura es exactamente lo que quien revisa está para revisar. Eso es cierto de
+     * la `lectura`, y por eso sigue corrigiéndose. No lo es del `elementoId`, que no es lectura
+     * de nada: es un PUNTERO a una fila del tablero determinista.
+     *
+     * La otra mitad del argumento —«lo contrastable se protege comprobándolo antes de que la
+     * propuesta nazca»— tenía un agujero de forma. Esa comprobación corre al GENERAR, contra el
+     * material de entonces; la corrección llega después y por otra puerta, y la frontera solo
+     * exige que cada id sea un uuid. Un cliente que no fuera el formulario de la casa podía
+     * reapuntar la desviación a cualquier elemento y sellarlo como contenido aceptado, sin que
+     * la comprobación del tablero volviera a correr nunca.
+     *
+     * Con lo cual es el mismo caso que el `criterioId` de C6, y por la misma frase: la parte
+     * que se puede contrastar no la reescribe quien revisa. La diferencia que yo alegaba —«en
+     * C6 el id ES el destino y aquí no se materializa nada»— no cambia el riesgo: lo que se
+     * sella es el testimonio, y un testimonio reapuntado manda a alguien a revisar un release
+     * que estaba bien con la firma de un post mortem detrás.
+     */
+    motivo:
+      'Los elementos que señala una desviación no se corrigen: cada uno apunta a una fila del tablero de conciliación, y esa comprobación se hizo contra el material que el modelo leyó. Corrige el texto de la lectura, o rechaza el borrador y pide otro.',
+  },
+  C6: {
+    parte: (c) => (c as ContenidoEntradaKpi).criterioId,
+    /*
+     * El `criterioId` de C6, y aquí hubo una contradicción mía que conviene dejar escrita
+     * porque la resolución no es obvia.
+     *
+     * Lo puse en `null` razonando que elegir el criterio equivocado es el error que más se
+     * corrige al revisar, y que `editarEntrada` existe justamente porque el dominio ya decidió
+     * que ese campo se repara. Y a la vez `CITAS_DEL_CONTENIDO.C6` deriva de él el `alcanceId`
+     * de cada cita, que la comparación de arriba SÍ compara: las dos reglas decían cosas
+     * opuestas, y la que ganaba —el rechazo— lo hacía por accidente y con el mensaje
+     * equivocado («las citas no se corrigen» sobre una corrección que no las tocaba).
+     *
+     * Gana el blindaje, y no por resolver el empate hacia el lado estricto: `criterioId` es la
+     * mitad CONTRASTABLE de lo que el modelo dijo. Los fragmentos se copiaron de UN criterio,
+     * y reapuntarlos a otro conservándolos es quedarse con el sostén de A para afirmar sobre
+     * B — el mismo «verde prestado» que el pajar por cita existe para impedir. Es exactamente
+     * lo que C2 hace con el `evidenciaId` de sus citas, y por eso esto deja de ser un caso
+     * especial: la parte que se puede contrastar no la reescribe quien revisa.
+     *
+     * Lo de `editarEntrada` sigue siendo cierto y no se pierde: DESPUÉS de aceptar, la entrada
+     * es un objeto de dominio y su criterio se repara mientras el registry sea borrador. Lo
+     * que no se puede es reapuntarla ANTES, cuando lo que se está sellando es el testimonio.
+     */
+    motivo:
+      'El criterio al que responde una entrada KPI no se corrige: los fragmentos citados se copiaron de ESE criterio, y reapuntarlos a otro conservando las citas es quedarse con el sostén de uno para afirmar sobre otro. Rechaza la propuesta, o acéptala y reapunta la entrada después (el registry lo admite mientras sea borrador).',
+  },
 };
 
 /**

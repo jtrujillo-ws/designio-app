@@ -150,6 +150,14 @@ export const CATALOGO_EXPORT = [
   { tabla: 'arquetipo', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'arquetipo_segmento', orden: 'arquetipo_id, segmento_id', poda: { modo: 'fuera' } },
   { tabla: 'arquetipo_evidencia', orden: 'arquetipo_id, evidencia_id', poda: { modo: 'fuera' } },
+  // El portafolio de la etapa 3 (CTX-04): la HMW y a qué insights se traza. Va con la cadena
+  // de razonamiento porque es lo que es —una pregunta derivada de insights validados— y
+  // queda `fuera` del entregable por lo mismo que el resto de esa cadena: su padre es el
+  // reto, que también está fuera, y una HMW sin su reto es un id colgando.
+  { tabla: 'oportunidad', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'oportunidad_insight', orden: 'oportunidad_id, insight_id', poda: { modo: 'fuera' } },
+  { tabla: 'concepto', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'concepto_evidencia', orden: 'concepto_id, evidencia_id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_etapa', orden: 'reabierto_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reapertura_insight', orden: 'reapertura_id, insight_id', poda: { modo: 'fuera' } },
   // Medición temporal de impacto y post mortem (SPEC-07 / SYS-22): el contrato de

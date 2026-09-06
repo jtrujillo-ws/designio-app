@@ -586,26 +586,40 @@ function cuerpoDePostMortem(expediente: ExpedienteDePostMortem): {
     partes.push('(este reto no tiene design versions a cargo de sus proyectos)');
   }
   const finales = new Map<string, number>();
+  /*
+   * El largo del texto YA UNIDO, llevado INCREMENTALMENTE. La primera versión hacía
+   * `partes.join('\n').length` dentro del bucle, o sea copiar el prefijo entero una vez por
+   * elemento: cuadrático sobre una conciliación que la base no acota, y pagado en CADA render
+   * —el del prompt y el del panel— aunque el único que necesita este mapa sea el del recorte.
+   * Medido antes de cambiarlo: 1,7 ms con 100 elementos, 46 ms con 800.
+   *
+   * Es la forma que ya usan `cuerpoDeInsights`, `cuerpoDeOportunidades` y `cuerpoDeRevision`;
+   * ésta se escribió sola y por eso se desvió. `partes` nunca está vacío aquí —arriba se
+   * empujó la cabecera del bloque—, así que el '\n' que une cada línea a lo anterior siempre
+   * cuenta.
+   */
+  let largo = partes.join('\n').length;
+  const anota = (linea: string) => {
+    partes.push(linea);
+    largo = largo + 1 + linea.length;
+  };
   for (const bloque of expediente.conciliacion) {
-    partes.push(`${bloque.proyectoCodigo} · ${bloque.designVersionCodigo}`);
+    anota(`${bloque.proyectoCodigo} · ${bloque.designVersionCodigo}`);
     for (const e of bloque.elementos) {
-      partes.push(
-        `- [${e.elementoId}] ${e.elementoTitulo} (${e.tipo}/${e.operacion}) → ${e.estado}`,
-      );
+      anota(`- [${e.elementoId}] ${e.elementoTitulo} (${e.tipo}/${e.operacion}) → ${e.estado}`);
       if (e.releaseCodigo) {
-        partes.push(`  Release: ${e.releaseCodigo} · ${e.releaseResponsable} · ${e.releaseFecha}`);
+        anota(`  Release: ${e.releaseCodigo} · ${e.releaseResponsable} · ${e.releaseFecha}`);
       }
       /* La desviación registrada, que es el hecho del que el modelo puede hablar. Su ausencia
        * también dice algo —el elemento quedó como se aprobó— y por eso no se rellena. */
-      if (e.queQuedoDistinto) partes.push(`  Quedó distinto: ${e.queQuedoDistinto}`);
-      if (e.razonDesviacion) partes.push(`  Razón registrada: ${e.razonDesviacion}`);
+      if (e.queQuedoDistinto) anota(`  Quedó distinto: ${e.queQuedoDistinto}`);
+      if (e.razonDesviacion) anota(`  Razón registrada: ${e.razonDesviacion}`);
       /*
-       * Y dónde acaba lo que este elemento aporta, contado sobre el texto YA UNIDO. Se anota
-       * después de sus líneas opcionales y no en la primera: un elemento cuyo «quedó distinto»
-       * cayó al otro lado del corte llegó a medias, y lo que la desviación necesita es
-       * precisamente ese hecho.
+       * Y dónde acaba lo que este elemento aporta. Se anota después de sus líneas opcionales y
+       * no en la primera: un elemento cuyo «quedó distinto» cayó al otro lado del corte llegó a
+       * medias, y lo que la desviación necesita es precisamente ese hecho.
        */
-      finales.set(e.elementoId, partes.join('\n').length);
+      finales.set(e.elementoId, largo);
     }
   }
   return { texto: partes.join('\n'), finales };

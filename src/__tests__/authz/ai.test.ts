@@ -34,6 +34,7 @@ import { parsearContenido } from '@/lib/ai/ai.contenido';
 import {
   criteriosQueLlegaronConLasOportunidades,
   evidenciaQueLlegoAlModelo,
+  elementosQueLlegaronAlModelo,
   materialDePostMortem,
   MAX_MATERIAL,
 } from '@/lib/ai/ai.prompts';
@@ -6821,7 +6822,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
               anclaId: reviewId,
             }),
         ),
-      ).rejects.toThrow(/no está[n]? en el tablero|no admite como tales/i);
+      ).rejects.toThrow(/no se sostienen en el tablero|el elemento no está en él/i);
     });
   });
 
@@ -6838,6 +6839,83 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * naciera ninguna propuesta, y la métrica de calidad del proveedor decía que había respondido
    * bien. La sonda lo mide en `llamada_ai`, no en el mensaje.
    */
+  /**
+   * Y el corte se cuenta AL CARÁCTER.
+   *
+   * `cuerpoDePostMortem` lleva el largo del texto ya unido incrementalmente —sumando el '\n'
+   * que une cada línea a la anterior— en vez de rehacer el `join` una vez por elemento, que era
+   * cuadrático sobre una conciliación que la base no acota: 1,7 ms con 100 elementos y 46 ms
+   * con 800, pagados en CADA render, el del prompt y el del panel.
+   *
+   * Un contador incremental es exactamente donde se cuela un off-by-one, y un off-by-one aquí
+   * no rompe nada visible: deja pasar un elemento cuya última línea se quedó fuera por un
+   * carácter, que es la avería que la puerta existe para cortar. Así que se mide EN LA
+   * FRONTERA: creciendo el material carácter a carácter, el conjunto de los que llegaron tiene
+   * que encoger de uno en uno y nunca saltarse ninguno.
+   */
+  it('el corte del post mortem se cuenta al carácter, no por aproximación', () => {
+    const conRelleno = (n: number) => ({
+      codigo: 'R-01',
+      titulo: 'T',
+      descripcion: 'D'.repeat(n),
+      metricaObjetivo: 'M',
+      lecturas: [],
+      conciliacion: [
+        {
+          proyectoCodigo: 'P-01',
+          designVersionCodigo: 'DV-01',
+          elementos: Array.from({ length: 40 }, (_, i) => ({
+            elementoId: `a7b8c9d0-0000-4000-8000-${String(i).padStart(12, '0')}`,
+            elementoTitulo: `Elemento ${i}`,
+            tipo: 'pantalla',
+            operacion: 'alta',
+            estado: 'desviado',
+            releaseCodigo: 'REL-3',
+            releaseResponsable: 'Equipo de alta',
+            releaseFecha: '2026-04-02',
+            queQuedoDistinto: 'Salió sin el paso de explicación',
+            // ÚNICA por elemento, y la ÚLTIMA línea que aporta: es el ancla contra la que se
+            // contrasta. Con un texto repetido, buscarla en el bloque no distinguiría de cuál.
+            razonDesviacion: `Se cortó por plazo, caso ${i}`,
+          })),
+        },
+      ],
+    });
+    /*
+     * La referencia no se recalcula con la misma aritmética que se está midiendo —eso sería
+     * escribir el error dos veces y llamarlo prueba—: se lee del TEXTO QUE SE ENTREGA. Un
+     * elemento llegó entero si su última línea aparece completa en el bloque que ve el modelo.
+     */
+    const losQueSeVen = (e: ReturnType<typeof conRelleno>) => {
+      const { bloque } = materialDePostMortem(e);
+      return e.conciliacion[0]!.elementos.filter((x) =>
+        bloque.includes(`  Razón registrada: ${x.razonDesviacion}`),
+      ).map((x) => x.elementoId);
+    };
+    // La frontera: el relleno máximo con el que todavía llegan los cuarenta.
+    let todos = 0;
+    let ninguno = MAX_MATERIAL;
+    while (ninguno - todos > 1) {
+      const medio = (todos + ninguno) >> 1;
+      if (losQueSeVen(conRelleno(medio)).length === 40) todos = medio;
+      else ninguno = medio;
+    }
+    expect(losQueSeVen(conRelleno(todos)).length).toBe(40);
+    // Y desde ahí, carácter a carácter: lo que la función dice tiene que ser exactamente lo que
+    // se ve en el bloque. Un off-by-one en cualquiera de los dos sentidos rompe la igualdad.
+    let bajadas = 0;
+    let anterior = 40;
+    for (let n = todos; n <= todos + 400; n++) {
+      const e = conRelleno(n);
+      const visto = losQueSeVen(e);
+      expect(elementosQueLlegaronAlModelo(e).ids).toEqual(visto);
+      if (visto.length < anterior) bajadas = bajadas + 1;
+      anterior = visto.length;
+    }
+    // Y que la sonda haya recorrido de verdad la frontera, no un tramo llano.
+    expect(bajadas).toBeGreaterThan(1);
+  });
+
   it('C7 no admite una desviación sobre un elemento que el recorte no dejó llegar', async () => {
     await enWorkspaceLimpio(
       'c7-elemento-recortado',
@@ -6877,7 +6955,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                 anclaId: reviewId,
               }),
           ),
-        ).rejects.toThrow(/no admite como tales|no están en el tablero/i);
+        ).rejects.toThrow(/no se sostienen en el tablero|el recorte del material lo dejó fuera/i);
         // Y la llamada consta como lo que fue: una salida fuera de contrato.
         const [linea] = await conUsuario(curadorId, (tx) => tx`
           select resultado from llamada_ai
@@ -7062,7 +7140,7 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                 anclaId: reviewId,
               }),
           ),
-        ).rejects.toThrow(/da por constatados|no admite como tales/i);
+        ).rejects.toThrow(/da por constatado|no se sostienen en el tablero/i);
       },
     );
   });

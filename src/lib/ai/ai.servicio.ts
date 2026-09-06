@@ -4352,7 +4352,7 @@ const COMPROBAR: Record<
          * calidad del proveedor decía que había respondido bien.
          */
         throw new ErrorContratoAI(
-          `Ese borrador señala ${fuera.length} desviación(es) sobre elementos que la conciliación de este reto no admite como tales —o no están en el tablero, o el tablero los da por constatados «como aprobado»—: la propuesta no se guarda, porque contradiría al dato determinista en el mismo expediente donde está impreso. Vuelve a pedirla.`,
+          `Ese borrador señala ${fuera.length} desviación(es) que no se sostienen en el tablero de este reto: o el elemento no está en él, o el tablero lo da por constatado «como aprobado», o el recorte del material lo dejó fuera y el modelo no llegó a verlo. La propuesta no se guarda, porque contradiría al dato determinista en el mismo expediente donde está impreso. Si el reto tiene muchos elementos conciliados, acorta su descripción y vuelve a pedirla.`,
         );
       }
     }

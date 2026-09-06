@@ -589,7 +589,23 @@ export const ContenidoPostMortemSchema = z
        * ofrece sobre cualquier post mortem en borrador —no solo sobre los que tienen
        * desviaciones—, así que la lista vacía sí describe un caso real.
        */
-      .max(MAX_DESVIACIONES_LEIDAS),
+      .max(MAX_DESVIACIONES_LEIDAS)
+      /*
+       * UNA por elemento. La unidad de esta lista es la FILA DEL TABLERO: cada desviación dice
+       * qué se leyó sobre un elemento de la conciliación, y dos lecturas del mismo elemento no
+       * son una lectura más rica —son dos versiones de un mismo hecho, sin nada que diga cuál
+       * vale—. Quien revisa se queda con la contradicción y el panel las pinta como dos filas
+       * con el mismo rótulo.
+       *
+       * La diferencia con las `contradicciones` de C2, que se cortan por lo mismo: allí lo que
+       * cierra el hueco de todas formas es un `unique` de la base, y el contrato solo adelanta
+       * el motivo. Aquí no hay red debajo —las desviaciones no se materializan, viven en el
+       * `contenido`—, así que este `refine` no adelanta la comprobación: ES la comprobación.
+       */
+      .refine(
+        (xs) => new Set(xs.map((x) => x.elementoId)).size === xs.length,
+        'dos desviaciones no pueden leer el mismo elemento del tablero: quien revisa se queda con dos versiones del mismo hecho y ninguna manera de elegir',
+      ),
     /*
      * Y las citas, SIN `alcanceId`: el material de C7 es UN documento —el expediente del post
      * mortem, con el tablero de conciliación y las lecturas por criterio dentro—, así que la

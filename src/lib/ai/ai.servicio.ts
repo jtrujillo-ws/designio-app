@@ -5079,13 +5079,10 @@ async function aceptarPropuestaEnTransaccion(
           contenido as ContenidoOportunidad,
         ),
       'outcome-review': () =>
-        materializarPostMortem(
-          tx,
-          actorId,
-          entrada.workspaceId,
-          p,
-          contenido as ContenidoPostMortem,
-        ),
+        // Sin `actorId`, y no por descuido: es la única materialización que no crea fila, así
+        // que aquí no hay `creado_por` que firmar. Quien aceptó consta en `revisada_por` de la
+        // propuesta, unas líneas más abajo, y de ahí cuelga el linaje del post mortem.
+        materializarPostMortem(tx, entrada.workspaceId, p, contenido as ContenidoPostMortem),
       'entrada-kpi': () =>
         materializarEntradaKpi(
           tx,
@@ -5492,7 +5489,6 @@ async function materializarEntradaKpi(
  */
 async function materializarPostMortem(
   tx: TransactionSql,
-  actorId: string,
   workspaceId: string,
   p: PropuestaEnRevision,
   c: ContenidoPostMortem,
@@ -5531,7 +5527,6 @@ async function materializarPostMortem(
       'No se pudo escribir la narrativa en ese post mortem: puede que ya no admita cambios',
     );
   }
-  await tx`select set_config('designio.actor', ${actorId}, true)`;
   return fila.id as string;
 }
 

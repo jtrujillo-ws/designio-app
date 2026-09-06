@@ -6720,6 +6720,54 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
   });
 
   /**
+   * Y dos desviaciones sobre el MISMO elemento tumban la respuesta igual, aunque el elemento
+   * exista.
+   *
+   * Es el hueco que deja la sonda de arriba: la pertenencia al tablero se comprueba elemento a
+   * elemento, así que un id repetido la pasa dos veces. Lo que queda entonces es un borrador
+   * con dos lecturas del mismo hecho y nada que diga cuál vale —quien revisa no puede elegir, y
+   * el panel las pinta como dos filas con el mismo rótulo—.
+   *
+   * Se corta en el CONTRATO y no en el servicio, y ahí está la diferencia con el elemento
+   * ajeno: aquello necesita el material delante para saberse; esto se ve en la forma de la
+   * respuesta, sin consultar nada. Por eso lo rechaza el parseo, con el motivo genérico de una
+   * respuesta fuera de forma —el detalle va al diagnóstico, no a quien revisa—.
+   */
+  it('C7 no guarda un borrador que lea dos veces el mismo elemento', async () => {
+    await enWorkspaceLimpio('c7-elemento-repetido', async ({ ws: wsC, curadorId, servicioId, retoId: retoC }) => {
+      const { reviewId, elementoId } = await postMortemConExpediente(wsC, retoC, servicioId, curadorId);
+      await expect(
+        conProveedor(
+          {
+            ok: true,
+            datos: {
+              contribucion: 'Algo se movió.',
+              factoresExternos: '',
+              hipotesisAbiertas: '',
+              aprendizajes: 'Algo se aprendió.',
+              /* El MISMO elemento, y con dos lecturas distintas: si sólo se comparara la
+               * desviación entera, este par pasaría. La unidad es la fila del tablero. */
+              desviaciones: [
+                { elementoId, lectura: 'Quedó distinto y eso explica el resultado.' },
+                { elementoId, lectura: 'Quedó distinto y eso no explica nada.' },
+              ],
+              citas: [{ fragmento: 'CONCILIACIÓN', localizacion: 'cabecera' }],
+              confianzaPropuesta: 'baja',
+            },
+            intentos: [intento({ uso: null })],
+          },
+          () =>
+            generarPropuestas(curadorId, {
+              workspaceId: wsC,
+              capacidad: 'C7',
+              anclaId: reviewId,
+            }),
+        ),
+      ).rejects.toThrow(/no cumplió el esquema/);
+    });
+  });
+
+  /**
    * Un post mortem sin nada que leer no se ofrece, y uno completado deja de ofrecerse.
    *
    * La primera mitad es la regla de «datos deterministas» aplicada al revés: sin lecturas ni

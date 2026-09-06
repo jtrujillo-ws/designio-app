@@ -26,7 +26,7 @@ import type { CapacidadActiva } from './ai.schemas';
  * sustituye al criterio —quien mueve las dos cosas a la vez sigue pudiendo equivocarse—,
  * pero convierte el olvido silencioso en un fallo ruidoso, que era el modo real de fallo.
  */
-export const PROMPT_VERSION = 'ai-2026-09-06.16';
+export const PROMPT_VERSION = 'ai-2026-09-06.17';
 
 /** Bounds del material que entra al prompt (SPEC-09 · contenido no confiable con techo
  * de tamaño antes de cualquier procesamiento). */
@@ -1760,7 +1760,7 @@ const ESQUEMA_DE_UNA_PROPUESTA: Record<CapacidadActiva, Record<string, unknown>>
             elementoId: {
               type: 'string',
               description:
-                'El id del elemento de cambio, COPIADO del material entre corchetes. Un id que no esté en el tablero de ESTE reto se rechaza entero',
+                'El id del elemento de cambio, COPIADO del material entre corchetes. Único en la lista: un elemento se lee UNA vez, y dos lecturas del mismo se rechazan enteras. Un id que no esté en el tablero de ESTE reto también',
             },
             lectura: {
               type: 'string',

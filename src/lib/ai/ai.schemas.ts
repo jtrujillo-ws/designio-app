@@ -10,6 +10,7 @@ import { z } from 'zod';
  * que nadie los llamara allí. Un reexport de tipos no crea esa arista.
  */
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
+import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
 
 import type { ContenidoPropuesta } from './ai.contenido';
 export type {
@@ -899,6 +900,10 @@ export const RevisarPropuestaSchema = z.object({
 });
 export type RevisarPropuesta = z.infer<typeof RevisarPropuestaSchema>;
 
+/** El libro de costos se lee de UN workspace: no hay vista cruzada, y la RLS tampoco la
+ * daría — cada lectura va dentro de la membresía de quien llama. */
+export const ObservabilidadInputSchema = z.object({ workspaceId: z.string().uuid() });
+
 export const PropuestasInputSchema = z.object({
   workspaceId: z.string().uuid(),
   /** Filtro de las anclas ofrecidas a la generación. Con más anclas elegibles que sitio en
@@ -1137,6 +1142,26 @@ export type PropuestaEnPanel = PropuestaEnPanelComun &
  * nadie se ha ganado), `tasaAceptacion` cuando nadie ha decidido todavía, y las latencias
  * cuando ninguna línea la trae medida.
  */
+/**
+ * Quién puede leer el libro de costos AI del workspace, DERIVADO y no copiado.
+ *
+ * §14 pone «observabilidad de costos, latencia, errores y calidad» en la misma fila que la
+ * auditoría —«Auditoría y operación»—, así que quien puede leer el registro operativo del
+ * workspace puede leer esto. Se deriva de `ROLES_AUDITORIA` en vez de escribir los tres roles
+ * otra vez: si algún día tienen que divergir, la divergencia será una edición deliberada en un
+ * sitio y no dos listas que se separan solas.
+ *
+ * Y una asimetría que hay que decir en vez de dar por hecha: la nota de `ROLES_AUDITORIA`
+ * presume que «la autoridad es la política RLS», y ahí es cierto —`evento_dominio` devuelve
+ * cero filas a los demás roles—. Aquí NO: la política de `llamada_ai` pide membresía a secas,
+ * porque el tope diario y el estado de la capacidad la leen para todo el que abre el panel.
+ * Así que esta puerta es de PANTALLA y el suelo es más ancho. Cerrar el suelo por rol
+ * repetiría la avería de la ronda 42 de #48 —cerrar una fila por rol y romper una lectura ya
+ * declarada—, y queda como pregunta de producto: en BYOAI (RF-09.9) `origen_key = 'workspace'`
+ * dice que paga el cliente, y quien paga probablemente deba ver la factura.
+ */
+export const ROLES_OBSERVABILIDAD_AI = ROLES_AUDITORIA;
+
 export type ObservabilidadDeCapacidad = {
   capacidad: string;
   /** Del registro cuando esta versión conoce la capacidad; el código a secas cuando no. */

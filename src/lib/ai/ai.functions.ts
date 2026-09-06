@@ -3,10 +3,12 @@ import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server';
 import {
   GenerarPropuestasSchema,
+  ObservabilidadInputSchema,
   PropuestasInputSchema,
   RegistrarConsentimientoSchema,
   RevisarPropuestaSchema,
 } from './ai.schemas';
+import { observabilidadAI } from './ai.observabilidad';
 import {
   aceptarPropuesta,
   ErrorAI,
@@ -110,4 +112,18 @@ export const rechazarPropuestaAI = createServerFn({ method: 'POST' })
       if (mensaje) return { ok: false as const, error: mensaje };
       throw e;
     }
+  });
+
+/**
+ * RF-08.9 — el libro de costos del workspace, por capacidad.
+ *
+ * GET y sin contrato `{ok, …}` porque es una LECTURA: si falla, falla hacia el error boundary
+ * del router como el resto de loaders. La puerta de rol la pone la pantalla; el servicio sólo
+ * exige lo que la base ya exige, que es membresía viva.
+ */
+export const observabilidadDelWorkspace = createServerFn({ method: 'GET' })
+  .inputValidator(ObservabilidadInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    return observabilidadAI(usuarioId, data.workspaceId);
   });

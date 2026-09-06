@@ -33,6 +33,7 @@ import {
 } from '@/lib/ai/ai.schemas';
 import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
 import { observabilidadAI } from '@/lib/ai/ai.observabilidad';
+import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.schemas';
 import {
   arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
@@ -12838,6 +12839,45 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       });
       // Y el total del workspace la incluye: si no, el gasto declarado sería menor que el real.
       expect(Number(conDesconocida.total.costoUsd.toFixed(2))).toBe(0.05);
+    });
+  });
+
+  /**
+   * Y LA FRONTERA de la puerta de rol, medida en vez de afirmada.
+   *
+   * La pantalla de operación dice «tu rol no incluye esta lectura» a quien no lleva el
+   * workspace, y esa frase es cierta DE LA PANTALLA. No lo es de la base: la política de
+   * `llamada_ai` pide membresía a secas porque el tope diario y el estado de la capacidad la
+   * leen para todo el que abre el panel de propuestas, así que el suelo es más ancho.
+   *
+   * Esta sonda existe para que esa asimetría no se lea nunca como una promesa de la base.
+   * Cerrarla por rol es tentador y sería la avería de la ronda 42 de #48 otra vez —cerrar una
+   * fila por rol y romper una lectura ya declarada—, así que el suelo se queda como está y la
+   * discrepancia va en el sentido seguro: la pantalla enseña menos, no más.
+   */
+  it('RF-08.9: la puerta de rol del cuadro de operación es de PANTALLA, no del suelo', async () => {
+    await enWorkspaceLimpio('obs-frontera', async ({ ws: wsO, curadorId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, costo_usd, creado_por)
+        values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 0.07,
+                ${curadorId})`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${`${marca}-obs-stake@test.demo`}, 'Stake', 'activo') returning id`;
+      const stakeId = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsO}, ${stakeId}, 'Stake', ${`${marca}-obs-stake@test.demo`}, 'stakeholder')`;
+
+      // La puerta de la pantalla: el stakeholder no está en la lista, así que el loader no pide
+      // el cuadro y la tarjeta dice por qué.
+      expect((ROLES_OBSERVABILIDAD_AI as readonly string[]).includes('stakeholder')).toBe(false);
+      // Y el suelo, que es más ancho y hay que saberlo: por el servicio, con su membresía viva,
+      // el stakeholder SÍ lee el libro. La pantalla enseña menos que la base, no al revés.
+      const obs = await observabilidadAI(stakeId, wsO);
+      expect(
+        Number(obs.total.costoUsd.toFixed(2)),
+        'la política de llamada_ai dejó de admitir a un miembro: mira qué lectura declarada se rompió',
+      ).toBe(0.07);
     });
   });
 

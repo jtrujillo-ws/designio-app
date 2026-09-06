@@ -581,6 +581,11 @@ describeAuthz('evidencia profunda: derechos bloqueantes, adjuntos y sanitizació
       // pasa (allí G2 con los confirmados, aquí G4 con SYS-13) y su título se lee en el
       // tablero de gobernanza—, así que entra con guard y no con motivo.
       'concepto_evidencia',
+      // Y la sexta, con C4: un hallazgo de revisión simulada dice «esto se apoya en el
+      // documento X», y esa frase se lee en el expediente del concepto. Que la frase sea
+      // SIMULACIÓN no cambia que el documento sea real, así que sostenerla en material que no
+      // se puede citar al cliente es lo mismo que sostener cualquier otra cosa en él.
+      'hallazgo_simulado_evidencia',
       'journey_nodo_evidencia',
     ]);
 

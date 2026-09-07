@@ -587,24 +587,55 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * como llamada. La lista es la misma que decide si se baja a un callback anónimo, y por
      * el mismo motivo: es lo que este repositorio usa para ejecutar lo que recibe.
      */
+    /*
+     * EL NOMBRE DE QUIEN LLAMA, y `obj['map'](…)` es el mismo que `obj.map(…)`.
+     *
+     * Las tres lecturas de este fichero que preguntan «¿quién recibe este callback?» sólo
+     * conocían el nombre a secas y el acceso con punto, así que con la clave escrita entre
+     * corchetes el nombre salía `null`, la arista del callback se caía y un
+     * `items['map'](generarConProveedor)` dejaba al proveedor fuera del grafo con SYS-21 en
+     * verde. Los corchetes ya se leían al resolver la LLAMADA; faltaba aquí, que es el mismo
+     * concepto leído en otro sitio.
+     */
+    const nombreDeQuienLlama = (q: ts.Expression): string | null => {
+      if (ts.isPropertyAccessExpression(q)) return q.name.text;
+      if (ts.isElementAccessExpression(q) && ts.isStringLiteral(q.argumentExpression)) {
+        return q.argumentExpression.text;
+      }
+      if (ts.isIdentifier(q)) return q.text;
+      return null;
+    };
+
     const argumentosEjecutados = (x: ts.CallExpression): ts.Expression[] => {
-      const q = x.expression;
-      const quien = ts.isPropertyAccessExpression(q)
-        ? q.name.text
-        : ts.isIdentifier(q)
-          ? q.text
-          : null;
+      const quien = nombreDeQuienLlama(x.expression);
       const posiciones = quien === null ? undefined : EJECUTAN_SU_CALLBACK.get(quien);
       if (posiciones === undefined || quien === null || !receptorValido(x, quien)) return [];
       // El nombre a secas y el acceso a propiedad: `map(persistir)` y
       // `map(proveedor.generar)` ejecutan lo mismo, y quedarse con el primero dejaba
       // al espacio de nombres —la forma normal de llamar a otro módulo— fuera del grafo.
+      /*
+       * Y LAS ENVOLTURAS TRANSPARENTES TAMPOCO ESCONDEN AL CALLBACK. Salió midiendo lo
+       * anterior: con los corchetes ya leídos, un `lote.map(generarConProveedor as never)`
+       * —un `.map` corriente, sin nada exótico— seguía dejando al proveedor fuera del grafo,
+       * porque el argumento no era ni un nombre ni un acceso a propiedad sino un `as`. Es la
+       * misma regla que ya se aplicaba al CALLEE, leída en el otro lado de la llamada.
+       */
+      const sinEnvoltura = (a: ts.Expression): ts.Expression => {
+        let y: ts.Expression = a;
+        while (
+          ts.isParenthesizedExpression(y) ||
+          ts.isAsExpression(y) ||
+          ts.isNonNullExpression(y)
+        ) {
+          y = y.expression;
+        }
+        return y;
+      };
       return posiciones
         .map((k) => x.arguments[k])
-        .filter(
-          (a): a is ts.Expression =>
-            a !== undefined && (ts.isIdentifier(a) || ts.isPropertyAccessExpression(a)),
-        );
+        .filter((a): a is ts.Expression => a !== undefined)
+        .map(sinEnvoltura)
+        .filter((a) => ts.isIdentifier(a) || ts.isPropertyAccessExpression(a));
     };
 
     /*
@@ -737,12 +768,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     /** Si la función que envuelve a la plantilla la entrega a alguien que ESPERA su vuelta. */
     const laEsperaQuienLaRecibe = (f: ts.Node): boolean =>
       recepcionDe(f).some(({ llamada, indice }) => {
-        const q = llamada.expression;
-        const quien = ts.isPropertyAccessExpression(q)
-          ? q.name.text
-          : ts.isIdentifier(q)
-            ? q.text
-            : null;
+        const quien = nombreDeQuienLlama(llamada.expression);
         if (quien === null || !asimilaLoQueDevuelve(quien)) return false;
         const posiciones = EJECUTAN_SU_CALLBACK.get(quien);
         return posiciones !== undefined && posiciones.includes(indice);
@@ -775,11 +801,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return false;
       }
       const q = recibe.expression;
-      const quien = ts.isPropertyAccessExpression(q)
-        ? q.name.text
-        : ts.isIdentifier(q)
-          ? q.text
-          : null;
+      const quien = nombreDeQuienLlama(q);
       const posiciones = quien === null ? undefined : EJECUTAN_SU_CALLBACK.get(quien);
       if (
         posiciones !== undefined &&
@@ -1935,6 +1957,31 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         nombradas.push(col[1]!.toLowerCase());
         /*
+         * Y UNA COLUMNA COMPARADA CONSIGO MISMA no acota: o no dice nada, o lo vacía todo.
+         * El respaldo se conformaba con que el conjunto EMPEZARA por algo con forma de
+         * columna, sin mirar el otro operando, así que un `and creado_por <> creado_por` en el
+         * guardado del borrador pasaba por un acota-de-más inocuo sobre una columna distinta
+         * —ni se comparaba con el filtro exigido ni se nombraba—, y esa columna es NOT NULL:
+         * nunca difiere de sí misma, el update no toca ninguna fila y la paridad quedaba en
+         * verde con el post mortem sin guardar.
+         *
+         * Sólo se mira la comparación de una columna CONSIGO MISMA —mismo nombre y mismo
+         * calificador—, que es degenerada con cualquier operador. Dos columnas DISTINTAS no:
+         * ahí un `update … from` legítimo une por ellas, y rechazarlo pondría en rojo código
+         * intacto.
+         */
+        const consigoMisma =
+          /^(?:([a-z_][a-z0-9_]*)\s*\.\s*)?([a-z_][a-z0-9_]*)\s*(?:=|<>|!=|<=|>=|<|>)\s*(?:([a-z_][a-z0-9_]*)\s*\.\s*)?([a-z_][a-z0-9_]*)\s*$/i.exec(
+            trozo,
+          );
+        if (
+          consigoMisma &&
+          consigoMisma[2]!.toLowerCase() === consigoMisma[4]!.toLowerCase() &&
+          (consigoMisma[1] ?? '').toLowerCase() === (consigoMisma[3] ?? '').toLowerCase()
+        ) {
+          predicadosSinColumna.add(`${trozo.slice(0, 60)} (se compara consigo misma)`);
+        }
+        /*
          * Y si acota contra un LITERAL se guarda con su valor. Que nombre una columna distinta
          * lo hacía inocuo a ojos del censo, y no lo es: cambiar `and estado = 'borrador'` por
          * `and estado = 'completado'` en el guardado del borrador deja una sentencia que no
@@ -2156,6 +2203,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         if (ts.isBlock(a) || ts.isSourceFile(a)) {
           for (const st of a.statements) {
+            /*
+             * Y UNA `function` DECLARADA LIGA IGUAL QUE UN `const`. Esta búsqueda sólo miraba
+             * sentencias de variable, así que un `function conUsuario(_actor, _callback) {}`
+             * anidado —que se traga lo que recibe— no tapaba al import y el nombre seguía
+             * resolviendo hasta `db.ts`: el callback se daba por ejecutado y su SQL contaba
+             * sin mandarse. `declaradaEn`, la otra búsqueda de este fichero, sí las leía; eran
+             * dos lecturas del mismo concepto que no decían lo mismo.
+             */
+            if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
             if (!ts.isVariableStatement(st)) continue;
             for (const d of st.declarationList.declarations) {
               if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
@@ -3044,7 +3100,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     ).toEqual([]);
     expect(
       [...predicadosSinColumna].sort(),
-      'una escritura lleva un predicado que este censo no sabe leer, o repite una columna: puede anular la sentencia entera',
+      'una escritura lleva un predicado que este censo no sabe leer, repite una columna o la compara consigo misma: puede anular la sentencia entera',
     ).toEqual([]);
     expect(
       [...conjuntosImposibles].sort(),

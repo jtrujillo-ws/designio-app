@@ -115,6 +115,64 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     return nombres;
   };
 
+  /**
+   * LA LIGADURA LÉXICA DE UN NOMBRE EN EL SITIO DONDE SE USA: parámetro, variable, `function`,
+   * cabecera de `for` o `catch`. Si la hay, TAPA al import y el nombre ya no dice a dónde va.
+   *
+   * Vive aquí arriba, y no dentro de una sonda, porque las dos lo preguntan y porque la lección
+   * más cara de #54 fue justo ésta: «¿qué liga este nombre aquí?» se leía en varias copias, y
+   * tres rondas seguidas el hallazgo era el sitio que quedó sin actualizar al endurecer el de al
+   * lado. Una sola lectura, o vuelve.
+   */
+  const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
+    let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
+    while (a !== undefined) {
+      if (ts.isFunctionLike(a)) {
+        for (const p of a.parameters) {
+          if (ts.isIdentifier(p.name) && p.name.text === nombre) return p;
+        }
+      }
+      if (ts.isBlock(a) || ts.isSourceFile(a)) {
+        for (const st of a.statements) {
+          /*
+           * Y UNA `function` DECLARADA LIGA IGUAL QUE UN `const`. Esta búsqueda sólo miraba
+           * sentencias de variable, así que un `function conUsuario(_actor, _callback) {}`
+           * anidado —que se traga lo que recibe— no tapaba al import y el nombre seguía
+           * resolviendo hasta `db.ts`: el callback se daba por ejecutado y su SQL contaba
+           * sin mandarse. `declaradaEn`, la otra búsqueda de este fichero, sí las leía; eran
+           * dos lecturas del mismo concepto que no decían lo mismo.
+           */
+          if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
+          if (!ts.isVariableStatement(st)) continue;
+          for (const d of st.declarationList.declarations) {
+            if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+          }
+        }
+      }
+      /*
+       * Y LOS DOS SITIOS QUE LIGAN SIN SER SENTENCIAS DE BLOQUE: la cabecera de un `for` y el
+       * `catch`. Sin ellos, un `for (const persistir of […]) { await persistir(); }` no
+       * tapaba a un `persistir` importado y la llamada se acreditaba al import, con lo que
+       * borrar la escritura de verdad dejaba la invariante en verde.
+       */
+      if (
+        (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
+        a.initializer !== undefined &&
+        ts.isVariableDeclarationList(a.initializer)
+      ) {
+        for (const d of a.initializer.declarations) {
+          if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+        }
+      }
+      if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
+        const v = a.variableDeclaration;
+        if (ts.isIdentifier(v.name) && v.name.text === nombre) return v;
+      }
+      a = a.parent as ts.Node | undefined;
+    }
+    return null;
+  };
+
   it('cada capacidad declara su paridad, y la clase concuerda con el destino', () => {
     // Que el censo mire las nueve y no una lista suya: derivado del registro.
     expect(CAPACIDADES_ACTIVAS.length, 'el registro salió vacío').toBeGreaterThan(5);
@@ -350,15 +408,70 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           ) {
             q = q.expression;
           }
-          if (ts.isIdentifier(q)) fuera.add(q.text);
-          else if (ts.isPropertyAccessExpression(q) && ts.isIdentifier(q.expression)) {
-            fuera.add(`${q.expression.text}.${q.name.text}`);
+          /*
+           * Y UN NOMBRE TAPADO NO ACREDITA AL IMPORT. Guardar el texto del identificador a secas
+           * bastaba para que una pantalla con la server function importada —usada sólo en un
+           * `typeof`— y un parámetro interno del mismo nombre pasara por llamadora: se llama al
+           * parámetro y la puerta manual sigue sin abrirse, con la invariante en verde. Es la
+           * misma «forma no es identidad» que costó tres rondas en #54, y por eso `ligaduraDe`
+           * vive arriba y lo comparten las dos sondas.
+           */
+          if (ts.isIdentifier(q)) {
+            if (ligaduraDe(q, q.text) === null) fuera.add(q.text);
+          } else if (ts.isPropertyAccessExpression(q) && ts.isIdentifier(q.expression)) {
+            if (ligaduraDe(q.expression, q.expression.text) === null) {
+              fuera.add(`${q.expression.text}.${q.name.text}`);
+            }
           }
         }
         ts.forEachChild(x, ver);
       };
       ver(leer(f));
       return fuera;
+    };
+
+    /**
+     * DÓNDE SE DECLARA DE VERDAD UN NOMBRE, siguiendo los re-exports del módulo por el que entra.
+     *
+     * Comparando rutas a secas, una pantalla que importe por un barrel (`@/lib/metodo`) daba una
+     * ruta que NUNCA puede ser igual a la del paso declarado (`@/lib/metodo/metodo.functions`), y
+     * esto se ponía rojo sobre código que funciona. Ése es el otro modo de fallo de este fichero
+     * y el que más caro sale: una sonda que miente en rojo enseña a desconfiar de ella, y
+     * entonces ya no protege nada. Las sondas de export e invocabilidad de arriba ya seguían los
+     * re-exports; ésta tenía que hacerlo igual.
+     */
+    type Origen = { modulo: string; nombre: string };
+    const declaraA = (modulo: string, nombre: string, vistos = new Set<string>()): Origen | null => {
+      if (vistos.has(modulo) || !existsSync(modulo)) return null; // Ciclo de barrels: se corta.
+      vistos.add(modulo);
+      const exportado = (n: ts.Node): boolean =>
+        (n as { modifiers?: ts.NodeArray<ts.ModifierLike> }).modifiers?.some(
+          (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+        ) ?? false;
+      for (const st of leer(modulo).statements) {
+        if (ts.isFunctionDeclaration(st) && st.name?.text === nombre && exportado(st)) {
+          return { modulo, nombre };
+        }
+        if (ts.isVariableStatement(st) && exportado(st)) {
+          for (const d of st.declarationList.declarations) {
+            if (ts.isIdentifier(d.name) && d.name.text === nombre) return { modulo, nombre };
+          }
+        }
+        if (!ts.isExportDeclaration(st) || !st.moduleSpecifier) continue;
+        const destino = resolver(modulo, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (destino === null) continue;
+        if (st.exportClause && ts.isNamedExports(st.exportClause)) {
+          for (const e of st.exportClause.elements) {
+            if (e.name.text !== nombre) continue;
+            const hallado = declaraA(destino, (e.propertyName ?? e.name).text, vistos);
+            if (hallado !== null) return hallado;
+          }
+        } else if (!st.exportClause) {
+          const hallado = declaraA(destino, nombre, vistos);
+          if (hallado !== null) return hallado;
+        }
+      }
+      return null;
     };
 
     const sinPantalla: string[] = [];
@@ -371,10 +484,26 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const laLlama = CAPA.some((pantalla) => {
           const traidos = traidosPor(pantalla);
           const llamados = llamadosEn(pantalla);
+          /*
+           * Y el cruce compara MÓDULO Y NOMBRE. Arreglando el barrel se me cayó la comparación
+           * del nombre, y con ella cualquier import llamado del mismo módulo valía: el
+           * `editarCriterioDeReto` de esta misma pantalla daba por abierta la puerta de C0.
+           * Por eso `declaraA` devuelve las dos cosas — y devuelve el NOMBRE, no el que se
+           * importó, para que un re-export que renombre no pierda el rastro.
+           */
+          const esElPaso = (o: Origen | null): boolean =>
+            o !== null && o.modulo === modulo && o.nombre === paso.funcion;
           for (const [local, via] of traidos) {
-            if (via.modulo !== modulo) continue;
-            if (via.espacio && llamados.has(`${local}.${paso.funcion}`)) return true;
-            if (!via.espacio && via.original === paso.funcion && llamados.has(local)) return true;
+            if (via.espacio) {
+              if (
+                llamados.has(`${local}.${paso.funcion}`) &&
+                esElPaso(declaraA(via.modulo, paso.funcion))
+              ) {
+                return true;
+              }
+              continue;
+            }
+            if (llamados.has(local) && esElPaso(declaraA(via.modulo, via.original))) return true;
           }
           return false;
         });
@@ -2365,55 +2494,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /** La ligadura LÉXICA de un nombre en el sitio donde se usa: parámetro o variable. */
-    const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
-      let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
-      while (a !== undefined) {
-        if (ts.isFunctionLike(a)) {
-          for (const p of a.parameters) {
-            if (ts.isIdentifier(p.name) && p.name.text === nombre) return p;
-          }
-        }
-        if (ts.isBlock(a) || ts.isSourceFile(a)) {
-          for (const st of a.statements) {
-            /*
-             * Y UNA `function` DECLARADA LIGA IGUAL QUE UN `const`. Esta búsqueda sólo miraba
-             * sentencias de variable, así que un `function conUsuario(_actor, _callback) {}`
-             * anidado —que se traga lo que recibe— no tapaba al import y el nombre seguía
-             * resolviendo hasta `db.ts`: el callback se daba por ejecutado y su SQL contaba
-             * sin mandarse. `declaradaEn`, la otra búsqueda de este fichero, sí las leía; eran
-             * dos lecturas del mismo concepto que no decían lo mismo.
-             */
-            if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
-            if (!ts.isVariableStatement(st)) continue;
-            for (const d of st.declarationList.declarations) {
-              if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
-            }
-          }
-        }
-        /*
-         * Y LOS DOS SITIOS QUE LIGAN SIN SER SENTENCIAS DE BLOQUE: la cabecera de un `for` y el
-         * `catch`. Sin ellos, un `for (const persistir of […]) { await persistir(); }` no
-         * tapaba a un `persistir` importado y la llamada se acreditaba al import, con lo que
-         * borrar la escritura de verdad dejaba la invariante en verde.
-         */
-        if (
-          (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
-          a.initializer !== undefined &&
-          ts.isVariableDeclarationList(a.initializer)
-        ) {
-          for (const d of a.initializer.declarations) {
-            if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
-          }
-        }
-        if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
-          const v = a.variableDeclaration;
-          if (ts.isIdentifier(v.name) && v.name.text === nombre) return v;
-        }
-        a = a.parent as ts.Node | undefined;
-      }
-      return null;
-    };
-
     /** `sql` / `sqlAdmin` de `db.ts`: la FÁBRICA del cliente, que todavía hay que llamar. */
     const esFabricaDeCliente = (e: ts.Expression, f: string): boolean => {
       if (ts.isIdentifier(e)) {

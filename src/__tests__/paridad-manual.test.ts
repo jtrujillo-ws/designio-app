@@ -145,6 +145,26 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
    * clave y como mucho se le quitan los paréntesis. Decidir qué es constante es por donde este
    * censo empezaría a poner en rojo código intacto, y ése es el modo de fallo caro.
    */
+  /**
+   * Quitadas las envolturas que no cambian a QUÉ se llama: paréntesis, `as` y `!`.
+   *
+   * Vive aquí porque el callee y el RECEPTOR tienen que leerse igual. Se desenvolvía sólo el
+   * callee, así que `(manual as typeof manual).definirCriterio(…)` —el `as` sobre el espacio de
+   * nombres, no sobre la llamada entera— dejaba un receptor que no era un identificador, la
+   * invocación válida se ignoraba y el censo se ponía ROJO SOBRE CÓDIGO QUE FUNCIONA.
+   */
+  const desenvuelto = (e: ts.Expression): ts.Expression => {
+    let x: ts.Expression = e;
+    while (
+      ts.isParenthesizedExpression(x) ||
+      ts.isAsExpression(x) ||
+      ts.isNonNullExpression(x)
+    ) {
+      x = x.expression;
+    }
+    return x;
+  };
+
   const ramaMuerta = (x: ts.Node): ts.Node | null => {
     const literal = (e: ts.Expression): boolean | null => {
       let c: ts.Expression = e;
@@ -254,6 +274,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
   };
 
   const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
+    // Por qué hijo se sube: un `var` del cuerpo NO alcanza al default de un parámetro.
+    let hijo: ts.Node = donde;
     let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
     while (a !== undefined) {
       if (ts.isFunctionLike(a)) {
@@ -271,8 +293,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
       // Y una clase-expresión con nombre se liga a sí misma, igual que la función de arriba.
       if (ts.isClassExpression(a) && a.name?.text === nombre) return a;
+      /*
+       * Y EL `var` DEL CUERPO SÓLO TAPA DENTRO DEL CUERPO. Preguntarlo al pasar por cualquier
+       * función daba por tapada una llamada escrita en el DEFAULT DE UN PARÁMETRO —
+       * `function P(x = definirCriterio(…)) { var definirCriterio = local; }`—, donde los
+       * parámetros viven en su propio ámbito y el `var` del cuerpo no llega. Se descartaba una
+       * invocación manual de verdad: ROJO SOBRE CÓDIGO QUE FUNCIONA, y regresión de mi propio
+       * arreglo de la ronda anterior. Por eso se mira POR QUÉ HIJO se ha subido.
+       */
       const cuerpo = cuerpoDeLaFuncion(a);
-      if (cuerpo !== null) {
+      if (cuerpo !== null && hijo === cuerpo) {
         const v = varsDe(cuerpo).get(nombre);
         if (v !== undefined) return v;
       }
@@ -324,6 +354,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const v = a.variableDeclaration;
         if (ligaEsteNombre(v.name, nombre)) return v;
       }
+      hijo = a;
       a = a.parent as ts.Node | undefined;
     }
     return null;
@@ -556,14 +587,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       const fuera = new Set<string>();
       const ver = (x: ts.Node): void => {
         if (ts.isCallExpression(x)) {
-          let q: ts.Expression = x.expression;
-          while (
-            ts.isParenthesizedExpression(q) ||
-            ts.isAsExpression(q) ||
-            ts.isNonNullExpression(q)
-          ) {
-            q = q.expression;
-          }
+          const q: ts.Expression = desenvuelto(x.expression);
           /*
            * Y UN NOMBRE TAPADO NO ACREDITA AL IMPORT. Guardar el texto del identificador a secas
            * bastaba para que una pantalla con la server function importada —usada sólo en un
@@ -574,9 +598,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            */
           if (ts.isIdentifier(q)) {
             if (ligaduraDe(q, q.text) === null) fuera.add(q.text);
-          } else if (ts.isPropertyAccessExpression(q) && ts.isIdentifier(q.expression)) {
-            if (ligaduraDe(q.expression, q.expression.text) === null) {
-              fuera.add(`${q.expression.text}.${q.name.text}`);
+          } else if (ts.isPropertyAccessExpression(q)) {
+            // El receptor se lee igual que el callee: el `as` puede envolver sólo al espacio.
+            const r = desenvuelto(q.expression);
+            if (ts.isIdentifier(r) && ligaduraDe(r, r.text) === null) {
+              fuera.add(`${r.text}.${q.name.text}`);
             }
           }
         }
@@ -1081,7 +1107,17 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * verde. Los corchetes ya se leían al resolver la LLAMADA; faltaba aquí, que es el mismo
      * concepto leído en otro sitio.
      */
-    const nombreDeQuienLlama = (q: ts.Expression): string | null => {
+    const nombreDeQuienLlama = (e: ts.Expression): string | null => {
+      /*
+       * Y AQUÍ TAMBIÉN SE DESENVUELVE, que es la misma asimetría de la sonda de pantallas una
+       * capa más allá y NO estaba reportada: salió midiéndola. Un
+       * `(conUsuario as typeof conUsuario)(actorId, async (tx) => {…})` —un cast corriente sobre
+       * el callee— dejaba de reconocerse como «ejecuta su callback», y con él se caían TODAS las
+       * escrituras de dentro: el censo decía que la secuencia manual no cubre
+       * `update outcome_review`. ROJO SOBRE CÓDIGO QUE FUNCIONA, en la otra sonda y por la misma
+       * causa. Se lee una vez aquí porque de este lector cuelgan los tres consumidores.
+       */
+      const q = desenvuelto(e);
       if (ts.isPropertyAccessExpression(q)) return q.name.text;
       if (ts.isElementAccessExpression(q) && ts.isStringLiteral(q.argumentExpression)) {
         return q.argumentExpression.text;
@@ -1153,16 +1189,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * que nunca se manda. El nombre se resuelve hasta `db.ts`, y una ligadura local (lo que
        * TAPA al import) descalifica: ahí ya no se sabe qué es.
        */
+      /*
+       * Y AQUÍ SE LEE EL CALLEE DESENVUELTO, que es donde de verdad se caía. Arreglar
+       * `nombreDeQuienLlama` no bastó —lo comprobé midiendo, y siguió rojo—: esta puerta
+       * exigía un identificador PELADO, así que un `(conUsuario as typeof conUsuario)(actorId,
+       * async (tx) => {…})` no pasaba y con él se caían todas las escrituras de dentro. Dos
+       * lecturas del mismo callee que no decían lo mismo, otra vez.
+       */
+      const q = desenvuelto(x.expression);
       if (como === 'suelto') {
-        if (!ts.isIdentifier(x.expression)) return false;
-        if (ligaduraDe(x.expression, x.expression.text) !== null) return false;
-        return vieneDeLaBase(x.getSourceFile().fileName, x.expression.text) === quien;
+        if (!ts.isIdentifier(q)) return false;
+        if (ligaduraDe(q, q.text) !== null) return false;
+        return vieneDeLaBase(x.getSourceFile().fileName, q.text) === quien;
       }
-      if (!ts.isPropertyAccessExpression(x.expression)) return false;
-      let a: ts.Expression = x.expression.expression;
+      if (!ts.isPropertyAccessExpression(q)) return false;
+      let a: ts.Expression = desenvuelto(q.expression);
       for (let i = 0; i < 12; i += 1) {
         if (ts.isCallExpression(a) || ts.isPropertyAccessExpression(a)) {
-          a = a.expression;
+          a = desenvuelto(a.expression);
           continue;
         }
         break;
@@ -2741,7 +2785,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       if (fn.parameters.indexOf(p) !== 0) return false;
       return recepcionDe(fn).some(({ llamada, indice }) => {
         if (indice !== 1) return false;
-        const quien = llamada.expression;
+        // Desenvuelto, igual que en las otras dos puertas: el `as` sobre el callee no cambia
+        // quién entrega la transacción, y leerlo pelado tiraba las escrituras del callback.
+        const quien = desenvuelto(llamada.expression);
         return (
           ts.isIdentifier(quien) &&
           ligaduraDe(quien, quien.text) === null &&

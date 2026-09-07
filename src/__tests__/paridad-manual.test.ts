@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { CAPACIDADES, CAPACIDADES_ACTIVAS } from '@/lib/ai/ai.schemas';
@@ -260,6 +260,132 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         ).toBe(true);
       }
     }
+  });
+
+  /**
+   * Y LA PREGUNTA QUE ESTE CENSO NO SE PODÍA HACER: ¿LA LLAMA ALGUIEN?
+   *
+   * Las tres sondas de este fichero miden la capa de SERVER FUNCTIONS, y por buenas razones:
+   * SYS-21 pide que la operación sea ejecutable sin AI, y ejecutable es la server function. Pero
+   * eso deja fuera exactamente un caso, y no es teórico: `definirCriterio` existía, se exportaba,
+   * escribía `criterio_exito` y pasaba las tres — y NO LA LLAMABA NINGÚN COMPONENTE. Con la AI
+   * apagada no había forma de crear un criterio de éxito, y SYS-22 los exige para G0. La pantalla
+   * llegaba a pintar «Sin criterios definidos: G0 no podrá aprobarse» sin ofrecer nada con lo que
+   * arreglarlo. Lo destapó una revisión contando llamadores a mano; se cerró en #55.
+   *
+   * Una puerta que nadie abre no es una puerta. Esto lo convierte en invariante para las nueve.
+   *
+   * NOMBRAR NO ES LLAMAR, y ésa es toda la dificultad. Un `grep` del nombre daría verde con el
+   * import a secas, con una mención en un comentario o con el nombre en una posición de tipo — que
+   * es justo el estado en el que estaba C0 antes de #55: importable y sin usar. Así que se exige
+   * una LLAMADA VIVA: el nombre en posición de callee, con las envolturas transparentes quitadas,
+   * y siguiendo el alias con el que la pantalla lo importe —renombrado o por espacio de nombres—.
+   *
+   * DOS LÍMITES, escritos y no disfrazados:
+   *  · sólo mira los `.tsx` de `src/components` y `src/routes`. Si mañana una pantalla delega la
+   *    llamada en un `.ts` de al lado, esto se pondrá ROJO y pedirá una decisión en vez de callar;
+   *  · no pregunta si el componente se RENDERIZA, sólo si la llamada existe en él. Un componente
+   *    muerto entero es un problema distinto y más grande, y no es el que esta sonda persigue.
+   */
+  it('alguna pantalla llama de verdad a cada puerta manual', () => {
+    /** Los `.tsx` de la capa que el usuario toca. */
+    const pantallas = (dir: string): string[] => {
+      if (!existsSync(dir)) return [];
+      const fuera: string[] = [];
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const ruta = `${dir}/${e.name}`;
+        if (e.isDirectory()) fuera.push(...pantallas(ruta));
+        else if (e.name.endsWith('.tsx')) fuera.push(ruta);
+      }
+      return fuera;
+    };
+    const CAPA = [...pantallas(`${raiz}/src/components`), ...pantallas(`${raiz}/src/routes`)];
+    expect(CAPA.length, 'no se encontró ni una pantalla: esta sonda no estaría mirando nada').toBeGreaterThan(0);
+
+    /**
+     * Cómo trae una pantalla un nombre de otro módulo. `tipoSolo` se descarta: un
+     * `import type { X }` no puede llamar a nada, y contarlo sería volver al «nombrar es llamar».
+     */
+    type Traido = { modulo: string; original: string; espacio: boolean };
+    const traidosPor = (f: string): Map<string, Traido> => {
+      const fuera = new Map<string, Traido>();
+      for (const st of leer(f).statements) {
+        if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+        if (st.importClause.isTypeOnly) continue;
+        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (destino === null) continue;
+        const enlace = st.importClause.namedBindings;
+        if (enlace && ts.isNamedImports(enlace)) {
+          for (const e of enlace.elements) {
+            if (e.isTypeOnly) continue;
+            fuera.set(e.name.text, {
+              modulo: destino,
+              original: (e.propertyName ?? e.name).text,
+              espacio: false,
+            });
+          }
+        } else if (enlace && ts.isNamespaceImport(enlace)) {
+          fuera.set(enlace.name.text, { modulo: destino, original: '*', espacio: true });
+        }
+      }
+      return fuera;
+    };
+
+    /**
+     * Lo que un fichero LLAMA, no lo que menciona: sólo el nombre en posición de callee.
+     *
+     * Con las envolturas transparentes quitadas, por lo mismo que en el grafo de escrituras:
+     * `(definirCriterio as typeof definirCriterio)({ data })` es la misma llamada. Las llamadas
+     * de propiedad se guardan como `objeto.nombre`, que es como se ve un espacio de nombres.
+     */
+    const llamadosEn = (f: string): Set<string> => {
+      const fuera = new Set<string>();
+      const ver = (x: ts.Node): void => {
+        if (ts.isCallExpression(x)) {
+          let q: ts.Expression = x.expression;
+          while (
+            ts.isParenthesizedExpression(q) ||
+            ts.isAsExpression(q) ||
+            ts.isNonNullExpression(q)
+          ) {
+            q = q.expression;
+          }
+          if (ts.isIdentifier(q)) fuera.add(q.text);
+          else if (ts.isPropertyAccessExpression(q) && ts.isIdentifier(q.expression)) {
+            fuera.add(`${q.expression.text}.${q.name.text}`);
+          }
+        }
+        ts.forEachChild(x, ver);
+      };
+      ver(leer(f));
+      return fuera;
+    };
+
+    const sinPantalla: string[] = [];
+    for (const cap of CAPACIDADES_ACTIVAS) {
+      const paridad = CAPACIDADES[cap].paridadManual;
+      if (paridad.clase !== 'escritura') continue;
+      for (const paso of paridad.pasos) {
+        const modulo = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
+        if (modulo === null) continue; // Ya lo denuncia la sonda de arriba; aquí no se repite.
+        const laLlama = CAPA.some((pantalla) => {
+          const traidos = traidosPor(pantalla);
+          const llamados = llamadosEn(pantalla);
+          for (const [local, via] of traidos) {
+            if (via.modulo !== modulo) continue;
+            if (via.espacio && llamados.has(`${local}.${paso.funcion}`)) return true;
+            if (!via.espacio && via.original === paso.funcion && llamados.has(local)) return true;
+          }
+          return false;
+        });
+        if (!laLlama) sinPantalla.push(`${cap}: ${paso.modulo}#${paso.funcion}`);
+      }
+    }
+
+    expect(
+      sinPantalla.sort(),
+      'la puerta manual existe y escribe, pero NINGUNA pantalla la llama: con la AI apagada no hay forma de hacerlo (es el caso de C0 antes de #55)',
+    ).toEqual([]);
   });
 
   /**

@@ -124,6 +124,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
    * tres rondas seguidas el hallazgo era el sitio que quedó sin actualizar al endurecer el de al
    * lado. Una sola lectura, o vuelve.
    */
+  const ramaMuerta = (x: ts.Node): ts.Node | null => {
+    if (ts.isIfStatement(x)) {
+      if (x.expression.kind === ts.SyntaxKind.FalseKeyword) return x.thenStatement;
+      if (x.expression.kind === ts.SyntaxKind.TrueKeyword) return x.elseStatement ?? null;
+      return null;
+    }
+    if (ts.isWhileStatement(x) && x.expression.kind === ts.SyntaxKind.FalseKeyword) {
+      return x.statement;
+    }
+    return null;
+  };
+
   const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
     let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
     while (a !== undefined) {
@@ -424,7 +436,17 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             }
           }
         }
-        ts.forEachChild(x, ver);
+        /*
+         * Y LA RAMA MUERTA TAMPOCO ABRE LA PUERTA. Este descenso contaba una llamada por
+         * aparecer en el árbol, así que mover la única invocación bajo un `if (false)` —o
+         * dejar el manejador viejo tras quitarle el botón— seguía dando la pantalla por
+         * llamadora. Es la misma ceguera que el recorrido de escrituras, y por eso `ramaMuerta`
+         * también vive arriba y la leen las dos.
+         */
+        const muerta = ramaMuerta(x);
+        ts.forEachChild(x, (y) => {
+          if (y !== muerta) ver(y);
+        });
       };
       ver(leer(f));
       return fuera;
@@ -1221,17 +1243,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * decidir qué es constante es justo por donde este censo empezaría a poner en rojo código
        * intacto, y ése es el otro modo de fallo, el que enseña a desconfiar de la sonda.
        */
-      const ramaMuerta = (x: ts.Node): ts.Node | null => {
-        if (ts.isIfStatement(x)) {
-          if (x.expression.kind === ts.SyntaxKind.FalseKeyword) return x.thenStatement;
-          if (x.expression.kind === ts.SyntaxKind.TrueKeyword) return x.elseStatement ?? null;
-          return null;
-        }
-        if (ts.isWhileStatement(x) && x.expression.kind === ts.SyntaxKind.FalseKeyword) {
-          return x.statement;
-        }
-        return null;
-      };
       const ver = (x: ts.Node): void => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);

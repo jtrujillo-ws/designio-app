@@ -873,11 +873,12 @@ con su pasaje o, si el derecho de uso se retiró después, solo el título y el 
 - **Puertas**: solo se escribe con el concepto `candidato` y la etapa 4 del reto abierta
   (`etapaAdmiteConceptos` viaja en la misma proyección); la lente tiene que ser un arquetipo **del
   reto y no refutado** (un arquetipo refutado no habla), y cada sesión **cita solo la evidencia de
-  su arquetipo**. Una revisión sin hallazgos ni preguntas no se admite (trigger diferido de
-  completitud). Corregir una revisión es **borrarla y escribir la buena**; borrar una aceptada suelta
+  su arquetipo**. Una revisión lleva **al menos un hallazgo y al menos una pregunta** (el contrato
+  exige de 1 a 6 de cada uno, y el trigger diferido de completitud rechaza al commit la que se quede
+  sin cualquiera de las dos colecciones, también al borrar hojas). Corregir una revisión es **borrarla y escribir la buena**; borrar una aceptada suelta
   el puntero de su propuesta y el hecho queda en `evento_dominio`.
 - **Ruta manual (SYS-21)**: los curadores (lead y diseñador) escriben una revisión desde el
-  formulario de la etapa 4 (lente, síntesis, hasta 6 hallazgos con hasta 4 citas cada uno, hasta 6
+  formulario de la etapa 4 (lente, síntesis, de 1 a 6 hallazgos con hasta 4 citas cada uno, de 1 a 6
   preguntas) por la **misma función** que usa la aceptación y validada con el **mismo contrato**
   que gobierna al modelo **más una restricción propia**: en esta ruta cada hallazgo cita **un solo
   pasaje por documento** (`EscribirRevisionAManoSchema` rechaza dos citas con el mismo
@@ -1261,7 +1262,7 @@ generar se desactivan y revisar lo ya propuesto sigue disponible (SYS-21).
 | **C1** | 1 | Transcripción, diarización y codificación con citas exactas | — | — | Diseñado (requiere STT) |
 | **C2** | 2 | Hasta 4 insights con afirmaciones (marcando hipótesis), citas por afirmación a la evidencia del reto por id, y contradicciones señaladas (una por evidencia) | Reto | Insight propuesto con afirmaciones, citas y contradicciones | Construido |
 | **C3** | 3 | Hasta 5 preguntas HMW con prioridad numérica y su razón argumentada contra los criterios de éxito del reto, y de 1 a 6 citas a los insights **validados** del reto por id; la traza a insights se **deriva de las citas** (no hay lista aparte), así que las citas no se corrigen y una HMW mal apoyada se rechaza | Reto con insights validados, criterios y portafolio abierto | Oportunidad en estado `propuesta` (por decidir) con su traza `oportunidad_insight` | Construido |
-| **C4** | 4 | **Una sesión por arquetipo** del reto (lentes con evidencia citable, no refutadas y que no hayan leído ya el concepto; hasta 6 por lote, rotando la menos pedida) sobre un concepto candidato: síntesis, hasta 6 hallazgos (fricciones, exclusiones, riesgos) que **citan la evidencia de su arquetipo** o van marcados como hipótesis, y hasta 6 preguntas para el test real; sin porcentajes ni agregados sintéticos | Concepto candidato (curadores) | `revision_simulada` con hallazgos, citas y preguntas, etiquetada **simulación** de forma imborrable; jamás evidencia ni citable en un checklist | Construido |
+| **C4** | 4 | **Una sesión por arquetipo** del reto (lentes con evidencia citable, no refutadas y que no hayan leído ya el concepto; hasta 6 por lote, rotando la menos pedida) sobre un concepto candidato: síntesis, de 1 a 6 hallazgos (fricciones, exclusiones, riesgos) que **citan la evidencia de su arquetipo** o van marcados como hipótesis, y de 1 a 6 preguntas para el test real; sin porcentajes ni agregados sintéticos | Concepto candidato (curadores) | `revision_simulada` con hallazgos, citas y preguntas, etiquetada **simulación** de forma imborrable; jamás evidencia ni citable en un checklist | Construido |
 | **C5** | 5 | Cómo cerrar cada señal de validación del journey; no rediagnostica | Journey | Informativo | Construido |
 | **C6** | 6 | Hasta 6 entradas KPI del Metric Registry contra los criterios de éxito del reto: criterio al que responde (por id), nombre, definición, fuente, dimensiones, frecuencia y citas a los criterios; **no** propone propietario del dato, línea base, ventana ni dashboard (compromisos y datos, no redacción) | Metric Registry en borrador | Entrada KPI (incompleta hasta la firma) | Construido |
 | **C7** | 7 | Borrador de los cuatro campos narrativos del post mortem (contribución, factores externos, hipótesis abiertas, aprendizajes) y, opcionalmente, lecturas de elementos del tablero de conciliación no constatados como aprobados, con citas al tablero del reto y a las lecturas por criterio; **no** propone el veredicto ni la casilla de diseño experimental | Outcome review en borrador (solo el lead) | El propio outcome review: aceptar escribe sus campos narrativos, no crea fila | Construido |

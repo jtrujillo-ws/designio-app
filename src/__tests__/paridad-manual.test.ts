@@ -156,6 +156,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
     while (a !== undefined) {
       if (ts.isFunctionLike(a)) {
+        /*
+         * Y UNA FUNCIÓN-EXPRESIÓN CON NOMBRE SE LIGA A SÍ MISMA. En
+         * `const h = function definirCriterio() { definirCriterio(); }` la llamada de dentro es
+         * la recursiva, no el import — y se le acreditaba al import. Es la ligadura que una
+         * función lleva encima, no la de sus parámetros, así que se miraba en el sitio pero no
+         * se miraba entera.
+         */
+        if (ts.isFunctionExpression(a) && a.name?.text === nombre) return a;
         for (const p of a.parameters) {
           if (ligaEsteNombre(p.name, nombre)) return p;
         }
@@ -480,8 +488,17 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      */
     type Origen = { modulo: string; nombre: string };
     const declaraA = (modulo: string, nombre: string, vistos = new Set<string>()): Origen | null => {
-      if (vistos.has(modulo) || !existsSync(modulo)) return null; // Ciclo de barrels: se corta.
-      vistos.add(modulo);
+      /*
+       * Y EL GUARD DE CICLOS SE LLAVEA POR MÓDULO **Y NOMBRE**, que es lo que se pregunta. Con
+       * la llave sólo del módulo, dos caminos de barrel al mismo fichero se estorbaban: si el
+       * primero —`export * from './x'`— buscaba ahí un nombre y no lo encontraba, el segundo
+       * —`export { real as publico } from './x'`— ya no podía entrar a buscar `real`, y el paso
+       * se quedaba sin origen. Rojo sobre código que funciona: una llave que no coincide con la
+       * pregunta no corta ciclos, corta respuestas.
+       */
+      const llave = `${modulo}#${nombre}`;
+      if (vistos.has(llave) || !existsSync(modulo)) return null;
+      vistos.add(llave);
       const exportado = (n: ts.Node): boolean =>
         (n as { modifiers?: ts.NodeArray<ts.ModifierLike> }).modifiers?.some(
           (m) => m.kind === ts.SyntaxKind.ExportKeyword,

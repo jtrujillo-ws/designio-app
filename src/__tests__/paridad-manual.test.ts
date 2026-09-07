@@ -336,25 +336,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * `contribucion = ${entrada.aprendizajes}` da el mismo conjunto de columnas que el correcto
      * y guarda el relato en el campo equivocado con el censo en verde.
      */
-    type Consulta = { sql: string; campos: string[][]; etiqueta: string };
+    type Consulta = { sql: string; campos: string[][]; etiqueta: string; tag: ts.Expression };
 
     /*
      * QUIÉN ETIQUETA LA PLANTILLA. Contando toda plantilla etiquetada, un `sqlText\`…\`` o un
      * `String.raw\`…\`` que formatee o registre una sentencia contaba como escritura: borrar la
      * consulta de verdad y dejar el texto formateado mantenía la invariante en verde.
      *
-     * Se reconocen las etiquetas del cliente de este repositorio —la transacción y los dos
-     * accesos de `db.ts`—, y lo que NO se reconoce no se ignora en silencio: una plantilla con
-     * una escritura y una etiqueta desconocida tumba el censo nombrándola. Así, el día que
-     * aparezca otra forma de consultar, esto pide una decisión en vez de contarla o perderla.
+     * Se guarda el NODO de la etiqueta y no su texto: la ligadura se resuelve más abajo, ya con
+     * el módulo delante. Mirar el texto —el último nombre tras los puntos— aceptaba un
+     * `logger.sql\`…\`` o un `sql` local que tapara al importado, que es la misma avería con
+     * otro disfraz. Lo que no resuelva a un cliente de la base no se ignora en silencio: tumba
+     * el censo nombrando la etiqueta, y así pide una decisión en vez de contarla o perderla.
      */
-    const ETIQUETAS_DE_LA_BASE = ['tx', 'sql', 'sqlAdmin', 'admin'];
-    const etiquetaDeBase = (t: string): boolean => {
-      const base = t.replace(/\([^)]*\)\s*$/, '');
-      const ultimo = base.split('.').pop() ?? '';
-      return ETIQUETAS_DE_LA_BASE.includes(ultimo.trim());
-    };
     const etiquetasDesconocidas = new Set<string>();
+    const callbacksSinInvocar = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -365,10 +361,20 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * llamada mantenía la escritura contada — la operación desaparecida y el censo en verde.
      * Se mira si el nombre aparece en algún otro sitio del cuerpo: sólo se baja si sí.
      *
-     * A las funciones anidadas SIN nombre sí se baja siempre, y no es una excepción de
-     * conveniencia: son las que van como argumento —`conUsuario(actorId, async (tx) => …)`,
-     * que es como escribe casi todo este repositorio—, y ésas las llama quien las recibe.
-     * Excluirlas dejaría ciego el censo entero, que es lo contrario de lo que se busca.
+     * A las funciones anidadas SIN nombre se baja cuando QUIEN LAS RECIBE LAS EJECUTA. Bajar a
+     * todas era lo mismo que contar toda mención: un manejador que se limitara a GUARDAR o a
+     * REGISTRAR un `async () => await tx\`…\`` —sin llegar a llamarlo— seguía aportando su
+     * escritura, así que borrar la persistencia de verdad dejaba la paridad en verde.
+     *
+     * Quién las ejecuta se lee de la LLAMADA que las recibe, y la lista sale del código, no de
+     * una conjetura: `conUsuario(actorId, async (tx) => …)` —el único camino a la base—, el
+     * `.handler(…)` con el que este repositorio escribe cada función de servidor, y los métodos
+     * de `Array`/`String` que llaman a lo que se les pasa. Lo que no esté en esa lista no se
+     * cuenta, y si lleva una plantilla dentro se NOMBRA al final: pide una decisión en vez de
+     * contarla en silencio.
+     *
+     * Un nodo función-like SIN cuerpo es un TIPO —`(cb: (t: T) => void)`—, y un tipo no ejecuta
+     * nada: se salta sin más.
      *
      * Y ES UN SOLO RECORRIDO porque la primera versión de esta regla vivía únicamente en la
      * lectura del SQL, y la de las llamadas seguía bajando a todas partes: un ayudante muerto
@@ -380,6 +386,61 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * a dos apariciones y pasaban por vivos. Se parte de lo que se nombra FUERA de todo cuerpo
      * con nombre y se expande por punto fijo: sólo entra el que alguien vivo nombra.
      */
+    const EJECUTAN_SU_CALLBACK = [
+      // El único camino de este repositorio a la base, y el cuerpo de cada función de servidor.
+      'conUsuario',
+      'handler',
+      // Y los métodos que llaman a lo que reciben.
+      'map',
+      'flatMap',
+      'filter',
+      'forEach',
+      'find',
+      'findLast',
+      'findIndex',
+      'some',
+      'every',
+      'reduce',
+      'sort',
+      'replace',
+      'then',
+      'catch',
+      'finally',
+    ];
+    /** Si quien recibe una función anónima la ejecuta. Lo que no, se nombra si lleva SQL. */
+    const laEjecutaQuienLaRecibe = (x: ts.Node): boolean => {
+      // Un nodo función-like sin cuerpo es un TIPO: no ejecuta nada y no hay nada que decir.
+      const cuerpo = (x as ts.FunctionLikeDeclaration).body;
+      if (cuerpo === undefined) return false;
+      const nombrarSiLleva = (donde: ts.Node, quien: string): void => {
+        let conSql = false;
+        const buscar = (z: ts.Node): void => {
+          if (ts.isTaggedTemplateExpression(z)) conSql = true;
+          if (!conSql) ts.forEachChild(z, buscar);
+        };
+        buscar(donde);
+        if (conSql) callbacksSinInvocar.add(quien);
+      };
+      const recibe = x.parent as ts.Node | undefined;
+      if (
+        recibe === undefined ||
+        !ts.isCallExpression(recibe) ||
+        !recibe.arguments.includes(x as unknown as ts.Expression)
+      ) {
+        nombrarSiLleva(x, recibe === undefined ? '(sin padre)' : `${ts.SyntaxKind[recibe.kind]}`);
+        return false;
+      }
+      const q = recibe.expression;
+      const quien = ts.isPropertyAccessExpression(q)
+        ? q.name.text
+        : ts.isIdentifier(q)
+          ? q.text
+          : null;
+      if (quien !== null && EJECUTAN_SU_CALLBACK.includes(quien)) return true;
+      nombrarSiLleva(x, `${quien ?? q.getText().slice(0, 40)}(…)`);
+      return false;
+    };
+
     const recorrerVivo = (n: ts.Node, visitar: (x: ts.Node) => void): void => {
       /** El nombre con el que se declara una función anidada, si lo tiene. */
       const nombreDe = (x: ts.Node): string | null => {
@@ -446,6 +507,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);
           if (nombre !== null && !vivas.has(nombre)) return;
+          if (nombre === null && !laEjecutaQuienLaRecibe(x)) return;
         }
         visitar(x);
         ts.forEachChild(x, ver);
@@ -465,17 +527,63 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         while (a !== undefined && !ts.isFunctionLike(a)) a = a.parent as ts.Node | undefined;
         return a ?? n;
       };
+      /**
+       * Y QUÉ NOMBRE SE CONSUME DE VERDAD. Recoger todo identificador que hubiera debajo de un
+       * `await` o de un `return` daba por disparada la consulta con un `await
+       * console.debug(pendiente)`: ahí el `await` espera lo que devuelve `console.debug`
+       * —`undefined`—, la consulta perezosa no sale nunca, y borrar la escritura de verdad
+       * dejaba la invariante en verde. Se recoge sólo el valor que LLEGA al `await` o al
+       * `return`, atravesando lo que no lo consume —paréntesis, `as`, `!`— y el
+       * `Promise.all([…])` de las que se esperan juntas, que sí las dispara todas.
+       *
+       * El límite, dicho: pasar la consulta a otra función que la espere —`await
+       * ejecutar(pendiente)`— se lee como no consumida. Medido, hoy ninguna de las nueve
+       * secuencias lo hace, y ese fallo sale ROJO nombrando la escritura que falta: pide una
+       * decisión en vez de tranquilizar.
+       */
+      const esperaConjunta = (x: ts.CallExpression): boolean =>
+        ts.isPropertyAccessExpression(x.expression) &&
+        ts.isIdentifier(x.expression.expression) &&
+        x.expression.expression.text === 'Promise' &&
+        ['all', 'allSettled', 'race', 'any'].includes(x.expression.name.text);
+      const valorConsumido = (
+        e: ts.Expression | undefined,
+        set: Set<string>,
+        enLista = false,
+      ): void => {
+        if (e === undefined) return;
+        let x: ts.Expression = e;
+        while (
+          ts.isParenthesizedExpression(x) ||
+          ts.isAsExpression(x) ||
+          ts.isNonNullExpression(x)
+        ) {
+          x = x.expression;
+        }
+        if (ts.isIdentifier(x)) {
+          set.add(x.text);
+          return;
+        }
+        if (ts.isAwaitExpression(x)) {
+          valorConsumido(x.expression, set);
+          return;
+        }
+        if (ts.isCallExpression(x) && esperaConjunta(x)) {
+          for (const a of x.arguments) valorConsumido(a, set, true);
+          return;
+        }
+        // Una lista sólo entrega sus elementos DENTRO de esa espera conjunta: un `return [q]`
+        // devuelve la consulta sin ejecutar, y contarlo sería el mismo agujero otra vez.
+        if (enLista && ts.isArrayLiteralExpression(x)) {
+          for (const el of x.elements) valorConsumido(el, set, true);
+        }
+      };
       const consumidosEn = new Map<ts.Node, Set<string>>();
       const juntarConsumidos = (y: ts.Node): void => {
         if (ts.isAwaitExpression(y) || ts.isReturnStatement(y)) {
           const suya = funcionDe(y);
           const set = consumidosEn.get(suya) ?? new Set<string>();
-          const dentro = (z: ts.Node): void => {
-            if (z !== y && ts.isFunctionLike(z)) return;
-            if (ts.isIdentifier(z)) set.add(z.text);
-            ts.forEachChild(z, dentro);
-          };
-          dentro(y);
+          valorConsumido(y.expression, set);
           consumidosEn.set(suya, set);
         }
         ts.forEachChild(y, juntarConsumidos);
@@ -523,7 +631,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const t = x.template;
         const etiqueta = x.tag.getText();
         if (ts.isNoSubstitutionTemplateLiteral(t)) {
-          trozos.push({ sql: soloSql(t.text), campos: [], etiqueta });
+          trozos.push({ sql: soloSql(t.text), campos: [], etiqueta, tag: x.tag });
           return;
         }
         /*
@@ -544,7 +652,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         t.templateSpans.forEach((sp, k) => {
           sql += testigo(k) + sp.literal.text;
         });
-        trozos.push({ sql: soloSql(sql), campos, etiqueta });
+        trozos.push({ sql: soloSql(sql), campos, etiqueta, tag: x.tag });
       });
       return trozos;
     };
@@ -884,15 +992,166 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return columnas;
     };
 
-    /** Las escrituras «verbo tabla» alcanzables desde una función, con las columnas de cada una. */
-    type Escritura = { columnas: Map<string, Set<string>>; filtro: Map<string, Set<string>> };
-    type Alcance = { escrituras: Map<string, Escritura>; modulos: Set<string> };
+    /*
+     * DE DÓNDE SALE LA ETIQUETA, resuelta hasta el cliente de postgres.js.
+     *
+     * El sufijo del texto no es una ligadura: `logger.sql\`…\`` acaba en `sql`, y un `const sql
+     * = (x: TemplateStringsArray) => …` declarado dentro de la propia función tapa al importado
+     * sin cambiar una letra del sitio donde se usa. En los dos casos, borrar la consulta de
+     * verdad y dejar el formateador mantenía la invariante en verde.
+     *
+     * Las TRES formas que este repositorio tiene de sostener el cliente, resueltas por su
+     * ligadura y ninguna más:
+     *   · un parámetro TIPADO con el tipo del driver —`tx: TransactionSql`—, que es como se
+     *     pasa la transacción de una función a otra;
+     *   · un parámetro SIN tipo que entrega quien recibe la función —`conUsuario(actorId,
+     *     async (tx) => …)`, que es el único camino legítimo a la base de este repositorio—;
+     *   · `sql()` y `sqlAdmin()`, las dos fábricas de `db.ts`, llamadas en el sitio o guardadas
+     *     antes en una constante.
+     *
+     * Los dos módulos que esto ancla se comprueban: si se renombran, el censo se cae en vez de
+     * dejar de mirar en silencio.
+     */
+    const BASE = `${raiz}/src/lib/db.ts`;
+    expect(existsSync(BASE), `el módulo de la base no está en ${BASE}`).toBe(true);
+    const CLIENTES_DE_LA_BASE = ['sql', 'sqlAdmin'];
+    const ENTREGA_LA_TRANSACCION = 'conUsuario';
+
+    /** Los nombres que un módulo trae del DRIVER: de ahí sale el tipo del cliente. */
+    const tiposDelDriver = (arbol: ts.SourceFile): Set<string> => {
+      const nombres = new Set<string>();
+      for (const st of arbol.statements) {
+        if (!ts.isImportDeclaration(st)) continue;
+        if ((st.moduleSpecifier as ts.StringLiteral).text !== 'postgres') continue;
+        const b = st.importClause?.namedBindings;
+        if (b && ts.isNamedImports(b)) for (const e of b.elements) nombres.add(e.name.text);
+      }
+      return nombres;
+    };
+
+    /** El nombre con el que `db.ts` declara lo que un módulo importa, o nada si no viene de ahí. */
+    const vieneDeLaBase = (f: string, nombre: string): string | null => {
+      let modulo = f;
+      let actual = nombre;
+      for (let i = 0; i < 8; i += 1) {
+        if (modulo === BASE) return actual;
+        const arbol = leer(modulo);
+        const via = importesDe(arbol, modulo).get(actual);
+        if (via) {
+          modulo = via.modulo;
+          actual = via.original;
+          continue;
+        }
+        const salto = reexportDe(arbol, modulo, actual);
+        if (!salto) return null;
+        modulo = salto.modulo;
+        actual = salto.original;
+      }
+      return null;
+    };
+
+    /** La ligadura LÉXICA de un nombre en el sitio donde se usa: parámetro o variable. */
+    const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
+      let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
+      while (a !== undefined) {
+        if (ts.isFunctionLike(a)) {
+          for (const p of a.parameters) {
+            if (ts.isIdentifier(p.name) && p.name.text === nombre) return p;
+          }
+        }
+        if (ts.isBlock(a) || ts.isSourceFile(a)) {
+          for (const st of a.statements) {
+            if (!ts.isVariableStatement(st)) continue;
+            for (const d of st.declarationList.declarations) {
+              if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+            }
+          }
+        }
+        a = a.parent as ts.Node | undefined;
+      }
+      return null;
+    };
+
+    /** `sql` / `sqlAdmin` de `db.ts`: la FÁBRICA del cliente, que todavía hay que llamar. */
+    const esFabricaDeCliente = (e: ts.Expression, f: string): boolean => {
+      if (ts.isIdentifier(e)) {
+        // Una ligadura local TAPA al import: ahí ya no se sabe qué es.
+        if (ligaduraDe(e, e.text) !== null) return false;
+        const original = vieneDeLaBase(f, e.text);
+        return original !== null && CLIENTES_DE_LA_BASE.includes(original);
+      }
+      if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression)) {
+        const via = importesDe(leer(f), f).get(e.expression.text);
+        return (
+          via !== undefined &&
+          via.modulo === BASE &&
+          via.original === '*' &&
+          CLIENTES_DE_LA_BASE.includes(e.name.text)
+        );
+      }
+      return false;
+    };
+
+    /** Un parámetro que sostiene la transacción: por su TIPO, o por quien entrega la función. */
+    const esParametroDeLaBase = (p: ts.ParameterDeclaration, f: string): boolean => {
+      if (p.type) {
+        return (
+          ts.isTypeReferenceNode(p.type) &&
+          ts.isIdentifier(p.type.typeName) &&
+          tiposDelDriver(leer(f)).has(p.type.typeName.text)
+        );
+      }
+      const fn = p.parent as ts.Node;
+      if (!ts.isFunctionLike(fn)) return false;
+      const llamada = fn.parent as ts.Node | undefined;
+      if (llamada === undefined || !ts.isCallExpression(llamada)) return false;
+      if (llamada.arguments.indexOf(fn as unknown as ts.Expression) !== 1) return false;
+      if (fn.parameters.indexOf(p) !== 0) return false;
+      const quien = llamada.expression;
+      if (!ts.isIdentifier(quien) || ligaduraDe(quien, quien.text) !== null) return false;
+      return vieneDeLaBase(f, quien.text) === ENTREGA_LA_TRANSACCION;
+    };
+
+    /** Y la etiqueta entera: lo que de verdad manda la sentencia a la base. */
+    const esCliente = (e: ts.Expression, f: string, hondo = 0): boolean => {
+      if (hondo > 8) return false;
+      let x: ts.Expression = e;
+      while (
+        ts.isParenthesizedExpression(x) ||
+        ts.isAsExpression(x) ||
+        ts.isNonNullExpression(x)
+      ) {
+        x = x.expression;
+      }
+      if (ts.isCallExpression(x)) return esFabricaDeCliente(x.expression, f);
+      if (!ts.isIdentifier(x)) return false;
+      const liga = ligaduraDe(x, x.text);
+      // Sin ligadura local sólo puede ser un import, y lo que `db.ts` exporta es la fábrica.
+      if (liga === null) return false;
+      if (ts.isParameter(liga)) return esParametroDeLaBase(liga, f);
+      if (ts.isVariableDeclaration(liga) && liga.initializer) {
+        return esCliente(liga.initializer, f, hondo + 1);
+      }
+      return false;
+    };
+
+    /**
+     * Las escrituras «verbo tabla» alcanzables desde una función: UNA ENTRADA POR SENTENCIA.
+     *
+     * Juntar en una sola bolsa las columnas y los filtros de todas las sentencias que tocan la
+     * misma tabla borra a cuál pertenece cada predicado. Con dos `update outcome_review` —uno
+     * acotado sólo por `id` y otro sólo por `workspace_id`— la unión daba el mismo conjunto que
+     * la materialización, y el segundo actualizaba TODAS las reviews del workspace con el censo
+     * en verde. Cada sentencia se guarda entera y se compara entera.
+     */
+    type Sentencia = { columnas: Map<string, Set<string>>; filtro: Map<string, Set<string>> };
+    type Alcance = { escrituras: Map<string, Sentencia[]>; modulos: Set<string> };
     const cacheDeEscrituras = new Map<string, Alcance>();
     const alcanceDesde = (modulo: string, funcion: string): Alcance => {
       const memo = cacheDeEscrituras.get(`${modulo}#${funcion}`);
       if (memo) return memo;
       const modulos = new Set<string>();
-      const escrituras = new Map<string, Escritura>();
+      const escrituras = new Map<string, Sentencia[]>();
       const visto = new Set<string>();
       const cola = [{ modulo, funcion }];
       while (cola.length > 0) {
@@ -915,13 +1174,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           for (const m of consulta.sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
             const tabla = m[2]!;
             if (CONTABILIDAD_AI.includes(tabla)) continue;
-            if (!etiquetaDeBase(consulta.etiqueta)) {
+            if (!esCliente(consulta.tag, actual.modulo)) {
               etiquetasDesconocidas.add(consulta.etiqueta);
               continue;
             }
             const verbo = m[1]!.toLowerCase().replace(/\s+/g, ' ');
             const clave = `${verbo} ${tabla}`;
-            const y = escrituras.get(clave) ?? {
+            const y: Sentencia = {
               columnas: new Map<string, Set<string>>(),
               filtro: new Map<string, Set<string>>(),
             };
@@ -942,7 +1201,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               for (const n of consulta.campos[c.indice] ?? []) campos.add(n);
               y.filtro.set(clv, campos);
             }
-            escrituras.set(clave, y);
+            escrituras.set(clave, [...(escrituras.get(clave) ?? []), y]);
           }
         }
         const imports = importesDe(arbol, actual.modulo);
@@ -1055,7 +1314,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       cacheDeEscrituras.set(`${modulo}#${funcion}`, alcance);
       return alcance;
     };
-    const escriturasDesde = (modulo: string, funcion: string): Map<string, Escritura> =>
+    const escriturasDesde = (modulo: string, funcion: string): Map<string, Sentencia[]> =>
       alcanceDesde(modulo, funcion).escrituras;
 
     /*
@@ -1096,26 +1355,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       expect(exigido.size, `${cap}: el materializador no escribe nada, no hay qué exigir`).toBeGreaterThan(0);
 
       if (def.paridadManual.clase !== 'escritura') continue;
-      const cubierto = new Map<string, Escritura>();
+      // Las sentencias de todos los pasos, cada una entera: no se funden entre sí.
+      const cubierto = new Map<string, Sentencia[]>();
       for (const paso of def.paridadManual.pasos) {
         const m = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
         expect(m, `${cap}: el módulo ${paso.modulo} no existe`).not.toBeNull();
-        for (const [e, y] of escriturasDesde(m!, paso.funcion)) {
-          const acumulado = cubierto.get(e) ?? {
-            columnas: new Map<string, Set<string>>(),
-            filtro: new Map<string, Set<string>>(),
-          };
-          for (const [c, campos] of y.columnas) {
-            const junto = acumulado.columnas.get(c) ?? new Set<string>();
-            for (const n of campos) junto.add(n);
-            acumulado.columnas.set(c, junto);
-          }
-          for (const [c, campos] of y.filtro) {
-            const junto = acumulado.filtro.get(c) ?? new Set<string>();
-            for (const n of campos) junto.add(n);
-            acumulado.filtro.set(c, junto);
-          }
-          cubierto.set(e, acumulado);
+        for (const [e, lista] of escriturasDesde(m!, paso.funcion)) {
+          cubierto.set(e, [...(cubierto.get(e) ?? []), ...lista]);
         }
       }
       const secuencia = def.paridadManual.pasos.map((x) => x.funcion).join(' → ');
@@ -1134,73 +1380,107 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         `${cap}: la secuencia manual (${secuencia}) no cubre lo que ${suyos[0]} escribe`,
       ).toEqual([]);
 
-      const columnasQueFaltan = [...exigido]
-        .flatMap(([e, y]) =>
-          [...y.columnas.keys()]
-            .filter((c) => !cubierto.get(e)!.columnas.has(c))
-            .map((c) => `${e}.${c}`),
-        )
-        .sort();
-      expect(
-        columnasQueFaltan,
-        `${cap}: la secuencia manual (${secuencia}) toca las mismas tablas que ${suyos[0]} pero no escribe todo lo que él escribe`,
-      ).toEqual([]);
-
       /*
-       * Y de dónde SALE cada columna, no sólo cuál se escribe. Un intercambio entre dos campos
-       * de relato —`contribucion = ${entrada.aprendizajes}` y al revés— da el mismo conjunto de
-       * destinos y guarda el texto en el sitio equivocado. Se comparan los identificadores de la
-       * interpolación: basta con que compartan uno, porque el objeto que los lleva se llama
-       * distinto en cada capa (`c.` en la materialización, `entrada.` en la ruta manual) y lo
-       * que tiene que coincidir es el CAMPO. Si alguno de los dos lados no tiene identificadores
-       * —un valor calculado— no hay nada que comparar y se deja pasar.
+       * CADA SENTENCIA DE LA MATERIALIZACIÓN CONTRA UNA SENTENCIA MANUAL, entera.
+       *
+       * Antes se comparaban dos uniones —todas las columnas contra todas las columnas, todos los
+       * predicados contra todos los predicados—, y ahí se pierde a qué sentencia pertenece cada
+       * cosa: partir en dos `update outcome_review` lo que la materialización hace en uno, con
+       * un `where id` en el primero y un `where workspace_id` en el segundo, daba exactamente la
+       * misma unión. El segundo actualiza TODAS las reviews del workspace, y el censo lo daba
+       * por bueno.
+       *
+       * Se exige que ALGUNA sentencia manual cubra la de la materialización por completo: sus
+       * columnas, el campo del que sale cada una y su acotación. Si ninguna lo hace, se cuentan
+       * los reparos de la que MENOS le faltó, que es la que el mensaje debe describir.
+       *
+       * Basta con que exista una que la cubra —no se exige que sea una por una—: la ruta manual
+       * puede escribir de más, y agrupar en una sola sentencia lo que la materialización parte
+       * en dos sigue dejando la fila igual.
        */
-      const camposQueNoCasan = [...exigido]
-        .flatMap(([e, y]) =>
-          [...y.columnas]
-            .filter(([c, campos]) => {
-              const suyos = cubierto.get(e)!.columnas.get(c);
-              if (campos.size === 0 || suyos === undefined || suyos.size === 0) return false;
-              if ([...campos].some((n) => suyos.has(n))) return false;
-              /*
-               * Y si no coinciden, todavía vale que el campo de la ruta manual NOMBRE A SU
-               * COLUMNA: `reto_id` desde `entrada.retoId` es correcto aunque la materialización
-               * lo escriba desde `p.anclaId`, porque las dos capas nombran distinto el mismo
-               * dato. Medido: sin esta salvedad el censo declaraba rota C0, que en este eje está
-               * bien.
-               *
-               * La primera versión sólo acusaba si el campo aparecía en OTRA columna —o sea,
-               * sólo los intercambios—, y eso dejaba pasar una sustitución cualquiera:
-               * `contribucion = ${entrada.reviewId}` no comparte identificador con nada y se
-               * colaba. Comparar contra la columna cubre las dos cosas sin listar excepciones.
-               */
-              const pelado = (n: string): string => n.toLowerCase().replace(/_/g, '');
-              return ![...suyos].some((n) => pelado(n) === pelado(c));
-            })
-            .map(([c, campos]) => `${e}.${c} ← ${[...campos].sort().join('|')}`),
-        )
-        .sort();
+      const pelar = (n: string): string => n.toLowerCase().replace(/_/g, '');
+      const reparosDe = (
+        r: Sentencia,
+        x: Sentencia,
+        e: string,
+      ): { columnas: string[]; campos: string[]; filtros: string[] } => {
+        const columnas: string[] = [];
+        const campos: string[] = [];
+        const filtros: string[] = [];
+        for (const [c, suyos] of r.columnas) {
+          const mios = x.columnas.get(c);
+          if (mios === undefined) {
+            columnas.push(`${e}.${c}`);
+            continue;
+          }
+          /*
+           * Y de dónde SALE cada columna, no sólo cuál se escribe. Un intercambio entre dos
+           * campos de relato —`contribucion = ${'${entrada.aprendizajes}'}` y al revés— da el
+           * mismo conjunto de destinos y guarda el texto en el sitio equivocado. Basta con que
+           * compartan un identificador, porque el objeto que los lleva se llama distinto en cada
+           * capa (`c.` en la materialización, `entrada.` a mano) y lo que tiene que coincidir es
+           * el CAMPO. Si alguno de los dos lados no tiene identificadores —un valor calculado—
+           * no hay nada que comparar y se deja pasar.
+           *
+           * Y si no coinciden, todavía vale que el campo de la ruta manual NOMBRE A SU COLUMNA:
+           * `reto_id` desde `entrada.retoId` es correcto aunque la materialización lo escriba
+           * desde `p.anclaId`, porque las dos capas nombran distinto el mismo dato. Medido: sin
+           * esta salvedad el censo declaraba rota C0, que en este eje está bien. La primera
+           * versión sólo acusaba si el campo aparecía en OTRA columna —o sea, sólo los
+           * intercambios—, y eso dejaba pasar una sustitución cualquiera.
+           */
+          if (suyos.size === 0 || mios.size === 0) continue;
+          if ([...suyos].some((n) => mios.has(n))) continue;
+          if ([...mios].some((n) => pelar(n) === pelar(c))) continue;
+          campos.push(`${e}.${c} ← ${[...suyos].sort().join('|')}`);
+        }
+        for (const c of r.filtro.keys()) if (!x.filtro.has(c)) filtros.push(`${e} where ${c}`);
+        return { columnas, campos, filtros };
+      };
+
+      const columnasQueFaltan: string[] = [];
+      const camposQueNoCasan: string[] = [];
+      const filtrosQueFaltan: string[] = [];
+      for (const [e, exigidas] of exigido) {
+        const manuales = cubierto.get(e);
+        if (manuales === undefined) continue; // Ya lo dice `faltan`, y con mejor mensaje.
+        for (const r of exigidas) {
+          let cubre = false;
+          let peor: { columnas: string[]; campos: string[]; filtros: string[] } | null = null;
+          const cuantos = (y: { columnas: string[]; campos: string[]; filtros: string[] }): number =>
+            y.columnas.length + y.campos.length + y.filtros.length;
+          for (const x of manuales) {
+            const rp = reparosDe(r, x, e);
+            if (cuantos(rp) === 0) {
+              cubre = true;
+              break;
+            }
+            if (peor === null || cuantos(rp) < cuantos(peor)) peor = rp;
+          }
+          if (cubre || peor === null) continue;
+          columnasQueFaltan.push(...peor.columnas);
+          camposQueNoCasan.push(...peor.campos);
+          filtrosQueFaltan.push(...peor.filtros);
+        }
+      }
       expect(
-        camposQueNoCasan,
+        [...new Set(columnasQueFaltan)].sort(),
+        `${cap}: la secuencia manual (${secuencia}) toca las mismas tablas que ${suyos[0]} pero no escribe todo lo que él escribe en una misma sentencia`,
+      ).toEqual([]);
+      expect(
+        [...new Set(camposQueNoCasan)].sort(),
         `${cap}: la secuencia manual (${secuencia}) escribe las mismas columnas que ${suyos[0]} pero no desde los mismos campos`,
       ).toEqual([]);
-
-      const filtrosQueFaltan = [...exigido]
-        .flatMap(([e, y]) =>
-          [...y.filtro.keys()]
-            .filter((c) => !cubierto.get(e)!.filtro.has(c))
-            .map((c) => `${e} where ${c}`),
-        )
-        .sort();
       expect(
-        filtrosQueFaltan,
-        `${cap}: la secuencia manual (${secuencia}) escribe lo mismo que ${suyos[0]} pero no acota la fila igual`,
+        [...new Set(filtrosQueFaltan)].sort(),
+        `${cap}: la secuencia manual (${secuencia}) escribe lo mismo que ${suyos[0]} pero no acota la fila igual en la misma sentencia`,
       ).toEqual([]);
 
       /*
        * Y UN OPERANDO QUE NOMBRA A OTRA COLUMNA DEL MISMO FILTRO es un intercambio:
-       * `where id = ${entrada.workspaceId} and workspace_id = ${entrada.reviewId}` acota por los
-       * valores cruzados y da el mismo conjunto que lo correcto.
+       * `where id = ${'${entrada.workspaceId}'} and workspace_id = ${'${entrada.reviewId}'}`
+       * acota por los valores cruzados y da el mismo conjunto que lo correcto. Se mira DENTRO DE
+       * CADA SENTENCIA, que es donde el cruce ocurre.
        *
        * No se compara el campo contra el de la materialización, y esto es una LIMITACIÓN medida,
        * no un olvido: C7 acota por `id` desde `p.anclaId` en la materialización y desde
@@ -1209,22 +1489,23 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * (`id` no se parece a ninguno de los dos). Exigir la coincidencia habría puesto en rojo
        * una ruta intacta.
        */
-      const pelar = (n: string): string => n.toLowerCase().replace(/_/g, '');
-      const columnasDelFiltro = new Set(
-        [...cubierto.values()].flatMap((y) => [...y.filtro.keys()].map((k) => pelar(k.split(' ')[0]!))),
-      );
       const operandosCruzados = [...cubierto]
-        .flatMap(([e, y]) =>
-          [...y.filtro].flatMap(([clv, campos]) => {
-            const col = clv.split(' ')[0]!;
-            return [...campos]
-              .filter((n) => pelar(n) !== pelar(col) && columnasDelFiltro.has(pelar(n)))
-              .map((n) => `${e} where ${col} ← ${n}`);
+        .flatMap(([e, lista]) =>
+          lista.flatMap((x) => {
+            const columnasDelFiltro = new Set(
+              [...x.filtro.keys()].map((k) => pelar(k.split(' ')[0]!)),
+            );
+            return [...x.filtro].flatMap(([clv, campos]) => {
+              const col = clv.split(' ')[0]!;
+              return [...campos]
+                .filter((n) => pelar(n) !== pelar(col) && columnasDelFiltro.has(pelar(n)))
+                .map((n) => `${e} where ${col} ← ${n}`);
+            });
           }),
         )
         .sort();
       expect(
-        operandosCruzados,
+        [...new Set(operandosCruzados)].sort(),
         `${cap}: la secuencia manual (${secuencia}) acota por un valor que nombra a otra columna del mismo filtro`,
       ).toEqual([]);
     }
@@ -1237,6 +1518,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     expect(
       [...etiquetasDesconocidas].sort(),
       'una plantilla escribe en la base con una etiqueta que este censo no reconoce: decide si cuenta',
+    ).toEqual([]);
+    expect(
+      [...callbacksSinInvocar].sort(),
+      'una función anónima con SQL dentro llega a alguien que este censo no sabe si la ejecuta: decide si cuenta',
     ).toEqual([]);
   });
 });

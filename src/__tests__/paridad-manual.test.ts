@@ -318,7 +318,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * Las plantillas anidadas dentro de un `${…}` se visitan por su cuenta al recorrer el árbol,
      * así que no se pierden.
      */
-    const TESTIGO = ' :interpolado ';
+    /**
+     * Cada `${…}` deja un testigo NUMERADO, y aparte se guardan los identificadores que hay
+     * dentro de él. Sin eso, la comparación por columnas sólo puede mirar el destino: un
+     * `contribucion = ${entrada.aprendizajes}` da el mismo conjunto de columnas que el correcto
+     * y guarda el relato en el campo equivocado con el censo en verde.
+     */
+    type Consulta = { sql: string; campos: string[][] };
+    const testigo = (k: number): string => ` :i${k} `;
 
     /**
      * EL RECORRIDO DE LO QUE SIGUE VIVO DENTRO DE UNA FUNCIÓN.
@@ -411,8 +418,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       ver(n);
     };
 
-    const sqlDe = (n: ts.Node): string[] => {
-      const trozos: string[] = [];
+    const sqlDe = (n: ts.Node): Consulta[] => {
+      const trozos: Consulta[] = [];
       recorrerVivo(n, (x) => {
         if (!ts.isTaggedTemplateExpression(x)) return;
         /*
@@ -438,10 +445,29 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         if (arriba !== undefined && ts.isExpressionStatement(arriba)) return;
         const t = x.template;
-        const literales = ts.isNoSubstitutionTemplateLiteral(t)
-          ? [t.text]
-          : [t.head.text, ...t.templateSpans.map((sp) => sp.literal.text)];
-        trozos.push(soloSql(literales.join(TESTIGO)));
+        if (ts.isNoSubstitutionTemplateLiteral(t)) {
+          trozos.push({ sql: soloSql(t.text), campos: [] });
+          return;
+        }
+        /*
+         * De cada interpolación se guarda su ÚLTIMO identificador, que es el campo: de
+         * `entrada.aprendizajes` sale `aprendizajes`, y el objeto que lo lleva —que se llama
+         * distinto en cada capa— se queda fuera.
+         */
+        const campos = t.templateSpans.map((sp) => {
+          const dentro: string[] = [];
+          const ver = (y: ts.Node): void => {
+            if (ts.isIdentifier(y)) dentro.push(y.text);
+            ts.forEachChild(y, ver);
+          };
+          ver(sp.expression);
+          return dentro.length > 0 ? [dentro[dentro.length - 1]!] : [];
+        });
+        let sql = t.head.text;
+        t.templateSpans.forEach((sp, k) => {
+          sql += testigo(k) + sp.literal.text;
+        });
+        trozos.push({ sql: soloSql(sql), campos });
       });
       return trozos;
     };
@@ -575,7 +601,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * que el esquema puede poner igual. Exigirla habría obligado a escribir a mano una constante
      * para poner verde un censo, que es la clase de arreglo que este PR existe para no hacer.
      */
-    const columnasTrasLaTabla = (sql: string, desde: number, verbo: string): string[] => {
+    const indicesEn = (t: string): number[] =>
+      [...t.matchAll(/:i(\d+)\b/g)].map((m) => Number(m[1]));
+
+    const columnasTrasLaTabla = (
+      sql: string,
+      desde: number,
+      verbo: string,
+    ): { columna: string; indices: number[] }[] => {
       const resto = sql.slice(desde);
       const partesDeNivelCero = (t: string): string[] => {
         const partes: string[] = [];
@@ -624,12 +657,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           .map((x) => x.trim().toLowerCase())
           .filter((x) => /^[a-z_][a-z0-9_]*$/.test(x));
         const values = /\bvalues\s*\(/i.exec(resto);
-        if (!values) return columnas; // `insert … select …`: sin pareja, se exigen todas.
+        // `insert … select …`: sin pareja, se exigen todas y sin campo con el que comparar.
+        if (!values) return columnas.map((c) => ({ columna: c, indices: [] }));
         const valores = grupo(resto, values.index + values[0].length - 1);
-        if (valores === null) return columnas;
+        if (valores === null) return columnas.map((c) => ({ columna: c, indices: [] }));
         const partes = partesDeNivelCero(valores);
-        if (partes.length !== columnas.length) return columnas;
-        return columnas.filter((_, i) => partes[i]!.includes(TESTIGO.trim()));
+        if (partes.length !== columnas.length) return columnas.map((c) => ({ columna: c, indices: [] }));
+        return columnas
+          .map((c, i) => ({ columna: c, indices: indicesEn(partes[i]!) }))
+          .filter((x) => x.indices.length > 0);
       }
       const set = /\bset\b/i.exec(resto);
       if (!set) return [];
@@ -660,9 +696,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       };
       const fin = finDeNivelCero(cuerpo);
       return partesDeNivelCero(fin >= 0 ? cuerpo.slice(0, fin) : cuerpo)
-        .filter((x) => x.includes(TESTIGO.trim()))
-        .map((x) => /^\s*([a-z_][a-z0-9_]*)\s*=/i.exec(x)?.[1]?.toLowerCase() ?? '')
-        .filter((x) => x !== '');
+        .map((x) => ({
+          columna: /^\s*([a-z_][a-z0-9_]*)\s*=/i.exec(x)?.[1]?.toLowerCase() ?? '',
+          indices: indicesEn(x),
+        }))
+        .filter((x) => x.columna !== '' && x.indices.length > 0);
     };
 
     /**
@@ -676,6 +714,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      *
      * Al menos, y no exactamente: acotar de más es asunto suyo; acotar de menos es escribir
      * donde la materialización no escribiría.
+     *
+     * Y sólo cuenta el predicado que ATA la fila a un valor de fuera. Aceptando cualquier
+     * operador, un `id is not null` registraba `id` y satisfacía el conjunto igual que
+     * `id = ${entrada.reviewId}` — o sea, se podían escribir todos los borradores del workspace
+     * con el censo en verde. Es la misma distinción que en las columnas: lo que viene de fuera.
      */
     const filtroTrasLaTabla = (sql: string, desde: number, verbo: string): string[] => {
       if (verbo !== 'update') return [];
@@ -718,7 +761,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         else if (c === ')') hondo2 -= 1;
         else if (hondo2 === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
           if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
-          const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b|\bis\b)/i.exec(cola.slice(i));
+          const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i\d+\b/i.exec(cola.slice(i));
           if (m) columnas.push(m[1]!.toLowerCase());
         }
       }
@@ -726,7 +769,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /** Las escrituras «verbo tabla» alcanzables desde una función, con las columnas de cada una. */
-    type Escritura = { columnas: Set<string>; filtro: Set<string> };
+    type Escritura = { columnas: Map<string, Set<string>>; filtro: Set<string> };
     const cacheDeEscrituras = new Map<string, Map<string, Escritura>>();
     const escriturasDesde = (modulo: string, funcion: string): Map<string, Escritura> => {
       const memo = cacheDeEscrituras.get(`${modulo}#${funcion}`);
@@ -749,16 +792,23 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           // venir de una librería—. No es un fallo: simplemente no hay por dónde seguir.
           continue;
         }
-        for (const sql of sqlDe(decl)) {
-          for (const m of sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
+        for (const consulta of sqlDe(decl)) {
+          for (const m of consulta.sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
             const tabla = m[2]!;
             if (CONTABILIDAD_AI.includes(tabla)) continue;
             const verbo = m[1]!.toLowerCase().replace(/\s+/g, ' ');
             const clave = `${verbo} ${tabla}`;
-            const y = escrituras.get(clave) ?? { columnas: new Set<string>(), filtro: new Set<string>() };
+            const y = escrituras.get(clave) ?? {
+              columnas: new Map<string, Set<string>>(),
+              filtro: new Set<string>(),
+            };
             const tras = m.index + m[0].length;
-            for (const c of columnasTrasLaTabla(sql, tras, verbo)) y.columnas.add(c);
-            for (const c of filtroTrasLaTabla(sql, tras, verbo)) y.filtro.add(c);
+            for (const c of columnasTrasLaTabla(consulta.sql, tras, verbo)) {
+              const campos = y.columnas.get(c.columna) ?? new Set<string>();
+              for (const i of c.indices) for (const n of consulta.campos[i] ?? []) campos.add(n);
+              y.columnas.set(c.columna, campos);
+            }
+            for (const c of filtroTrasLaTabla(consulta.sql, tras, verbo)) y.filtro.add(c);
             escrituras.set(clave, y);
           }
         }
@@ -842,8 +892,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const m = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
         expect(m, `${cap}: el módulo ${paso.modulo} no existe`).not.toBeNull();
         for (const [e, y] of escriturasDesde(m!, paso.funcion)) {
-          const acumulado = cubierto.get(e) ?? { columnas: new Set<string>(), filtro: new Set<string>() };
-          for (const c of y.columnas) acumulado.columnas.add(c);
+          const acumulado = cubierto.get(e) ?? {
+            columnas: new Map<string, Set<string>>(),
+            filtro: new Set<string>(),
+          };
+          for (const [c, campos] of y.columnas) {
+            const junto = acumulado.columnas.get(c) ?? new Set<string>();
+            for (const n of campos) junto.add(n);
+            acumulado.columnas.set(c, junto);
+          }
           for (const c of y.filtro) acumulado.filtro.add(c);
           cubierto.set(e, acumulado);
         }
@@ -857,12 +914,50 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
 
       const columnasQueFaltan = [...exigido]
         .flatMap(([e, y]) =>
-          [...y.columnas].filter((c) => !cubierto.get(e)!.columnas.has(c)).map((c) => `${e}.${c}`),
+          [...y.columnas.keys()]
+            .filter((c) => !cubierto.get(e)!.columnas.has(c))
+            .map((c) => `${e}.${c}`),
         )
         .sort();
       expect(
         columnasQueFaltan,
         `${cap}: la secuencia manual (${secuencia}) toca las mismas tablas que ${suyos[0]} pero no escribe todo lo que él escribe`,
+      ).toEqual([]);
+
+      /*
+       * Y de dónde SALE cada columna, no sólo cuál se escribe. Un intercambio entre dos campos
+       * de relato —`contribucion = ${entrada.aprendizajes}` y al revés— da el mismo conjunto de
+       * destinos y guarda el texto en el sitio equivocado. Se comparan los identificadores de la
+       * interpolación: basta con que compartan uno, porque el objeto que los lleva se llama
+       * distinto en cada capa (`c.` en la materialización, `entrada.` en la ruta manual) y lo
+       * que tiene que coincidir es el CAMPO. Si alguno de los dos lados no tiene identificadores
+       * —un valor calculado— no hay nada que comparar y se deja pasar.
+       */
+      const camposQueNoCasan = [...exigido]
+        .flatMap(([e, y]) =>
+          [...y.columnas]
+            .filter(([c, campos]) => {
+              const suyos = cubierto.get(e)!.columnas.get(c);
+              if (campos.size === 0 || suyos === undefined || suyos.size === 0) return false;
+              if ([...campos].some((n) => suyos.has(n))) return false;
+              /*
+               * Y sólo se acusa si ese campo aparece en OTRA columna de la misma escritura: eso
+               * es un intercambio, y es lo que hay que cazar. Que las dos capas nombren distinto
+               * un mismo dato NO lo es — medido: C0 escribe `reto_id` desde `p.anclaId` en la
+               * materialización y desde `entrada.retoId` a mano, y ahí no hay nada roto. Sin
+               * esta condición, el censo declaraba rota la única capacidad que ya sabíamos que
+               * está bien en este eje.
+               */
+              return [...cubierto.get(e)!.columnas].some(
+                ([otra, ajenos]) => otra !== c && [...campos].some((n) => ajenos.has(n)),
+              );
+            })
+            .map(([c, campos]) => `${e}.${c} ← ${[...campos].sort().join('|')}`),
+        )
+        .sort();
+      expect(
+        camposQueNoCasan,
+        `${cap}: la secuencia manual (${secuencia}) escribe las mismas columnas que ${suyos[0]} pero no desde los mismos campos`,
       ).toEqual([]);
 
       const filtrosQueFaltan = [...exigido]

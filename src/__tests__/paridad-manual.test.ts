@@ -281,11 +281,46 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      *
      * Las plantillas anidadas dentro de un `${…}` se visitan por su cuenta al recorrer el árbol,
      * así que no se pierden.
+     *
+     * Y NO SE BAJA a un ayudante anidado con NOMBRE al que ya no llama nadie. El descenso era
+     * incondicional, así que dejar `const persistir = () => tx\`…\`` declarado y quitar su
+     * llamada mantenía la escritura contada — la operación desaparecida y el censo en verde.
+     * Se mira si el nombre aparece en algún otro sitio del cuerpo: sólo se baja si sí.
+     *
+     * A las funciones anidadas SIN nombre sí se baja siempre, y no es una excepción de
+     * conveniencia: son las que van como argumento —`conUsuario(actorId, async (tx) => …)`,
+     * que es como escribe casi todo este repositorio—, y ésas las llama quien las recibe.
+     * Excluirlas dejaría ciego el censo entero, que es lo contrario de lo que se busca.
      */
     const TESTIGO = ' :interpolado ';
     const sqlDe = (n: ts.Node): string[] => {
+      const usos = new Map<string, number>();
+      const contar = (x: ts.Node): void => {
+        if (ts.isIdentifier(x)) usos.set(x.text, (usos.get(x.text) ?? 0) + 1);
+        ts.forEachChild(x, contar);
+      };
+      contar(n);
+      /** El nombre con el que se declara una función anidada, si lo tiene. */
+      const nombreDe = (x: ts.Node): string | null => {
+        if (ts.isFunctionDeclaration(x)) return x.name?.text ?? null;
+        const padre = x.parent as ts.Node | undefined;
+        if (
+          padre &&
+          ts.isVariableDeclaration(padre) &&
+          padre.initializer === x &&
+          ts.isIdentifier(padre.name)
+        ) {
+          return padre.name.text;
+        }
+        return null;
+      };
       const trozos: string[] = [];
       const ver = (x: ts.Node): void => {
+        if (x !== n && ts.isFunctionLike(x)) {
+          const nombre = nombreDe(x);
+          // Su propia declaración ya cuenta una vez: hace falta OTRA aparición para estar viva.
+          if (nombre !== null && (usos.get(nombre) ?? 0) < 2) return;
+        }
         if (ts.isTaggedTemplateExpression(x)) {
           const t = x.template;
           const literales = ts.isNoSubstitutionTemplateLiteral(t)
@@ -300,7 +335,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /**
-     * A dónde manda un módulo que RE-EXPORTA el nombre buscado, con nombre o con comodín.
+     * A dónde manda un módulo que RE-EXPORTA el nombre buscado: con nombre, con comodín o
+     * renombrando algo suyo.
      *
      * Sin esto, un barrel legítimo rompía el recorrido: se sembraba el nombre en el barrel,
      * `funcionesDe` no encontraba allí ninguna declaración y el censo concluía que la secuencia
@@ -323,17 +359,32 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     ): { modulo: string; original: string } | null => {
       const comodines: string[] = [];
       for (const st of arbol.statements) {
-        if (!ts.isExportDeclaration(st) || !st.moduleSpecifier) continue;
-        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
-        if (!destino) continue;
-        if (!st.exportClause) {
-          comodines.push(destino);
+        if (!ts.isExportDeclaration(st)) continue;
+        if (!st.exportClause || !ts.isNamedExports(st.exportClause)) {
+          if (st.moduleSpecifier && !st.exportClause) {
+            const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+            if (destino) comodines.push(destino);
+          }
           continue;
         }
-        if (!ts.isNamedExports(st.exportClause)) continue;
         for (const e of st.exportClause.elements) {
           if (e.name.text !== nombre) continue;
-          return { modulo: destino, original: (e.propertyName ?? e.name).text };
+          const local = (e.propertyName ?? e.name).text;
+          if (st.moduleSpecifier) {
+            const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+            if (destino) return { modulo: destino, original: local };
+            continue;
+          }
+          /*
+           * `export { implementar as puerta }` SIN `from`: el símbolo es de este módulo, o algo
+           * que este módulo importó. La sonda de existencia ya acepta el nombre de salida, así
+           * que sin resolver el de entrada el recorrido no encontraba declaración y rechazaba
+           * una ruta manual intacta — el mismo desacuerdo entre las dos mitades que ya costó
+           * los alias y los comodines.
+           */
+          const importado = importesDe(arbol, f).get(local);
+          if (importado) return { modulo: importado.modulo, original: importado.original };
+          if (funcionesDe(arbol).has(local)) return { modulo: f, original: local };
         }
       }
       for (const destino of comodines) {

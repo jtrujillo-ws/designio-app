@@ -187,6 +187,19 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
    * fichero ha tenido una misma pregunta en dos sitios, la ronda siguiente ha traído el sitio
    * que no actualicé.
    */
+  /**
+   * Una sentencia que corta el flujo en seco: lo que venga DETRÁS, en su misma lista, no corre.
+   *
+   * Deliberadamente sólo el nivel de la lista: un `return` dentro de un `if` no mata a los
+   * hermanos del `if`, y adivinar eso ya sería análisis de flujo de verdad. Aquí sólo se lee
+   * lo que es indiscutible.
+   */
+  const salidaSeca = (st: ts.Statement): boolean =>
+    ts.isReturnStatement(st) ||
+    ts.isThrowStatement(st) ||
+    ts.isBreakStatement(st) ||
+    ts.isContinueStatement(st);
+
   const sentenciasDelAmbito = (n: ts.Node): readonly ts.Statement[] | null => {
     if (ts.isSourceFile(n) || ts.isBlock(n) || ts.isModuleBlock(n)) return n.statements;
     if (ts.isCaseBlock(n)) return n.clauses.flatMap((c) => [...c.statements]);
@@ -413,6 +426,19 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * verde. La misma copia sin actualizar de siempre, un tipo de sentencia más allá.
            */
           if (ts.isClassDeclaration(st) && st.name?.text === nombre) return st;
+          /*
+           * Y UN `namespace` TAMBIÉN DECLARA UN NOMBRE DE VALOR. Un `namespace metodo` anidado
+           * tapa a un `import * as metodo` de arriba, y `metodo.definirCriterio()` va al
+           * anidado; se le acreditaba al import. Sólo con nombre de identificador: un
+           * `declare module 'x'` lleva literal de cadena y no liga nada local.
+           */
+          if (
+            ts.isModuleDeclaration(st) &&
+            ts.isIdentifier(st.name) &&
+            st.name.text === nombre
+          ) {
+            return st;
+          }
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
             if (ligaEsteNombre(d.name, nombre)) return d;
@@ -715,6 +741,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * también vive arriba y la leen las dos.
          */
         const muertas = ramaMuerta(x);
+        /*
+         * Y LO QUE VA DETRÁS DE UN `return`/`throw`/`break`/`continue` TAMPOCO SE EJECUTA.
+         * Este descenso no miraba el orden de las sentencias, así que dejar la única llamada
+         * —o la única escritura— después de un `return` seco la seguía acreditando.
+         *
+         * La excepción, que es lo que impide que esto se vuelva un rechazo falso: una
+         * `function` declarada después SIGUE SIENDO LLAMABLE desde antes, porque se iza. Se
+         * visita igual. Una `class` no: su ligadura nunca llega a inicializarse.
+         */
+        const lista =
+          ts.isBlock(x) || ts.isSourceFile(x) || ts.isModuleBlock(x) ? x.statements : null;
+        if (lista !== null) {
+          let tras = false;
+          for (const st of lista) {
+            if ((!tras || ts.isFunctionDeclaration(st)) && !muertas.includes(st)) ver(st);
+            if (salidaSeca(st)) tras = true;
+          }
+          return;
+        }
         ts.forEachChild(x, (y) => {
           if (!muertas.includes(y)) ver(y);
         });
@@ -1603,6 +1648,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         visitar(x);
         const muertas = ramaMuerta(x);
+        /*
+         * Y LO QUE VA DETRÁS DE UN `return`/`throw`/`break`/`continue` TAMPOCO SE EJECUTA.
+         * Este descenso no miraba el orden de las sentencias, así que dejar la única llamada
+         * —o la única escritura— después de un `return` seco la seguía acreditando.
+         *
+         * La excepción, que es lo que impide que esto se vuelva un rechazo falso: una
+         * `function` declarada después SIGUE SIENDO LLAMABLE desde antes, porque se iza. Se
+         * visita igual. Una `class` no: su ligadura nunca llega a inicializarse.
+         */
+        const lista =
+          ts.isBlock(x) || ts.isSourceFile(x) || ts.isModuleBlock(x) ? x.statements : null;
+        if (lista !== null) {
+          let tras = false;
+          for (const st of lista) {
+            if ((!tras || ts.isFunctionDeclaration(st)) && !muertas.includes(st)) ver(st);
+            if (salidaSeca(st)) tras = true;
+          }
+          return;
+        }
         ts.forEachChild(x, (y) => {
           if (!muertas.includes(y)) ver(y);
         });

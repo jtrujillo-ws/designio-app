@@ -196,6 +196,16 @@ export type ProyectoMetodo = {
     titulo: string;
     estado: string;
     criterios: CriterioDeReto[];
+    /**
+     * Si el reto ya no admite tocar sus criterios, contestado por la BASE.
+     *
+     * No es un espejo: `reto_criterios_congelados` son DOS condiciones —el G0 que certificó
+     * estos criterios y el Metric Registry firmado— y la segunda no se puede deducir de nada
+     * que esta pantalla traiga. Un espejo cliente habría ofrecido el formulario a un reto con
+     * el registry firmado para que la política lo rechazara. Lo IMPONE la política y lo
+     * ANTICIPA esto, y los dos llaman a la misma función.
+     */
+    criteriosCongelados: boolean;
   };
   etapas: EtapaDeProyecto[];
   gates: GateDeProyecto[];
@@ -262,4 +272,66 @@ export function faltaParaAprobarGate(
     falta.push('El proyecto no está activo: retómalo antes, porque aprobar el plan lo pone en implementación (§7)');
   }
   return falta;
+}
+
+/**
+ * Qué le falta a UN criterio para que G0 pueda aprobarse (SYS-22).
+ *
+ * Vivía dentro de la pantalla del proyecto como un `criteriosCompletos` privado que solo
+ * sabía decir sí o no, y por el mismo motivo que `faltaParaAprobarGate`: lo que la pantalla
+ * decide a mano es lo que ningún test alcanza. En cuanto los criterios se pueden escribir a
+ * mano hacen falta las DOS lecturas —la etiqueta de G0, que pregunta por el reto entero, y el
+ * reparo de cada fila, que es lo que dice al que rellena qué le queda—, así que se contesta
+ * una vez aquí y de aquí salen las dos.
+ *
+ * Espeja el predicado de `gate_aprobar_suficiencia_guard`: la exigencia real vive en el
+ * servidor y en la política, y esto solo la dice ANTES para que nadie llegue a G0 y descubra
+ * allí que su criterio no servía.
+ */
+export function faltaEnCriterio(c: CriterioDeReto): string[] {
+  const falta: string[] = [];
+  if (c.kpi.trim() === '') falta.push('el KPI');
+  if (c.definicion.trim() === '') falta.push('la definición');
+  if (c.objetivo.trim() === '') falta.push('el objetivo');
+  if (c.ventanaDias === null) falta.push('la ventana de medición');
+  // La línea base se acredita de DOS formas y basta una: un valor CON su fecha, o un plan
+  // para registrarla (SYS-22). Un valor sin fecha no es ninguna de las dos.
+  const conValor = (c.lineaBaseValor ?? '').trim() !== '' && c.lineaBaseFecha !== null;
+  if (!conValor && c.lineaBasePlan.trim() === '') {
+    falta.push('la línea base: un valor con su fecha, o un plan para registrarla');
+  }
+  return falta;
+}
+
+/** Y el reto entero: sin criterios, o con uno incompleto, G0 no se aprueba. */
+export function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
+  return criterios.length > 0 && criterios.every((c) => faltaEnCriterio(c).length === 0);
+}
+
+/** Los roles que las políticas `criterio_insert` y `criterio_update` aceptan. */
+export const ROLES_DEFINEN_CRITERIOS = ['lead-boutique', 'disenador'];
+
+/**
+ * Por qué NO se pueden definir ni editar criterios ahora, o `null` si sí se puede.
+ *
+ * Espeja las DOS superficies que rechazan esta escritura, que es la lección repetida de este
+ * repositorio: la política —`workspace_role(…) in ('lead-boutique', 'disenador')`— y
+ * `reto_criterios_congelados`, que cierra la puerta cuando el G0 certifica los criterios o
+ * cuando el Metric Registry se firma. Ofrecer el formulario sin mirar las dos sería prometer
+ * un envío que la base ya negó, y esconderlo de más dejaría a un reto sin forma de aprobar G0.
+ *
+ * El motivo se DICE, no se deja descubrir por el error del servidor: un botón que no está y
+ * no explica por qué es un callejón mudo.
+ */
+export function motivoParaNoDefinirCriterios(contexto: {
+  rol: string;
+  criteriosCongelados: boolean;
+}): string | null {
+  if (!ROLES_DEFINEN_CRITERIOS.includes(contexto.rol)) {
+    return 'Los criterios de éxito los define el lead de boutique o quien diseña';
+  }
+  if (contexto.criteriosCongelados) {
+    return 'Los criterios están congelados: el G0 del reto ya fue aprobado o su Metric Registry ya está firmado';
+  }
+  return null;
 }

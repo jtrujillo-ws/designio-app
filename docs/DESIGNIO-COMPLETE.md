@@ -439,7 +439,7 @@ aceptar una propuesta, `ai.servicio.ts` inserta directamente en `evidencia` y `d
 `hallazgo_simulado_evidencia` y `pregunta_de_test` (C4, por `escribirRevisionSimulada`), y actualiza
 `outcome_review` (C7); todos los servicios insertan en `evento_dominio`; y las proyecciones
 (Aprobaciones, Biblioteca, la exportación bajo RLS) leen lo que otros poseen. En **tiempo de
-ejecución** hay seis dependencias entre módulos de dominio: `ai` llama a `bloquearReto` de `metodo`,
+ejecución** hay seis dependencias por **llamada a función** entre módulos de dominio: `ai` llama a `bloquearReto` de `metodo`,
 a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`, y a
 `patronDeBusqueda` de `busqueda` (una función exportada desde su archivo de esquemas, con la que el
 panel filtra propuestas por texto: cambiar el escapado de la búsqueda cambia ese filtro); `metodo`
@@ -456,7 +456,12 @@ viajan entre módulos como comportamiento, no solo como tipo: `ROLES_CURADORES` 
 ve cada rol y con qué rótulo, y `ROLES_OBSERVABILIDAD_AI` y `ROLES_INFORME_GROUNDING` (definidas en
 `ai.roles.ts`, un módulo sin Zod, como alias de `ROLES_AUDITORIA`) deciden en `loop` quién ve la
 operación de la capa AI y el informe de grounding: desde #52 un censo del grafo de módulos impide que
-el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`.
+el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`. Y los **contratos de salida de la AI**
+dependen de contratos de otros módulos: `ai.contenido` valida las respuestas del proveedor con
+`FechaCalendarioSchema` de `evidencia` (la fecha de una evidencia propuesta por CI), `CODIGOS_SENAL`
+de `journey` (las señales que C5 puede nombrar), `TOPE_NARRATIVA` de `medicion` (los textos de C7) y
+`MAX_PREGUNTA` y `MAX_RAZON` de `servicio` (las HMW de C3), así que cambiar uno de esos límites
+cambia qué respuestas acepta la capa AI.
 Cambiar una de esas listas cambia esos módulos. El resto de esquemas
 Zod y tipos se importan libremente entre módulos como contratos compartidos. El detalle de tablas por
 contexto está en `21` y el de la capa AI en `22`.
@@ -1672,8 +1677,10 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
    deben devolver una foto coherente (exportación, panel de disposición, auditoría, árbol, resumen
    del loop, aprobaciones, memoria, segmentos, bandeja de importación, evidencia con derechos,
    panel de propuestas AI, operación de la capa AI (`observabilidadAI`, para que los agregados de
-   `llamada_ai` y `propuesta_ai` salgan del mismo snapshot), membresías y el diagnóstico de «qué
-   falta para el post mortem» al abrir el outcome review)
+   `llamada_ai` y `propuesta_ai` salgan del mismo snapshot), la corrida y el informe de grounding
+   (`correrEvalDeGrounding` compone sus cuatro métricas sobre una misma foto antes de escribirlas, e
+   `informeDeGrounding` lee las corridas elegidas y sus mediciones en varias sentencias), membresías
+   y el diagnóstico de «qué falta para el post mortem» al abrir el outcome review)
    abren la transacción en `repeatable read`; una proyección que cabe en **una sola sentencia**
    (por ejemplo, el seguimiento de impacto de la medición) ya obtiene su foto coherente del
    snapshot de esa sentencia y corre en `read committed`; las **escrituras** de dominio

@@ -6,7 +6,7 @@ language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta c1e8a6b, 2026-09-07). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 9867bf9, 2026-09-07). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,7 +17,7 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-07, punta `c1e8a6b`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-07, punta `9867bf9`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
 > [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
@@ -27,8 +27,9 @@ language: es
 > [#50](https://github.com/jtrujillo-ws/designio-app/pull/50),
 > [#51](https://github.com/jtrujillo-ws/designio-app/pull/51),
 > [#48](https://github.com/jtrujillo-ws/designio-app/pull/48),
-> [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) y
-> [#53](https://github.com/jtrujillo-ws/designio-app/pull/53)). Donde el paquete de diseño y el código
+> [#52](https://github.com/jtrujillo-ws/designio-app/pull/52),
+> [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) y
+> [#55](https://github.com/jtrujillo-ws/designio-app/pull/55)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -66,7 +67,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49, #50, #51, #48, #52 y #53 se fusionaron entre el 2026-09-05 y el 2026-09-07) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: #54, el censo de paridad manual de RF-08.6; #39, #43, #45, #46, #47, #49, #50, #51, #48, #52, #53 y #55 se fusionaron entre el 2026-09-05 y el 2026-09-07) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -129,7 +130,7 @@ Cinco ideas sostienen el producto:
 | **Árbol simple sobre grafo rico** | El cliente navega Cliente → Servicios → Retos → Proyectos; debajo, el dominio es un grafo n:m que sostiene trazabilidad, consulta y scoping de la AI |
 | **Trazabilidad decisión → resultado** | Cadena evidencia → insight → decisión → design version → release → effective state → snapshots → outcome review, navegable en ambos sentidos |
 | **Medición temporal y honesta** | Metric Registry firmado en G6, snapshots manuales o CSV, ventana por criterio, post mortem con veredicto de cuatro valores y sin causalidad automática |
-| **La AI propone, el humano aprueba** | Pipeline único `PropuestaAI` con citas verificables y lineage; sin AI todo flujo sigue disponible a mano, con una excepción hoy declarada: los criterios de éxito de un reto nuevo solo entran desde la interfaz por C0 mientras J2 no tenga pantalla (ver `05` y `10`) |
+| **La AI propone, el humano aprueba** | Pipeline único `PropuestaAI` con citas verificables y lineage; sin AI todo flujo sigue disponible a mano: desde #55 también los criterios de éxito, que se escriben y editan en la pantalla del proyecto; lo que sigue sin pantalla es crear un reto y activarlo con perfil, que no es tarea de ninguna capacidad AI (ver `05`) |
 
 Lo que Designio **no es**, por diseño (prediseño §21): no es un canvas ni "un Miro peor"; no es una
 plataforma de telemetría u operación continua; no aprende de otros clientes; no presenta revisores
@@ -506,7 +507,7 @@ contexto está en `21` y el de la capa AI en `22`.
    snapshots son append-only y la ventana la fija el calendario de la base, no quien llama.
 6. **La AI deja libro de costos y lineage**: cada llamada al proveedor es una fila con su desenlace,
    tokens, costo y modelo; cada propuesta conserva su contenido original aunque se corrija; sin
-   proveedor la plataforma funciona igual y lo dice (con la excepción de J2 anotada arriba).
+   proveedor la plataforma funciona igual y lo dice.
 
 ## Estado del producto de un vistazo (2026-09-07)
 
@@ -516,7 +517,7 @@ contexto está en `21` y el de la capa AI en `22`.
 | Árbol, servicios, segmentos, búsqueda, biblioteca del cliente | ✔ | | Servicios afectados adicionales de un reto en la UI |
 | Bandeja, evidencia, adjuntos, derechos de uso | ✔ | | Escaneo de malware, object storage, transcripción y diarización (C1) |
 | Insights, citas, contradicciones | ✔ | | Clustering (fuera del MVP) |
-| Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas | ✔ | | **Pantalla de J2**: crear un reto, definir criterios a mano y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (los criterios entran hoy por C0 o por seed). **Pantalla de la etapa 4**: el concepto, su evidencia de test, su umbral, su N/A y su veredicto existen en la base con políticas y puerta de G4 (#46), pero ninguna server function ni pantalla los crea o decide; mientras no exista, G4 aprueba como antes cuando el reto no tiene conceptos, y una decisión `pasa-muere` no puede registrarse desde la interfaz porque exige elegir un concepto. Las **revisiones simuladas** de cada concepto (C4, #48) sí se leen y se escriben a mano desde la etapa 4 |
+| Método: proyectos, etapas, gates, checklists, decisiones, arquetipos, reaperturas, criterios de éxito a mano (#55) | ✔ | | **Pantalla de J2**: crear un reto y activarlo con perfil existen como server functions pero ninguna pantalla las llama todavía (un reto nace del seed o de una llamada directa); los criterios sí se escriben y editan a mano desde la pantalla del proyecto desde #55. **Pantalla de la etapa 4**: el concepto, su evidencia de test, su umbral, su N/A y su veredicto existen en la base con políticas y puerta de G4 (#46), pero ninguna server function ni pantalla los crea o decide; mientras no exista, G4 aprueba como antes cuando el reto no tiene conceptos, y una decisión `pasa-muere` no puede registrarse desde la interfaz porque exige elegir un concepto. Las **revisiones simuladas** de cada concepto (C4, #48) sí se leen y se escriben a mano desde la etapa 4 |
 | Oportunidades HMW (con borrador AI de preguntas trazadas a insights, C3) y G3 sobre el portafolio | ✔ | | Serializar la carrera entre validar un insight y persistir un lote de C3 (deuda anotada en #45; C2 la comparte) |
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
 | Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones como discrepancias propuestas (RF-06.8); C7 solo lee las ya registradas dentro del borrador del post mortem (discrepancia 20) |
@@ -766,13 +767,22 @@ módulo aparte (ADR-0007).
   (`candidato` → `activo` → `en-medicion` → `cerrado`, o `archivado`).
 - Se crea como **candidato** (lead o diseñador) y se **activa con un perfil**, lo que abre un proyecto `P-nn`
   con sus ocho etapas, ocho gates y el checklist del perfil. **Estado: construido en servidor, sin
-  pantalla**: las server functions `crearRetoCandidato`, `definirCriterio`, `editarCriterioDeReto` y
-  `activarRetoConPerfil` existen y están probadas, pero ninguna ruta ni componente las llama
-  todavía; hoy un reto y su proyecto nacen del seed o de una llamada directa, y la pantalla del
-  proyecto solo muestra los criterios existentes. Es el hueco visible del flujo J2 (ver `30`).
+  pantalla**: las server functions `crearRetoCandidato` y `activarRetoConPerfil` existen y están
+  probadas, pero ninguna ruta ni componente las llama todavía; hoy un reto y su proyecto nacen del
+  seed o de una llamada directa. Es el hueco visible que queda del flujo J2 (ver `30`).
 - Cada **criterio de éxito** registra KPI, definición, línea base (valor y fecha), objetivo y
-  **ventana de medición en días**. Desde la app los criterios entran hoy aceptando propuestas de la
-  AI (C0); la definición y edición manual existen como server functions sin pantalla.
+  **ventana de medición en días**. Desde la app entran aceptando propuestas de la AI (C0) **o a
+  mano**: desde [#55](https://github.com/jtrujillo-ws/designio-app/pull/55) el bloque `CriteriosDelReto` de la pantalla del proyecto ofrece «Añadir
+  criterio» y «Editar» por fila a lead y diseñador (los roles de `criterio_insert` y
+  `criterio_update`), con el botón decidido por el mismo `CriterioSchema` que valida el servidor y
+  con lo que falta dicho **mientras se escribe** (`faltaEnCriterio`, `criteriosCompletos`, que
+  subieron de la pantalla al módulo). El bloque no se ofrece cuando la base lo rechazaría
+  (`motivoParaNoDefinirCriterios`): rol sin permiso, o criterios **congelados** porque el G0 ya se
+  aprobó o el Metric Registry ya está firmado; `criteriosCongelados` viaja en la proyección
+  contestado por la misma función que usa la política (`reto_criterios_congelados`), porque la
+  segunda condición no se puede deducir de nada que la pantalla traiga. Si otro aprueba G0 o firma
+  el registry con el formulario abierto, el servicio anticipa la causa bajo el candado del reto en
+  vez de devolver un «intenta de nuevo».
 - **G0 congela los criterios**: después de aprobado no se editan ni se añaden (`reto_admite_criterios`);
   el cambio es una reapertura trazada de la etapa 0.
 
@@ -1309,11 +1319,11 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
 - Cupo diario **por workspace** (`workspace.limite_llamadas_ai_dia`, mínimo 2), con respaldo de 60
   cuando no hay uno pactado. La unidad es la **llamada atendida** por el proveedor (lo que se paga),
   contada sobre el mismo libro que suma costos.
-- Corte **suave**: al agotarse se pausan las capacidades AI, no los flujos de negocio. **Una
-  excepción conocida**: mientras la pantalla de J2 no exista (ver `05`), los criterios de éxito solo
-  entran desde la app aceptando propuestas de C0, así que sin AI un reto nuevo no puede llegar a
-  G0 desde la interfaz; la paridad manual que exige SYS-21 está en el servidor pero no en la
-  pantalla.
+- Corte **suave**: al agotarse se pausan las capacidades AI, no los flujos de negocio. La paridad
+  manual que exige SYS-21 llega hasta la pantalla para las nueve capacidades (la de C0, los
+  criterios de éxito a mano, desde #55); el censo que la vuelve invariante (`paridadManual`
+  obligatoria en cada capacidad y un barrido del grafo de llamadas hasta la escritura) está **en
+  vuelo** en #54.
 - Política de modelos en código: primario `claude-sonnet-5`, respaldo `claude-sonnet-4-6` solo ante
   404 o 5xx (no ante timeout), una degradación por operación; timeout duro de 25 s; sin reintentos
   del SDK. Tarifas por millón de tokens junto a la política; el costo se persiste con la llamada.
@@ -1718,7 +1728,7 @@ comportamiento vive en `auth`, `arbol` y `segmento`).
 
 Primitivas del design system en `ui/` (Button, Card, Checkbox, Chip, Destacado, EnlaceA, Input,
 JourneyBadge, Select, Switch, Tabs, Tag, Textarea, Wordmark); piezas de pantalla en `loop/`
-(LoopScreen, Buscador, NuevoServicio), `metodo/SeccionGobernanza`, `medicion/SeccionMedicion`,
+(LoopScreen, Buscador, NuevoServicio), `metodo/SeccionGobernanza`, `metodo/CriteriosDelReto`, `medicion/SeccionMedicion`,
 `portal/PanelDeHilos`, `journey/DiagramaMermaid`, `evidencia/DescargaArchivo`.
 
 ---
@@ -1986,7 +1996,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (24 archivos, uno por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, oportunidad, concepto, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#53): **1000 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#55): **1011 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1998,7 +2008,8 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-07. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) | — |
+| [#54](https://github.com/jtrujillo-ws/designio-app/pull/54) | RF-08.6: la paridad manual deja de ser una afirmación y pasa a ser una invariante. `paridadManual` obligatoria en `DefinicionCapacidad` (no compila una capacidad sin ella), censo que compara la clase declarada con el destino y recorre el grafo de llamadas desde la server function manual hasta la escritura, con lo exigido derivado del materializador de cada capacidad; sin cambios de datos. Deja abierto a propósito que el censo no cubre todavía la capa de pantalla | Abierto contra `agents`, CI en verde |
+| — | Últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) y [#55](https://github.com/jtrujillo-ws/designio-app/pull/55) (los criterios de éxito se escriben a mano) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -2007,7 +2018,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-01 Workspace, roles, portal | Baja de miembros desde la app (política y grant de DELETE, server function y pantalla); hilos del portal sobre retos y evidencias en la interfaz (el modelo ya los admite); correo saliente (invitaciones, avisos del portal), notificaciones básicas por email; recovery de contraseña por correo | RF-01.4, RF-01.5, diseño técnico · Correo |
 | SPEC-02 Árbol y grafo | Servicios **afectados** adicionales de un reto en la UI (la tabla `reto_servicio_afectado` existe y la lectura de journeys ya la usa); consultas de trazabilidad predefinidas como pantalla propia (a–f); `AlcanceDeContexto` explícito para la AI (hoy el alcance es por ancla y se resume en `alcance_resumen`) | RF-02.3, RF-02.6, RF-02.7 |
 | SPEC-03 Evidencia e importación | Transcripción y diarización (C1, requiere proveedor STT); escaneo de malware; object storage S3-compatible con proxy de bytes (hoy `bytea` en Postgres); preview y OCR de artefactos; codificación asistida por segmento y tema | RF-03.2, RF-03.7, RF-03.8 |
-| SPEC-04 Método | **Pantalla de J2** para crear el reto, definir y editar criterios a mano y activarlo con perfil (las server functions existen; ninguna ruta las llama); **pantalla de la etapa 4** para crear conceptos, enlazar su evidencia de test, declarar umbral, registrar lectura, aprobar la N/A y dictar el veredicto (el modelo, las políticas y la puerta de G4 ya están en la base desde #46; sin esa pantalla un `pasa-muere` no se puede registrar desde la interfaz); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
+| SPEC-04 Método | **Pantalla de J2** para crear el reto y activarlo con perfil (las server functions existen; ninguna ruta las llama; los criterios a mano ya tienen bloque en la pantalla del proyecto desde #55); **pantalla de la etapa 4** para crear conceptos, enlazar su evidencia de test, declarar umbral, registrar lectura, aprobar la N/A y dictar el veredicto (el modelo, las políticas y la puerta de G4 ya están en la base desde #46; sin esa pantalla un `pasa-muere` no se puede registrar desde la interfaz); motor de marcado automático aguas abajo en reaperturas (hoy asistido) | RF-04.1 a RF-04.3, RF-04.10, SYS-13 |
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones como **discrepancias propuestas** entre la design version y lo constatado, a confirmar por el lead (la spec sigue vigente; C7 solo lee las desviaciones ya registradas dentro del borrador del post mortem, y la migración de #47 argumenta contra un detector que proponga constataciones: decisión de producto pendiente, discrepancia 20) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
@@ -2191,7 +2202,7 @@ base.
 | **Capacidad** | Una de C0–C7, CT o CI |
 | **Revisor AI** | Lente de revisión por arquetipo etiquetada como simulación; nunca evidencia (C4, construido en #48) |
 | **Revisión simulada** | Lo que una lente (arquetipo no refutado, con evidencia) ve en un concepto candidato: síntesis, hallazgos que citan o se declaran hipótesis, y preguntas para el test real; una por lente y concepto, con la marca de simulación imborrable |
-| **Degradación segura** | Sin AI disponible, todo flujo sigue operable a mano y la pantalla dice por qué; excepción vigente: los criterios de éxito de un reto nuevo, que solo entran desde la interfaz por C0 hasta que exista la pantalla de J2 |
+| **Degradación segura** | Sin AI disponible, todo flujo sigue operable a mano y la pantalla dice por qué (desde #55 también los criterios de éxito) |
 | **Portal** | Los hilos de comentarios y aprobaciones dentro del workspace, auditados |
 | **Evento de dominio** | Fila append-only de auditoría con tipo, payload, actor y rol |
 | **Exportación** | Paquete JSON del workspace en ámbito archivo (todo el catálogo) o entregable (solo la evidencia con derechos vigentes, con su fuente, derechos, segmentos y originales; sin razonamiento, sin objetos derivados y sin la propuesta AI de origen) |
@@ -2222,7 +2233,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I4 / SYS-18 | `agente-ai` sin aprobar ni publicar | Rol no invitable, ausente de todo predicado de escritura; CT sin destino | Construido |
 | I4 / SYS-19 | Toda escritura AI pasa por PropuestaAI con lineage | `propuesta_ai` + guard de materialización diferido; `propuesta_ai_id` en destinos | Construido |
 | I4 / SYS-20 | Revisores AI etiquetados, no evidencia, no cuentan en G4/G5 | `es_simulacion` con CHECK y sin UPDATE en las cuatro tablas de C4; `checklist_item` sin columna donde citar una revisión (censo en la suite); `unique (concepto_id, arquetipo_id)`; `sin_agregado_sintetico()` en base y contrato | Construido (#48) |
-| I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada; C4 con formulario a mano por la misma función y el mismo contrato que la aceptación | **Parcial**: la definición manual de criterios (J2) no tiene pantalla, así que sin AI un reto nuevo no llega a G0 desde la interfaz; E2E «AI off» pendiente |
+| I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada; C4 con formulario a mano por la misma función y el mismo contrato que la aceptación | **Parcial**: la ruta manual llega a la pantalla para las nueve capacidades (criterios a mano desde #55) y el censo que la garantiza está en vuelo (#54); E2E «AI off» pendiente |
 | I5 / SYS-22 | Ventana por criterio en G0; registry firmado en G6 | `criterio_g0_pendiente_guard`, `registry_firmar_guard`, `aprobado_sin_registry` solo como marca histórica | Construido |
 | I5 / SYS-23 | Snapshots solo formulario/CSV, append-only | `snapshot_insert` con contrato firmado y ventana abierta; `snapshot_carga_no_corrige_guard` | Construido |
 | I5 / SYS-24 | Sin causalidad automática; veredicto cerrado | `outcome_review_completar_guard`; catálogo de cuatro veredictos; estructura de contribución y factores | Construido |
@@ -2239,7 +2250,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Siete días de construcción (2026-09-01 a 2026-09-07), 50 commits en `agents`, cada uno un
+Siete días de construcción (2026-09-01 a 2026-09-07), 51 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -2294,6 +2305,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-06 | #48 | C4: los revisores AI son simulación, y lo siguen siendo después de aceptarlos |
 | 09-06 | #52 | RF-08.9: el libro de costos AI tiene lector, y sus números dicen lo que miden |
 | 09-07 | #53 | RF-08.7: el grounding se mide, se guarda y se compara contra dos corridas |
+| 09-07 | #55 | Los criterios de éxito se pueden escribir a mano, que es lo que SYS-22 da por hecho |
 
 ---
 
@@ -2321,7 +2333,7 @@ fuente o a un ADR de sucesión.
 | 14 | Diseño técnico · AI | Grounding evaluado con fidelidad de citas | Lo medido es presencia literal; la fidelidad se delega al acto humano | Reescribir la sección de grounding con el nombre honesto |
 | 15 | Runbook Railway §2 | `ANTHROPIC_API_KEY` «solo cuando llegue la capa AI» | La capa AI existe desde el 09-03 | Actualizar nota |
 | 16 | `docs/README.md` | Estados del paquete «borrador» | El código ya materializa la mayoría de las specs | Añadir columna de estado de implementación (o enlazar este documento) |
-| 17 | Journeys J2 (`docs/04-journeys/`) / SPEC-04 RF-04.1–04.3 | El lead formula el reto y define criterios en la plataforma | Las server functions existen pero ninguna pantalla las expone: el reto y sus criterios manuales nacen del seed o de C0 | Construir la pantalla de J2 (alta de reto, criterios, activación) |
+| 17 | Journeys J2 (`docs/04-journeys/`) / SPEC-04 RF-04.1–04.3 | El lead formula el reto y define criterios en la plataforma | Los criterios se definen y editan en la pantalla del proyecto desde #55; crear el reto y activarlo con perfil siguen como server functions sin pantalla, así que un reto nace del seed o de una llamada directa | Construir la pantalla de J2 (alta de reto y activación) |
 | 18 | Journeys J7 / prediseño §13.2 | El sponsor «recibe el post mortem» y decide continuidad; la tabla de journeys lo pone como rol decisivo | El veredicto lo dicta el lead (`review_completar`); no hay aprobación del sponsor sobre el review | Decidir si el sponsor debe firmar el outcome review (ADR) o dejar el rol como está y ajustar el journey |
 | 19 | SPEC-01 RF-01.4 | El admin del cliente gestiona los accesos de su organización | Alta por invitación sí; la baja de una membresía no tiene camino en la app (solo conexión administrativa) | Añadir política, grant y pantalla de baja |
 | 20 | SPEC-06 RF-06.8 | Detección AI de desviaciones: discrepancias propuestas entre DV y lo constatado, a confirmar por el lead | C7 (#47) no propone discrepancias ni constataciones: lee las desviaciones ya registradas por el lead y las comenta, opcionalmente, dentro del borrador del post mortem; la migración de C7 sostiene que una constatación propuesta por el modelo contradiría su carácter testimonial | Decidir si se reescribe RF-06.8 o se construye el detector; mientras, RF-06.8 sigue pendiente en `30` |

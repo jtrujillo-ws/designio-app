@@ -224,6 +224,51 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return m;
     };
 
+    /**
+     * EL SQL DE UNA FUNCIÓN, leído de sus PLANTILLAS ETIQUETADAS y no de su texto.
+     *
+     * `decl.getText()` incluye comentarios y literales corrientes, así que un comentario que
+     * dijera «insert into cita» contaba como escritura. Lo señaló una revisión, y el modo de
+     * fallo que describe es el peor de todos: borrar el SQL de verdad y dejar el comentario que
+     * lo explicaba mantiene la invariante en verde justo cuando la operación ha desaparecido.
+     *
+     * Se recogen los `tx\`…\`` y equivalentes. Las plantillas anidadas dentro de un `${…}` se
+     * visitan por su cuenta al recorrer el árbol, así que no se pierden.
+     */
+    const sqlDe = (n: ts.Node): string[] => {
+      const trozos: string[] = [];
+      const ver = (x: ts.Node): void => {
+        if (ts.isTaggedTemplateExpression(x)) trozos.push(x.template.getText());
+        ts.forEachChild(x, ver);
+      };
+      ver(n);
+      return trozos;
+    };
+
+    /**
+     * A dónde manda un módulo que RE-EXPORTA el nombre buscado (`export { x } from './y'`).
+     *
+     * Sin esto, un barrel legítimo rompía el recorrido: se sembraba el nombre en el barrel,
+     * `funcionesDe` no encontraba allí ninguna declaración y el censo concluía que la secuencia
+     * no cubría nada. Es el mismo error que el de los alias, un fichero más allá.
+     */
+    const reexportDe = (
+      arbol: ts.SourceFile,
+      f: string,
+      nombre: string,
+    ): { modulo: string; original: string } | null => {
+      for (const st of arbol.statements) {
+        if (!ts.isExportDeclaration(st) || !st.moduleSpecifier) continue;
+        if (!st.exportClause || !ts.isNamedExports(st.exportClause)) continue;
+        for (const e of st.exportClause.elements) {
+          if (e.name.text !== nombre) continue;
+          const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+          if (destino) return { modulo: destino, original: (e.propertyName ?? e.name).text };
+        }
+      }
+      return null;
+    };
+
     const llamadasEn = (n: ts.Node): string[] => {
       const nombres: string[] = [];
       const ver = (x: ts.Node): void => {
@@ -265,13 +310,19 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         visto.add(clave);
         const arbol = leer(actual.modulo);
         const decl = funcionesDe(arbol).get(actual.funcion);
-        // Un nombre que no resuelve a una función de este repositorio no es un fallo: puede venir
-        // de una librería. Simplemente no hay por dónde seguir por ahí.
-        if (!decl) continue;
-        const texto = decl.getText();
-        for (const [, verbo, tabla] of texto.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
-          if (CONTABILIDAD_AI.includes(tabla!)) continue;
-          escrituras.add(`${verbo!.toLowerCase().replace(/\s+/g, ' ')} ${tabla!}`);
+        if (!decl) {
+          // Puede que el módulo sólo la RE-EXPORTE: se sigue hasta donde se declara.
+          const via = reexportDe(arbol, actual.modulo, actual.funcion);
+          if (via) cola.push({ modulo: via.modulo, funcion: via.original });
+          // Y si tampoco es eso, el nombre no resuelve a una función de este repositorio —puede
+          // venir de una librería—. No es un fallo: simplemente no hay por dónde seguir.
+          continue;
+        }
+        for (const sql of sqlDe(decl)) {
+          for (const [, verbo, tabla] of sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
+            if (CONTABILIDAD_AI.includes(tabla!)) continue;
+            escrituras.add(`${verbo!.toLowerCase().replace(/\s+/g, ' ')} ${tabla!}`);
+          }
         }
         const imports = importesDe(arbol, actual.modulo);
         const locales = funcionesDe(arbol);

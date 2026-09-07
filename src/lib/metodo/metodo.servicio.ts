@@ -69,6 +69,41 @@ export async function crearReto(actorId: string, entrada: CrearReto): Promise<{ 
   });
 }
 
+/**
+ * POR QUÉ NO SE PUEDEN TOCAR LOS CRITERIOS DE ESTE RETO, preguntado a la BASE.
+ *
+ * `criterio_g0_pendiente_guard` corre en el `insert` Y en el `update`, y levanta DOS motivos
+ * distintos —el registry firmado y el G0 aprobado— con un `P0001` que `mensajeDe` no traduce:
+ * el motivo accionable llegaba a la pantalla convertido en «intenta de nuevo», que es un
+ * consejo imposible porque reintentar no puede funcionar.
+ *
+ * Se ANTICIPA con las mismas funciones que el guard IMPONE, y no con un espejo escrito a
+ * mano: es la receta que la propia migración deja dicha. Va DESPUÉS del candado del reto, que
+ * es lo que serializa esto contra una aprobación de G0 concurrente; preguntar antes de
+ * bloquear deja justo el hueco que el candado existe para cerrar.
+ *
+ * El orden lo fija la migración y conviene repetirlo: la firma del registry no tiene vuelta
+ * atrás, así que se nombra primero. Decirle «reabre la etapa 0» a quien tiene el contrato
+ * firmado sería mandarlo a un trámite que no desbloquea nada.
+ */
+async function exigirCriteriosAbiertos(
+  tx: TransactionSql,
+  retoId: string,
+  workspaceId: string,
+): Promise<void> {
+  const [porque] = await tx`select
+      reto_registry_firmado(${retoId}, ${workspaceId}) as registry,
+      reto_g0_congela_criterios(${retoId}, ${workspaceId}) as g0`;
+  if (porque!.registry as boolean) {
+    throw new ErrorMetodo(
+      'El Metric Registry del reto ya está firmado: sus criterios son el contrato acordado y no se tocan (SYS-22)',
+    );
+  }
+  if (porque!.g0 as boolean) {
+    throw new ErrorMetodo('Los criterios están congelados: el G0 del reto ya fue aprobado');
+  }
+}
+
 export async function agregarCriterio(
   actorId: string,
   entrada: CriterioEntrada,
@@ -79,6 +114,7 @@ export async function agregarCriterio(
     // concurrente podrían commitear juntos y congelar un criterio incompleto. El
     // evento CriterioDefinido lo emite el guard de la transición.
     await bloquearReto(tx, entrada.retoId);
+    await exigirCriteriosAbiertos(tx, entrada.retoId, entrada.workspaceId);
     let fila;
     try {
       [fila] = await tx`
@@ -115,6 +151,7 @@ export async function editarCriterio(actorId: string, entrada: EditarCriterio): 
     // Mismo candado que agregarCriterio: editar y decidir G0 no pueden entrecruzarse.
     // El evento CriterioEditado lo emite el guard de la transición.
     await bloquearReto(tx, dueno.reto_id as string);
+    await exigirCriteriosAbiertos(tx, dueno.reto_id as string, entrada.workspaceId);
     const filas = await tx`
       update criterio_exito
       set kpi = ${entrada.kpi}, definicion = ${entrada.definicion},
@@ -125,9 +162,10 @@ export async function editarCriterio(actorId: string, entrada: EditarCriterio): 
           fecha_post_mortem = ${entrada.fechaPostMortem}
       where id = ${entrada.criterioId} and workspace_id = ${entrada.workspaceId}`;
     if (filas.count === 0) {
-      throw new ErrorMetodo(
-        'El criterio está congelado por un G0 aprobado o no puedes editarlo',
-      );
+      // El congelado ya se dijo arriba con su causa, así que aquí sólo queda el permiso: la
+      // política admite al lead de boutique y a quien diseña. Antes este mensaje ofrecía las
+      // dos posibilidades y acertaba la mitad de las veces.
+      throw new ErrorMetodo('No puedes editar los criterios de este reto');
     }
   });
 }

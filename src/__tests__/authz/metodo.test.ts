@@ -272,6 +272,13 @@ describeAuthz('método: etapas, gates y checklists', () => {
     await expect(
       agregarCriterio(leadId, { workspaceId: ws, retoId, ...criterioBase }),
     ).rejects.toThrow(/congelados/);
+    // Y el motivo llega DICHO, no como un P0001 crudo. El guard corre en el insert y en el
+    // update con dos causas distintas, y `mensajeDe` no traduce ese código: sin esto, quien
+    // tuviera el formulario abierto cuando otro aprueba G0 recibía «intenta de nuevo» —un
+    // consejo imposible, porque reintentar no puede funcionar—.
+    await expect(
+      editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase }),
+    ).rejects.toThrow(/el G0 del reto ya fue aprobado/);
     // Y la pantalla se entera: el mismo hecho que las dos líneas de arriba imponen, aquí
     // ANTICIPADO, para que el formulario a mano se retire en vez de prometer un envío que
     // ya no cabe.

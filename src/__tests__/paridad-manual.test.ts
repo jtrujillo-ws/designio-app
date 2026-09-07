@@ -225,26 +225,33 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /**
-     * FUERA LOS COMENTARIOS DE SQL, que son el mismo agujero un nivel más adentro.
+     * SÓLO EL SQL: fuera sus comentarios y fuera el TEXTO de sus cadenas.
      *
-     * Limitar el barrido a las plantillas etiquetadas dejó fuera los comentarios de TypeScript,
-     * pero no los de SQL: un `-- update outcome_review` DENTRO de la plantilla seguía contando
-     * como escritura. Reproducido cambiando el `insert into oportunidad_insight` de
-     * `enlazarInsight` por otra tabla y dejando encima un comentario que lo nombra: el censo
-     * seguía en VERDE con la operación ya desaparecida, que es exactamente lo que existe para
-     * impedir.
+     * Es el mismo agujero, dos veces más adentro. Limitar el barrido a las plantillas etiquetadas
+     * dejó fuera los comentarios de TypeScript, pero no los de SQL: un `-- update outcome_review`
+     * DENTRO de la plantilla contaba como escritura. Y quitados esos, seguía contando un
+     * `select 'insert into cita'` — un texto de diagnóstico o de auditoría que nombra la
+     * operación que ya no se hace.
      *
-     * Se respetan las cadenas: un `--` dentro de `'…'` es texto y no un comentario.
+     * Las dos formas abren el mismo modo de fallo, que es el que este censo existe para impedir:
+     * borrar la sentencia y dejar lo que la explicaba mantiene la invariante en verde. Las dos
+     * reproducidas sobre `enlazarInsight` cambiando su tabla y dejando el nombre viejo, primero
+     * en un comentario y luego en una cadena: verde las dos veces.
+     *
+     * De las cadenas se conservan las comillas y se tira el contenido, para no descolocar lo que
+     * viene después: una lista de valores sigue teniendo el mismo número de elementos.
      */
-    const sinComentariosSql = (t: string): string => {
+    const soloSql = (t: string): string => {
       let fuera = '';
       let enCadena = false;
       let i = 0;
       while (i < t.length) {
         const c = t[i]!;
         if (enCadena) {
-          fuera += c;
-          if (c === "'") enCadena = false;
+          if (c === "'") {
+            fuera += c;
+            enCadena = false;
+          }
           i += 1;
         } else if (c === "'") {
           fuera += c;
@@ -326,7 +333,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           const literales = ts.isNoSubstitutionTemplateLiteral(t)
             ? [t.text]
             : [t.head.text, ...t.templateSpans.map((sp) => sp.literal.text)];
-          trozos.push(sinComentariosSql(literales.join(TESTIGO)));
+          trozos.push(soloSql(literales.join(TESTIGO)));
         }
         ts.forEachChild(x, ver);
       };

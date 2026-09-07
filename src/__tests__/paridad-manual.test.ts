@@ -876,10 +876,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
 
     /** Las escrituras «verbo tabla» alcanzables desde una función, con las columnas de cada una. */
     type Escritura = { columnas: Map<string, Set<string>>; filtro: Set<string> };
-    const cacheDeEscrituras = new Map<string, Map<string, Escritura>>();
-    const escriturasDesde = (modulo: string, funcion: string): Map<string, Escritura> => {
+    type Alcance = { escrituras: Map<string, Escritura>; modulos: Set<string> };
+    const cacheDeEscrituras = new Map<string, Alcance>();
+    const alcanceDesde = (modulo: string, funcion: string): Alcance => {
       const memo = cacheDeEscrituras.get(`${modulo}#${funcion}`);
       if (memo) return memo;
+      const modulos = new Set<string>();
       const escrituras = new Map<string, Escritura>();
       const visto = new Set<string>();
       const cola = [{ modulo, funcion }];
@@ -888,6 +890,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const clave = `${actual.modulo}#${actual.funcion}`;
         if (visto.has(clave)) continue;
         visto.add(clave);
+        modulos.add(actual.modulo);
         const arbol = leer(actual.modulo);
         const decl = funcionesDe(arbol).get(actual.funcion);
         if (!decl) {
@@ -1028,9 +1031,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           else if (locales.has(bajo)) cola.push({ modulo: actual.modulo, funcion: bajo });
         }
       }
-      cacheDeEscrituras.set(`${modulo}#${funcion}`, escrituras);
-      return escrituras;
+      const alcance = { escrituras, modulos };
+      cacheDeEscrituras.set(`${modulo}#${funcion}`, alcance);
+      return alcance;
     };
+    const escriturasDesde = (modulo: string, funcion: string): Map<string, Escritura> =>
+      alcanceDesde(modulo, funcion).escrituras;
+
+    /*
+     * EL PROVEEDOR NO PUEDE ESTAR EN LA RUTA MANUAL, que es lo que SYS-21 pide de verdad.
+     *
+     * Comparando sólo escrituras, un manejador manual que esperara al proveedor antes de llegar
+     * a su SQL salía verde — y en la caída que este requisito cubre no funcionaría. Lo que se
+     * exige es que ninguno de los módulos que la secuencia alcanza sea el del proveedor.
+     *
+     * Se comprueba que el fichero existe: si se renombra, esto tiene que caerse en vez de dejar
+     * de mirar en silencio.
+     */
+    const PROVEEDOR = `${raiz}/src/lib/ai/proveedor.server.ts`;
+    expect(existsSync(PROVEEDOR), `el módulo del proveedor no está en ${PROVEEDOR}`).toBe(true);
 
     // Los materializadores, derivados del fichero y no de una lista: `materializarAlgo`.
     const materializadores = [...funcionesDe(leer(servicioAI)).keys()].filter((n) =>
@@ -1076,6 +1095,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
       }
       const secuencia = def.paridadManual.pasos.map((x) => x.funcion).join(' → ');
+
+      const porElProveedor = def.paridadManual.pasos.filter((paso) => {
+        const m = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
+        return m !== null && alcanceDesde(m, paso.funcion).modulos.has(PROVEEDOR);
+      });
+      expect(
+        porElProveedor.map((x) => x.funcion),
+        `${cap}: la ruta manual pasa por el proveedor AI, así que no funciona en la caída que SYS-21 cubre`,
+      ).toEqual([]);
       const faltan = [...exigido.keys()].filter((e) => !cubierto.has(e)).sort();
       expect(
         faltan,

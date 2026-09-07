@@ -246,25 +246,44 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /**
-     * A dónde manda un módulo que RE-EXPORTA el nombre buscado (`export { x } from './y'`).
+     * A dónde manda un módulo que RE-EXPORTA el nombre buscado, con nombre o con comodín.
      *
      * Sin esto, un barrel legítimo rompía el recorrido: se sembraba el nombre en el barrel,
      * `funcionesDe` no encontraba allí ninguna declaración y el censo concluía que la secuencia
      * no cubría nada. Es el mismo error que el de los alias, un fichero más allá.
+     *
+     * Y las DOS formas, porque atender sólo la de nombre dejaba a las dos mitades de este
+     * fichero en desacuerdo sobre qué es un barrel: la sonda de existencia sigue `export * from`
+     * desde que se escribió, y este recorrido no lo hacía. Un módulo declarado que fuera un
+     * comodín pasaba la existencia y luego se leía como si no escribiera nada — o sea, rechazaba
+     * una paridad intacta, que es el mismo modo de fallo que el alias sin resolver.
+     *
+     * El comodín re-exporta con el MISMO nombre, así que el símbolo no cambia; lo que hay que
+     * decidir es CUÁL de los comodines lo trae, y eso lo contesta `exportadasDe` — el
+     * reconocedor de la otra mitad, que es justamente lo que las pone de acuerdo.
      */
     const reexportDe = (
       arbol: ts.SourceFile,
       f: string,
       nombre: string,
     ): { modulo: string; original: string } | null => {
+      const comodines: string[] = [];
       for (const st of arbol.statements) {
         if (!ts.isExportDeclaration(st) || !st.moduleSpecifier) continue;
-        if (!st.exportClause || !ts.isNamedExports(st.exportClause)) continue;
+        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (!destino) continue;
+        if (!st.exportClause) {
+          comodines.push(destino);
+          continue;
+        }
+        if (!ts.isNamedExports(st.exportClause)) continue;
         for (const e of st.exportClause.elements) {
           if (e.name.text !== nombre) continue;
-          const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
-          if (destino) return { modulo: destino, original: (e.propertyName ?? e.name).text };
+          return { modulo: destino, original: (e.propertyName ?? e.name).text };
         }
+      }
+      for (const destino of comodines) {
+        if (exportadasDe(destino).has(nombre)) return { modulo: destino, original: nombre };
       }
       return null;
     };

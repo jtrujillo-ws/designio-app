@@ -1387,6 +1387,33 @@ export const METRICAS_DE_GROUNDING = [
 export type MetricaDeGrounding = (typeof METRICAS_DE_GROUNDING)[number];
 
 /**
+ * LAS QUE RF-08.7 EXIGE Y ESTE REPOSITORIO NO SABE MEDIR TODAVÍA.
+ *
+ * Viajan en cada corrida con las tres cifras nulas, igual que una métrica que no tiene universo
+ * en esa capacidad — y ahí estaba el problema, porque «no aplica» y «se exige y no la medimos»
+ * son lo contrario la una de la otra y salían con la misma cara. Una dice que la pregunta no
+ * corresponde; la otra, que corresponde y falta.
+ *
+ * Se declara aquí, en el contrato, y no en la pantalla: quien corre la eval y quien la lee tienen
+ * que estar de acuerdo en cuál es cuál, y una lista escrita dos veces se separa sola. El runner
+ * las escribe nulas siempre, en todas las capacidades, para que el día que se decida cómo
+ * medirlas la serie ya tenga carril.
+ */
+export const METRICAS_SIN_MEDIR: readonly MetricaDeGrounding[] = ['fidelidad-de-citas'];
+
+/**
+ * Y CÓMO SE NOMBRA UN HUECO, que es la mitad que se ve.
+ *
+ * Las dos razones para no traer cifras escriben el mismo null y dicen lo contrario, así que el
+ * rótulo es lo único que las separa para quien mira. Vive aquí, en una función pura al lado de la
+ * lista, y no dentro del `<td>`: allí no se podía medir sin pintar la ruta entera, y una regla que
+ * no se puede medir es la que se vuelve a romper.
+ */
+export function rotuloSinCifra(metrica: MetricaDeGrounding): 'sin medir' | 'no aplica' {
+  return METRICAS_SIN_MEDIR.includes(metrica) ? 'sin medir' : 'no aplica';
+}
+
+/**
  * La fila del agregado del workspace, que va en la misma columna que las capacidades.
  *
  * En mayúscula y sin parecerse a ninguna del catálogo a propósito: la columna es texto —tiene

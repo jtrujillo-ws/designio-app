@@ -35,9 +35,19 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
-import { correrEvalDeGrounding, informeDeGrounding } from '@/lib/ai/ai.evals';
+import {
+  CAPACIDADES_CON_AFIRMACIONES,
+  correrEvalDeGrounding,
+  informeDeGrounding,
+} from '@/lib/ai/ai.evals';
+import { CAPACIDADES_QUE_DECLARAN_AFIRMACIONES } from '@/lib/ai/ai.contenido';
+import { agregarAfirmacion } from '@/lib/insight/insight.servicio';
 import { observabilidadAI } from '@/lib/ai/ai.observabilidad';
-import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.schemas';
+import {
+  METRICAS_SIN_MEDIR,
+  ROLES_OBSERVABILIDAD_AI,
+  rotuloSinCifra,
+} from '@/lib/ai/ai.schemas';
 import {
   arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
@@ -20425,8 +20435,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
 
       const informe = await correrEvalDeGrounding(curadorId, wsC);
-      const filas = informe.ultima!.mediciones.filter((m) => m.metrica === 'fidelidad-de-citas');
-      // Aparece, y en TODAS: es una exigencia del producto, no una propiedad de una capacidad.
+      // La lista NO se escribe aquí: es la del contrato, que es la que lee la pantalla para
+      // decir «sin medir» en vez de «no aplica». Escrita a mano, esta sonda seguiría verde el
+      // día que las dos se separaran, que es justo lo que tiene que cazar.
+      expect(METRICAS_SIN_MEDIR.length, 'el censo se quedó sin métricas que mirar').toBeGreaterThan(
+        0,
+      );
+      const filas = informe.ultima!.mediciones.filter((m) => METRICAS_SIN_MEDIR.includes(m.metrica));
+      // Aparecen, y en TODAS: son exigencias del producto, no propiedades de una capacidad.
       expect(filas.length, 'la fidelidad no llegó al informe').toBeGreaterThan(1);
       for (const f of filas) {
         expect([f.numerador, f.denominador, f.sinVeredicto, f.tasa]).toEqual([
@@ -20436,6 +20452,26 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           null,
         ]);
       }
+      /*
+       * Y LOS DOS VACÍOS CONVIVEN EN LA MISMA CORRIDA, que es lo que obliga a distinguirlos.
+       * `afirmaciones-no-soportadas` sale nula en una capacidad que no materializa insights —ahí
+       * la pregunta NO corresponde, y la pantalla dice «no aplica»—, mientras la fidelidad sale
+       * nula en todas porque corresponde y falta. Con un solo rótulo, la fila cuyo título dice
+       * «exigida y NO medida» se pintaba «no aplica», afirmando lo contrario de lo que es.
+       */
+      const noAplica = informe.ultima!.mediciones.find(
+        (m) => m.numerador === null && !METRICAS_SIN_MEDIR.includes(m.metrica),
+      );
+      expect(
+        noAplica,
+        'sin un «no aplica» de verdad, la distinción no se estaría midiendo',
+      ).toBeDefined();
+      // Y el rótulo los separa, que es la mitad que ve quien mira: los dos huecos escriben el
+      // mismo null y dicen lo contrario.
+      expect([rotuloSinCifra(filas[0]!.metrica), rotuloSinCifra(noAplica!.metrica)]).toEqual([
+        'sin medir',
+        'no aplica',
+      ]);
       /*
        * Y en el MISMO workspace el suelo sí trae cifras. Es lo que separa «declarada y no
        * medida» de «aquí no hay datos»: si las dos salieran vacías, esta sonda pasaría con la
@@ -20455,6 +20491,87 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * workspace. Con una sola puerta, cualquiera que abriera la pantalla habría dejado una corrida
    * en la tabla — y una serie histórica que se llena sola al mirarla no compara nada.
    */
+  /**
+   * UNA AFIRMACIÓN ESCRITA A MANO DESPUÉS NO ES DEL MODELO, y hasta esta ronda lo era.
+   *
+   * Al aceptar una propuesta de C2 el insight nace en `propuesto`, y la política de INSERT de
+   * `afirmacion` deja añadir más mientras siga ahí. La métrica contaba desde esa tabla, así que
+   * una afirmación humana sin citas empeoraba el grounding de la versión de prompt vigente sin
+   * que el modelo hubiera producido nada distinto — y `afirmacion` no guarda de dónde vino cada
+   * fila, así que la contaminación no se podía deshacer después.
+   */
+  it('RF-08.7: una afirmación añadida a mano tras aceptar no cuenta contra el modelo', async () => {
+    await enWorkspaceLimpio('eval-linaje', async ({ ws: wsL, curadorId, retoId: retoL }) => {
+      const ev = await evidenciaDelReto(wsL, retoL, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsL, capacidad: 'C2', anclaId: retoL }),
+      );
+      const panel = await panelPropuestas(curadorId, wsL);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      // `objetoId` es el insight que la aceptación materializó: es de ahí de donde cuelgan las
+      // afirmaciones, y por donde entra la que una persona añada después.
+      const { objetoId: insightId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsL,
+        propuestaId: propuesta.id,
+      });
+
+      const cifrasDeC2 = (i: Awaited<ReturnType<typeof correrEvalDeGrounding>>) => {
+        const m = i.ultima!.mediciones.find(
+          (x) => x.metrica === 'afirmaciones-no-soportadas' && x.capacidad === 'C2',
+        )!;
+        return [m.numerador, m.denominador, m.sinVeredicto];
+      };
+      const antes = cifrasDeC2(await correrEvalDeGrounding(curadorId, wsL));
+      // El modelo propuso una afirmación no-hipótesis, sostenida: 0 sin sostén de 1.
+      expect(antes).toEqual([0, 1, 0]);
+
+      // Y ahora una persona añade la suya, sin ninguna cita, sobre el MISMO insight.
+      const { afirmacionId } = await agregarAfirmacion(curadorId, {
+        workspaceId: wsL,
+        insightId,
+        texto: 'Y además el equipo cree que el problema es el copy del botón.',
+        esHipotesis: false,
+      });
+      /*
+       * La sonda comprueba que de verdad entró: sin esto mediría un fixture que la RLS rechazó
+       * —el insight podría haber nacido validado— y saldría verde sin haber tocado el caso.
+       */
+      const admin = sqlAdmin();
+      const [fila] = await admin`select count(*)::int as n from afirmacion
+        where insight_id = ${insightId} and workspace_id = ${wsL}`;
+      expect([afirmacionId !== undefined, fila!.n], 'la afirmación a mano no llegó a la tabla').toEqual([
+        true,
+        2,
+      ]);
+
+      // Y la medida NO se mueve: mide lo que el modelo propuso, no lo que hay hoy colgando.
+      expect(
+        cifrasDeC2(await correrEvalDeGrounding(curadorId, wsL)),
+        'una afirmación humana sin citas se contó como fallo del modelo',
+      ).toEqual([0, 1, 0]);
+    });
+  });
+
+  /**
+   * EL CENSO DE LA PUERTA: quién sabe leer afirmaciones y quién las tiene.
+   *
+   * El universo de la métrica se deriva del DESTINO —materializa un insight— y el extractor del
+   * payload se declara por capacidad. Son dos listas, y una capacidad nueva que materialice
+   * insights sin enseñar a leer sus afirmaciones no rompería nada: mediría cero de cero, que en
+   * una métrica de grounding se lee «salió limpio».
+   */
+  it('RF-08.7: toda capacidad que materializa insights sabe leer sus afirmaciones', () => {
+    expect(CAPACIDADES_QUE_DECLARAN_AFIRMACIONES.length, 'el censo no reconoció ninguna').toBe(
+      CAPACIDADES_CON_AFIRMACIONES.length,
+    );
+    expect(CAPACIDADES_QUE_DECLARAN_AFIRMACIONES).toEqual([...CAPACIDADES_CON_AFIRMACIONES].sort());
+    expect(CAPACIDADES_QUE_DECLARAN_AFIRMACIONES.length).toBeGreaterThan(0);
+  });
+
   it('RF-08.7: el informe se lee con la puerta de auditoría y se corre con la de la boutique', async () => {
     await enWorkspaceLimpio('eval-puertas', async ({ ws: wsC, curadorId }) => {
       const admin = sqlAdmin();

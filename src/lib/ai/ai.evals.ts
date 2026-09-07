@@ -2,7 +2,8 @@ import '@/lib/server-only';
 import type { TransactionSql } from 'postgres';
 import { conUsuario } from '@/lib/db';
 import { exigirCuentaActiva } from '@/lib/auth/auth.servicio';
-import type { ContenidoPropuesta } from './ai.contenido';
+import { AFIRMACIONES_DEL_CONTENIDO } from './ai.contenido';
+import type { AfirmacionDelContenido, ContenidoPropuesta } from './ai.contenido';
 import { PROMPT_VERSION } from './ai.prompts';
 import {
   CAPACIDADES,
@@ -16,6 +17,7 @@ import {
   type MedicionDeGrounding,
   type Destino,
   type MetricaDeGrounding,
+  type CapacidadActiva,
 } from './ai.schemas';
 import { ErrorAI, citasConPresencia, proyeccionDelPanel } from './ai.servicio';
 
@@ -42,6 +44,17 @@ type Recuento = { numerador: number; denominador: number; sinVeredicto: number }
 
 /** «No hay universo»: esta métrica no tiene nada que contar en esta capacidad. */
 const SIN_UNIVERSO = null;
+
+/**
+ * Y el de «la exigencia existe y no la sabemos medir», que NO es el de arriba.
+ *
+ * Las dos escriben null —lo guardado es idéntico y así debe ser: no hay cifra— pero significan lo
+ * contrario, y con un solo centinela la pantalla pintaba «no aplica» sobre una fila cuyo propio
+ * título dice «exigida y NO medida». Cuál es cuál lo declara el contrato en `METRICAS_SIN_MEDIR`,
+ * que es lo que lee la pantalla; aquí sólo se nombra para que quien edite este Record vea que hay
+ * dos razones distintas para no traer cifras, y elija.
+ */
+const NO_SE_MIDE = () => null;
 
 function medicion(
   metrica: MetricaDeGrounding,
@@ -103,7 +116,7 @@ const DESTINO_MATERIALIZA_INSIGHT: Record<Destino, boolean> = {
  * el objeto—, así que su fila se escribe SIN UNIVERSO en vez de con un cero, que diría «medido
  * y salió limpio».
  */
-const CAPACIDADES_CON_AFIRMACIONES: readonly string[] = CAPACIDADES_ACTIVAS.filter((k) => {
+export const CAPACIDADES_CON_AFIRMACIONES: readonly string[] = CAPACIDADES_ACTIVAS.filter((k) => {
   const destino = CAPACIDADES[k].destino;
   // Sin destino no se materializa nada, así que tampoco hay afirmaciones que contar. No es un
   // caso hipotético: CT es informativa —aconseja sobre un gate y no escribe ningún objeto—, y
@@ -240,50 +253,81 @@ async function correccionHumana(
 /**
  * ── LAS AFIRMACIONES NO SOPORTADAS ──
  *
- * Una afirmación materializada desde una propuesta aceptada, que NO se declaró hipótesis y que
- * hoy no tiene ninguna cita viva. «Viva» es `evidencia_usable(…, 'cliente')`: el derecho de uso
- * caduca por fecha y se puede revocar, así que una afirmación que nació sostenida deja de
- * estarlo sin que nadie la toque — y eso es precisamente lo que esta métrica existe para ver.
+ * Una afirmación QUE EL MODELO PROPUSO, que no declaró hipótesis y que hoy no tiene ninguna cita
+ * viva. «Viva» es `evidencia_usable(…, 'cliente')`: el derecho de uso caduca por fecha y se puede
+ * revocar, así que una afirmación que nació sostenida deja de estarlo sin que nadie la toque — y
+ * eso es precisamente lo que esta métrica existe para ver.
  *
- * `es_hipotesis` se excluye porque el esquema lo declara así donde se define: «la extrapolación
+ * **Se lee del PAYLOAD, no de la tabla `afirmacion`, y ese fue un hallazgo.** Al aceptar una
+ * propuesta de C2 el insight nace en `propuesto`, y la política de INSERT de `afirmacion` deja
+ * añadir más mientras siga ahí: contando desde la tabla, una afirmación escrita a mano y sin
+ * citas empeoraba el grounding de la versión de prompt vigente sin que el modelo hubiera
+ * producido nada distinto. Y como `afirmacion` no guarda de dónde vino cada fila —no hay
+ * `propuesta_id` ni `creado_por`—, tampoco se podían separar después: la comparación entre
+ * versiones quedaba contaminada de forma irreversible.
+ *
+ * Las otras tres métricas ya se anclaban al payload; ésta era la única que leía filas vivas como
+ * si fueran del modelo. `AFIRMACIONES_DEL_CONTENIDO` cierra la asimetría.
+ *
+ * Lo que SÍ sigue siendo una lectura viva, porque es la pregunta: los derechos. Se resuelven
+ * contra `evidencia_usable` HOY, sobre los `evidenciaId` que la propuesta citó.
+ *
+ * `esHipotesis` se excluye porque el esquema lo declara así donde se define: «la extrapolación
  * honesta — no exige cita, pero queda etiquetada como tal para siempre». Contarla como no
  * soportada castigaría al modelo por hacer lo correcto.
  *
- * Se agrupa por CAPACIDAD y se filtra por `insight_id is not null` —o sea, por lo que la
- * propuesta materializó— en vez de por `capacidad = 'C2'`: el día que otra capacidad
- * materialice insights, entra sin que nadie tenga que acordarse de venir aquí.
+ * Se agrupa por CAPACIDAD y el universo lo decide `CAPACIDADES_CON_AFIRMACIONES` —derivado del
+ * destino— en vez de `capacidad = 'C2'`: el día que otra materialice insights, entra sin que
+ * nadie tenga que acordarse de venir aquí.
  */
 async function afirmacionesNoSoportadas(
   tx: TransactionSql,
   workspaceId: string,
 ): Promise<Map<string, Recuento>> {
   const filas = await tx`
-    select p.capacidad,
-           count(*)::int as afirmaciones,
-           count(*) filter (where not exists (
-             select 1 from cita c
-             where c.afirmacion_id = a.id
-               and c.workspace_id = a.workspace_id
-               and evidencia_usable(c.evidencia_id, c.workspace_id, 'cliente')
-           ))::int as sin_sosten
+    select p.capacidad, p.contenido_original
     from propuesta_ai p
-    join afirmacion a on a.insight_id = p.insight_id and a.workspace_id = p.workspace_id
     where p.workspace_id = ${workspaceId}
       and p.estado in ('aceptada', 'corregida')
       and p.prompt_version = ${PROMPT_VERSION}
-      and p.insight_id is not null
-      and not a.es_hipotesis
-    group by p.capacidad`;
-  return new Map(
-    filas.map((f) => [
-      f.capacidad as string,
-      {
-        numerador: f.sin_sosten as number,
-        denominador: f.afirmaciones as number,
-        sinVeredicto: 0,
-      },
-    ]),
-  );
+      and p.insight_id is not null`;
+
+  const propuestas: { capacidad: string; afirmaciones: AfirmacionDelContenido[] }[] = filas.map((f) => ({
+    capacidad: f.capacidad as string,
+    afirmaciones:
+      AFIRMACIONES_DEL_CONTENIDO[f.capacidad as CapacidadActiva]?.(
+        f.contenido_original as ContenidoPropuesta,
+      ) ?? [],
+  }));
+
+  /*
+   * Los derechos, de una vez y solo sobre lo citado. Preguntarlo por afirmación habría sido una
+   * consulta por fila; preguntarlo por todo el workspace habría traído documentos que nadie
+   * citó. El conjunto es el de los ids que aparecen en los payloads medidos.
+   */
+  const citados = [...new Set(propuestas.flatMap((p) => p.afirmaciones.flatMap((a) => a.evidenciaIds)))];
+  const usables = new Set<string>();
+  if (citados.length > 0) {
+    const vivas = await tx`
+      select e.id::text as id
+      from evidencia e
+      where e.workspace_id = ${workspaceId}
+        and e.id = any(${citados}::uuid[])
+        and evidencia_usable(e.id, e.workspace_id, 'cliente')`;
+    for (const v of vivas) usables.add((v.id as string).toLowerCase());
+  }
+
+  const por = new Map<string, Recuento>();
+  for (const { capacidad, afirmaciones } of propuestas) {
+    const r = por.get(capacidad) ?? { numerador: 0, denominador: 0, sinVeredicto: 0 };
+    for (const a of afirmaciones) {
+      if (a.esHipotesis) continue;
+      r.denominador += 1;
+      if (!a.evidenciaIds.some((id) => usables.has(id))) r.numerador += 1;
+    }
+    por.set(capacidad, r);
+  }
+  return por;
 }
 
 /**
@@ -443,7 +487,7 @@ export async function correrEvalDeGrounding(
          * el problema de que la evaluación pasaría a depender del componente que evalúa y a
          * costar por corrida, o nombrar un proxy COMO proxy— son decisión de producto.
          */
-        'fidelidad-de-citas': () => SIN_UNIVERSO,
+        'fidelidad-de-citas': NO_SE_MIDE,
         // El suelo tiene universo en toda capacidad: la que no declara citas mide cero de cero,
         // que es verdad —no citó nada—, y no «aquí no se puede medir».
         'suelo-presencia-literal': (c) =>

@@ -19,6 +19,7 @@ import {
   type InformeDeGrounding,
   type MedicionDeGrounding,
   type MetricaDeGrounding,
+  rotuloSinCifra,
 } from '@/lib/ai/ai.schemas';
 
 /**
@@ -492,11 +493,22 @@ function FilaDeMedicion({
   destacada?: boolean;
 }) {
   /*
-   * Las tres cifras en null son «esta métrica no tiene universo aquí», que NO es cero. Se dice
-   * con palabras y no con un guion: un hueco mudo en una tabla de recuentos se lee como cero, y
-   * un cero en «afirmaciones no soportadas» diría «medido y salió limpio».
+   * Las tres cifras en null son «aquí no hay cifra», y eso tiene DOS razones opuestas que la
+   * tabla tiene que separar:
+   *
+   *  · «no aplica» — la métrica no tiene universo en esta capacidad. La pregunta no corresponde.
+   *  · «sin medir» — la métrica se EXIGE y este repositorio no la sabe calcular todavía. La
+   *    pregunta corresponde y falta la respuesta.
+   *
+   * Con un solo rótulo, la fila cuyo título dice «exigida y NO medida» se pintaba «no aplica»,
+   * que afirma justo lo contrario y esconde el hueco que esa fila existe para enseñar. Cuál es
+   * cuál es cuál lo decide el contrato, no esta pantalla: `rotuloSinCifra`.
+   *
+   * Y en los dos casos se dice con palabras y no con un guion: un hueco mudo en una tabla de
+   * recuentos se lee como cero, y un cero en «afirmaciones no soportadas» diría «medido y salió
+   * limpio».
    */
-  const sinUniverso = m.numerador === null;
+  const sinCifra = m.numerador === null;
   const fondo = destacada ? 'var(--surface-sunken)' : undefined;
   return (
     <tr style={{ background: fondo }}>
@@ -510,13 +522,13 @@ function FilaDeMedicion({
       >
         {m.capacidad}
       </th>
-      <td style={cifra}>{sinUniverso ? 'no aplica' : m.numerador}</td>
-      <td style={cifra}>{sinUniverso ? '' : m.denominador}</td>
-      <td style={cifra}>{sinUniverso ? '' : porcentaje(m.tasa)}</td>
+      <td style={cifra}>{sinCifra ? rotuloSinCifra(m.metrica) : m.numerador}</td>
+      <td style={cifra}>{sinCifra ? '' : m.denominador}</td>
+      <td style={cifra}>{sinCifra ? '' : porcentaje(m.tasa)}</td>
       <CeldaDelta
         d={delta(m, previa)}
         subirEsBueno={subirEsBueno}
-        sinUniverso={sinUniverso}
+        sinUniverso={sinCifra}
         sinReferencia="sin comparación"
       />
       {/* Y la de §17. «Sin otra versión» no es «no cambió»: la primera se dice cuando todavía
@@ -524,10 +536,10 @@ function FilaDeMedicion({
       <CeldaDelta
         d={delta(m, previaDeOtraVersion)}
         subirEsBueno={subirEsBueno}
-        sinUniverso={sinUniverso}
+        sinUniverso={sinCifra}
         sinReferencia="sin otra versión"
       />
-      <td style={cifra}>{sinUniverso ? '' : m.sinVeredicto}</td>
+      <td style={cifra}>{sinCifra ? '' : m.sinVeredicto}</td>
     </tr>
   );
 }

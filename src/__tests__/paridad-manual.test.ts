@@ -124,6 +124,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
    * tres rondas seguidas el hallazgo era el sitio que quedó sin actualizar al endurecer el de al
    * lado. Una sola lectura, o vuelve.
    */
+  const ligaEsteNombre = (b: ts.BindingName, nombre: string): boolean => {
+    if (ts.isIdentifier(b)) return b.text === nombre;
+    for (const e of b.elements) {
+      if (ts.isOmittedExpression(e)) continue;
+      if (ligaEsteNombre(e.name, nombre)) return true;
+    }
+    return false;
+  };
+
   const ramaMuerta = (x: ts.Node): ts.Node | null => {
     if (ts.isIfStatement(x)) {
       if (x.expression.kind === ts.SyntaxKind.FalseKeyword) return x.thenStatement;
@@ -136,12 +145,19 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     return null;
   };
 
+  /*
+   * Y LIGA IGUAL SI EL NOMBRE VIENE DE UN PATRÓN. Esta lectura sólo reconocía declaraciones
+   * cuyo nombre fuera un identificador, así que un `const { definirCriterio } = props` —o un
+   * parámetro desestructurado, o la ligadura de un `for`, o la de un `catch`— no tapaba al
+   * import y la llamada al LOCAL se le acreditaba. Por eso usa `ligaEsteNombre`, que ya existía
+   * para lo mismo un ámbito más adentro: dos lecturas del mismo concepto, otra vez.
+   */
   const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
     let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
     while (a !== undefined) {
       if (ts.isFunctionLike(a)) {
         for (const p of a.parameters) {
-          if (ts.isIdentifier(p.name) && p.name.text === nombre) return p;
+          if (ligaEsteNombre(p.name, nombre)) return p;
         }
       }
       if (ts.isBlock(a) || ts.isSourceFile(a)) {
@@ -157,7 +173,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
-            if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+            if (ligaEsteNombre(d.name, nombre)) return d;
           }
         }
       }
@@ -173,12 +189,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         ts.isVariableDeclarationList(a.initializer)
       ) {
         for (const d of a.initializer.declarations) {
-          if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+          if (ligaEsteNombre(d.name, nombre)) return d;
         }
       }
       if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
         const v = a.variableDeclaration;
-        if (ts.isIdentifier(v.name) && v.name.text === nombre) return v;
+        if (ligaEsteNombre(v.name, nombre)) return v;
       }
       a = a.parent as ts.Node | undefined;
     }
@@ -503,6 +519,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       for (const paso of paridad.pasos) {
         const modulo = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
         if (modulo === null) continue; // Ya lo denuncia la sonda de arriba; aquí no se repite.
+        /*
+         * Y EL PASO DECLARADO SE NORMALIZA IGUAL QUE EL IMPORT DE LA PANTALLA. Normalizando sólo
+         * un lado, declarar el paso contra un barrel —una forma que las sondas de export e
+         * invocabilidad de arriba SÍ aceptan— dejaba el origen de la pantalla apuntando al
+         * módulo de verdad y el del paso al barrel: ningún llamador legítimo casaba y esto se
+         * ponía rojo. Arreglé un lado de la comparación y no el otro; se comparan los DOS
+         * orígenes.
+         */
+        const origenDelPaso = declaraA(modulo, paso.funcion);
+        if (origenDelPaso === null) continue; // Tampoco se repite: la sonda de export ya lo dice.
         const laLlama = CAPA.some((pantalla) => {
           const traidos = traidosPor(pantalla);
           const llamados = llamadosEn(pantalla);
@@ -514,7 +540,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * importó, para que un re-export que renombre no pierda el rastro.
            */
           const esElPaso = (o: Origen | null): boolean =>
-            o !== null && o.modulo === modulo && o.nombre === paso.funcion;
+            o !== null && o.modulo === origenDelPaso.modulo && o.nombre === origenDelPaso.nombre;
           for (const [local, via] of traidos) {
             if (via.espacio) {
               if (
@@ -1145,14 +1171,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return null;
       };
       /** Los nombres que liga un patrón: `(p)`, `({ p })`, `([p])`, `(...p)`, y anidados. */
-      const ligaEsteNombre = (b: ts.BindingName, nombre: string): boolean => {
-        if (ts.isIdentifier(b)) return b.text === nombre;
-        for (const e of b.elements) {
-          if (ts.isOmittedExpression(e)) continue;
-          if (ligaEsteNombre(e.name, nombre)) return true;
-        }
-        return false;
-      };
       /*
        * Y UN PARÁMETRO TAPA AL AYUDANTE DE FUERA, igual que lo tapa una declaración. El
        * ascenso sólo miraba bloques y ficheros, así que con un `[nada].map((persistir) =>

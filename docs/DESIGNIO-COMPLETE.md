@@ -203,8 +203,9 @@ Las aristas de esa cadena hasta el effective state existen hoy en la base como t
 con FK; el tramo effective state → snapshots **no** es una FK: los snapshots cuelgan de la entrada
 KPI y, a través de ella, del criterio de éxito, y su relación con los releases es temporal (por
 fechas), todavía sin marcas de release sobre la serie (ver `09`). Cada eslabón está protegido por
-una política RLS y un guard: un insight solo se valida con citas a evidencia con **derechos
-vigentes**; una decisión solo enlaza insights **validados**; una design version se **congela** al
+una política RLS y un guard: un insight solo se valida si **cada afirmación no marcada como
+hipótesis** cita evidencia con **derechos vigentes** (una hipótesis se valida sin cita, ver `04`);
+una decisión solo enlaza insights **validados**; una design version se **congela** al
 aprobarse junto al snapshot de su journey; un release declara **exactamente** qué elementos
 incluye; una desviación exige **razón**; G7 no pasa con elementos en estado desconocido; y el
 outcome review dicta un veredicto del catálogo cerrado.
@@ -1629,8 +1630,10 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
    cuenta esté activa; re-validan tenant y rol para sus reglas (capa 2); ejecutan SQL. La base
    aplica RLS y guards (capa 1). Las **proyecciones de solo lectura** que consultan varias tablas y
    deben devolver una foto coherente (exportación, panel de disposición, auditoría, árbol, resumen
-   del loop, aprobaciones, memoria, segmentos, evidencia con derechos, panel de propuestas AI,
-   membresías y el diagnóstico de «qué falta para el post mortem» al abrir el outcome review)
+   del loop, aprobaciones, memoria, segmentos, bandeja de importación, evidencia con derechos,
+   panel de propuestas AI, operación de la capa AI (`observabilidadAI`, para que los agregados de
+   `llamada_ai` y `propuesta_ai` salgan del mismo snapshot), membresías y el diagnóstico de «qué
+   falta para el post mortem» al abrir el outcome review)
    abren la transacción en `repeatable read`; una proyección que cabe en **una sola sentencia**
    (por ejemplo, el seguimiento de impacto de la medición) ya obtiene su foto coherente del
    snapshot de esa sentencia y corre en `read committed`; las **escrituras** de dominio

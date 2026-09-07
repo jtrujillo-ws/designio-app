@@ -536,6 +536,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const conjuntosImposibles = new Set<string>();
     const origenesSinLeer = new Set<string>();
     const sentenciasQueNoEjecutan = new Set<string>();
+    const escriturasQueNoPersisten = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -1457,10 +1458,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
         }
         /*
-         * `f.call(…)`, `f.apply(…)` y `f.bind(…)` LLAMAN A `f`. Leídas como llamadas de
-         * propiedad se descartaban —el receptor no es un espacio de nombres—, así que un
+         * `f.call(…)` y `f.apply(…)` LLAMAN A `f`. Leídas como llamadas de propiedad se
+         * descartaban —el receptor no es un espacio de nombres—, así que un
          * `await generarConProveedor.call(undefined, entrada)` dejaba fuera al proveedor y
          * SYS-21 seguía en verde con la ruta manual llamando al modelo.
+         *
+         * `f.bind(…)` NO está en esa lista: no ejecuta nada, sólo fabrica otra función. Al
+         * meterlo con las otras dos, un `persistirManual.bind(null, actorId, entrada)` que
+         * nadie llegase a invocar se apuntaba el SQL de `persistirManual`, y esa escritura
+         * la sonda la daba por hecha sin que ocurriera. Quien invoque la función atada ya
+         * cuenta por su propia llamada.
          */
         /*
          * Y `obj['nombre'](…)` es la misma llamada que `obj.nombre(…)`: con la clave escrita
@@ -1490,7 +1497,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         const acceso = comoPropiedad(llamado);
         const porElReceptor =
-          acceso !== null && ['call', 'apply', 'bind'].includes(acceso.nombre)
+          acceso !== null && ['call', 'apply'].includes(acceso.nombre)
             ? acceso.objeto
             : null;
         if (porElReceptor !== null && ts.isIdentifier(porElReceptor)) {
@@ -2200,6 +2207,79 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return false;
     };
 
+    /** Y el cliente que sostiene una TRANSACCIÓN, que no es lo mismo que la fábrica suelta. */
+    const esTransaccion = (e: ts.Expression, f: string, hondo = 0): boolean => {
+      if (hondo > 8) return false;
+      let x: ts.Expression = e;
+      while (
+        ts.isParenthesizedExpression(x) ||
+        ts.isAsExpression(x) ||
+        ts.isNonNullExpression(x)
+      ) {
+        x = x.expression;
+      }
+      if (!ts.isIdentifier(x)) return false;
+      const liga = ligaduraDe(x, x.text);
+      if (liga === null) return false;
+      if (ts.isParameter(liga)) return esParametroDeLaBase(liga, f);
+      if (ts.isVariableDeclaration(liga) && liga.initializer) {
+        return !seReasigna(liga) && esTransaccion(liga.initializer, f, hondo + 1);
+      }
+      return false;
+    };
+
+    /** Si una sentencia SALE de aquí por otro sitio, lo que venga detrás ya no es seguro. */
+    const desvia = (s: ts.Statement): boolean => {
+      let hay = false;
+      const ver = (y: ts.Node): void => {
+        if (hay) return;
+        if (ts.isReturnStatement(y) || ts.isBreakStatement(y) || ts.isContinueStatement(y)) {
+          hay = true;
+          return;
+        }
+        // El `return` de una función anidada la devuelve a ELLA, no a ésta.
+        if (ts.isFunctionLike(y)) return;
+        ts.forEachChild(y, ver);
+      };
+      ver(s);
+      return hay;
+    };
+
+    /*
+     * UNA ESCRITURA QUE SIEMPRE TERMINA EN `throw` DENTRO DE LA TRANSACCIÓN NO PERSISTE.
+     *
+     * `conUsuario` entrega su callback a `sql().begin(…)`, y el driver deshace la transacción
+     * entera si el callback lanza. Un `update outcome_review set …` seguido de un `throw` sin
+     * condición se contaba igual que una escritura de verdad: la paridad quedaba en verde con
+     * la fila intacta, que es exactamente lo que este censo existe para impedir.
+     *
+     * La lectura es CONSERVADORA a propósito, porque el precio de equivocarse aquí es poner en
+     * rojo código intacto: sólo cuenta el `throw` que está en el MISMO bloque que la sentencia
+     * —o en uno que lo contenga por anidamiento suelto—, DESPUÉS de ella, sin que entre medias
+     * haya nada que pueda salir por otro lado. Y se corta en cuanto aparece un `try` con
+     * `catch`, donde el `throw` puede quedar atrapado y la transacción seguir su curso.
+     */
+    const siempreLanzaTras = (tag: ts.Node): boolean => {
+      let hijo: ts.Node = tag;
+      let padre: ts.Node | undefined = tag.parent as ts.Node | undefined;
+      while (padre !== undefined) {
+        if (ts.isTryStatement(padre) && padre.catchClause !== undefined) return false;
+        if (ts.isBlock(padre)) {
+          const i = padre.statements.indexOf(hijo as ts.Statement);
+          if (i < 0) return false;
+          for (const y of padre.statements.slice(i + 1)) {
+            if (ts.isThrowStatement(y)) return true;
+            if (desvia(y)) return false;
+          }
+          // El bloque se acaba sin lanzar: sólo se sigue subiendo por un bloque SUELTO.
+          if (!ts.isBlock(padre.parent)) return false;
+        }
+        hijo = padre;
+        padre = padre.parent as ts.Node | undefined;
+      }
+      return false;
+    };
+
     /**
      * Las escrituras «verbo tabla» alcanzables desde una función: UNA ENTRADA POR SENTENCIA.
      *
@@ -2259,6 +2339,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             if (CONTABILIDAD_AI.includes(tabla)) continue;
             if (!esCliente(consulta.tag, actual.modulo)) {
               etiquetasDesconocidas.add(consulta.etiqueta);
+              continue;
+            }
+            if (
+              esTransaccion(consulta.tag, actual.modulo) &&
+              siempreLanzaTras(consulta.tag)
+            ) {
+              escriturasQueNoPersisten.add(
+                `${actual.funcion}: ${m[1]!.toLowerCase().replace(/\s+/g, ' ')} ${tabla}, y la transacción termina en throw`,
+              );
               continue;
             }
             const verbo = m[1]!.toLowerCase().replace(/\s+/g, ' ');
@@ -2886,6 +2975,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     expect(
       [...sentenciasQueNoEjecutan].sort(),
       'una escritura va detrás de un EXPLAIN, que no la ejecuta: decide si cuenta',
+    ).toEqual([]);
+    expect(
+      [...escriturasQueNoPersisten].sort(),
+      'una escritura de la transacción termina siempre en throw: el driver la deshace y no queda nada',
     ).toEqual([]);
   });
 });

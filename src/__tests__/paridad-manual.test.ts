@@ -386,6 +386,32 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * a dos apariciones y pasaban por vivos. Se parte de lo que se nombra FUERA de todo cuerpo
      * con nombre y se expande por punto fijo: sólo entra el que alguien vivo nombra.
      */
+    /**
+     * LOS AYUDANTES QUE SE PASAN A QUIEN LOS EJECUTA TAMBIÉN SE LLAMAN.
+     *
+     * `items.map(persistir)` ejecuta `persistir` sin que su nombre aparezca nunca como
+     * callee, y yo lo había dejado dicho como límite —«se leería como muerto, y eso sale
+     * ROJO»—. Es cierto para las escrituras, donde perder una arista deja una escritura sin
+     * cubrir; pero la comprobación de SYS-21 pregunta lo CONTRARIO —que la ruta manual NO
+     * alcance al proveedor— y ahí perder una arista sale VERDE. La misma ceguera con el signo
+     * cambiado: `await Promise.all(items.map(generarConProveedor))` llamaba al proveedor con
+     * la invariante tranquila.
+     *
+     * Así que un identificador pasado como argumento a alguien de la lista de abajo cuenta
+     * como llamada. La lista es la misma que decide si se baja a un callback anónimo, y por
+     * el mismo motivo: es lo que este repositorio usa para ejecutar lo que recibe.
+     */
+    const argumentosEjecutados = (x: ts.CallExpression): ts.Identifier[] => {
+      const q = x.expression;
+      const quien = ts.isPropertyAccessExpression(q)
+        ? q.name.text
+        : ts.isIdentifier(q)
+          ? q.text
+          : null;
+      if (quien === null || !EJECUTAN_SU_CALLBACK.includes(quien)) return [];
+      return x.arguments.filter((a): a is ts.Identifier => ts.isIdentifier(a));
+    };
+
     const EJECUTAN_SU_CALLBACK = [
       // El único camino de este repositorio a la base, y el cuerpo de cada función de servidor.
       'conUsuario',
@@ -457,15 +483,41 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return null;
       };
 
-      const nombradas = new Map<string, ts.Node>();
-      const juntar = (x: ts.Node): void => {
-        if (x !== n && ts.isFunctionLike(x)) {
-          const nom = nombreDe(x);
-          if (nom !== null && !nombradas.has(nom)) nombradas.set(nom, x);
+      /**
+       * Y el cuerpo que un nombre resuelve DESDE EL SITIO donde se le llama, por ligadura
+       * léxica. Un mapa único por nombre para toda la función no es una ligadura: con un
+       * `persistir` muerto arriba —conservado para un log— y OTRO `persistir` declarado y
+       * llamado dentro de un ámbito anidado, la llamada del segundo daba por vivo al primero
+       * y su SQL seguía contando. Es el mismo error que ya costó las sombras en las llamadas,
+       * un ámbito más adentro.
+       */
+      const declaradaEn = (ambito: ts.Node, nombre: string): ts.Node | null => {
+        if (!ts.isBlock(ambito) && !ts.isSourceFile(ambito)) return null;
+        for (const st of ambito.statements) {
+          if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
+          if (!ts.isVariableStatement(st)) continue;
+          for (const d of st.declarationList.declarations) {
+            if (
+              ts.isIdentifier(d.name) &&
+              d.name.text === nombre &&
+              d.initializer &&
+              ts.isFunctionLike(d.initializer)
+            ) {
+              return d.initializer;
+            }
+          }
         }
-        ts.forEachChild(x, juntar);
+        return null;
       };
-      juntar(n);
+      const cuerpoDesde = (donde: ts.Node, nombre: string): ts.Node | null => {
+        let a: ts.Node | undefined = donde;
+        while (a !== undefined) {
+          const hallada = declaradaEn(a, nombre);
+          if (hallada !== null) return hallada;
+          a = a.parent as ts.Node | undefined;
+        }
+        return null;
+      };
 
       /**
        * Lo que una región LLAMA, sin entrar en los cuerpos con nombre que haya dentro.
@@ -479,12 +531,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * sale ROJO y nombrando la escritura que falta, no verde: pide una decisión en vez de
        * tranquilizar.
        */
-      const nombraA = (region: ts.Node): string[] => {
-        const nombres: string[] = [];
+      const nombraA = (region: ts.Node): { nombre: string; donde: ts.Node }[] => {
+        const nombres: { nombre: string; donde: ts.Node }[] = [];
         const ver = (x: ts.Node): void => {
           if (x !== region && ts.isFunctionLike(x) && nombreDe(x) !== null) return;
-          if (ts.isCallExpression(x) && ts.isIdentifier(x.expression)) {
-            nombres.push(x.expression.text);
+          if (ts.isCallExpression(x)) {
+            if (ts.isIdentifier(x.expression)) {
+              nombres.push({ nombre: x.expression.text, donde: x });
+            }
+            for (const a of argumentosEjecutados(x)) nombres.push({ nombre: a.text, donde: a });
           }
           ts.forEachChild(x, ver);
         };
@@ -492,21 +547,22 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return nombres;
       };
 
-      const vivas = new Set<string>();
+      // El punto fijo se expande sobre CUERPOS, no sobre nombres: dos ayudantes homónimos en
+      // ámbitos distintos son dos cosas distintas, y sólo vive el que alguien vivo llama.
+      const vivas = new Set<ts.Node>();
       const cola = nombraA(n);
       while (cola.length > 0) {
-        const nom = cola.shift()!;
-        if (vivas.has(nom)) continue;
-        const cuerpo = nombradas.get(nom);
-        if (!cuerpo) continue;
-        vivas.add(nom);
+        const { nombre, donde } = cola.shift()!;
+        const cuerpo = cuerpoDesde(donde, nombre);
+        if (cuerpo === null || vivas.has(cuerpo)) continue;
+        vivas.add(cuerpo);
         cola.push(...nombraA(cuerpo));
       }
 
       const ver = (x: ts.Node): void => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);
-          if (nombre !== null && !vivas.has(nombre)) return;
+          if (nombre !== null && !vivas.has(x)) return;
           if (nombre === null && !laEjecutaQuienLaRecibe(x)) return;
         }
         visitar(x);
@@ -659,18 +715,37 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           return;
         }
         /*
-         * De cada interpolación se guarda su ÚLTIMO identificador, que es el campo: de
+         * De cada interpolación se guardan TODAS sus fuentes, y de cada una su campo: de
          * `entrada.aprendizajes` sale `aprendizajes`, y el objeto que lo lleva —que se llama
          * distinto en cada capa— se queda fuera.
+         *
+         * Quedarse con el ÚLTIMO identificador no era leer la fuente sino UNA de ellas:
+         * `contribucion = ${'${entrada.reviewId + entrada.contribucion}'}` daba `contribucion` y
+         * pasaba la comparación con el id de la review guardado dentro del relato. Se recogen
+         * las dos, y más abajo se exige que TODAS estén justificadas.
+         *
+         * De una cadena `a.b.c` el campo es `c`: lo de en medio es el CAMINO, no la fuente.
+         * Pero si la base de la cadena no es un nombre a secas —una llamada, un índice— ahí
+         * dentro puede haber otra fuente y se sigue mirando.
          */
         const campos = t.templateSpans.map((sp) => {
           const dentro: string[] = [];
           const ver = (y: ts.Node): void => {
-            if (ts.isIdentifier(y)) dentro.push(y.text);
+            if (ts.isPropertyAccessExpression(y)) {
+              dentro.push(y.name.text);
+              let base: ts.Node = y.expression;
+              while (ts.isPropertyAccessExpression(base)) base = base.expression;
+              if (!ts.isIdentifier(base)) ver(base);
+              return;
+            }
+            if (ts.isIdentifier(y)) {
+              dentro.push(y.text);
+              return;
+            }
             ts.forEachChild(y, ver);
           };
           ver(sp.expression);
-          return dentro.length > 0 ? [dentro[dentro.length - 1]!] : [];
+          return [...new Set(dentro)];
         });
         let sql = t.head.text;
         t.templateSpans.forEach((sp, k) => {
@@ -766,6 +841,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       const llamadas: { objeto: string | null; nombre: string; donde: ts.Node }[] = [];
       recorrerVivo(n, (x) => {
         if (!ts.isCallExpression(x)) return;
+        for (const a of argumentosEjecutados(x)) {
+          llamadas.push({ objeto: null, nombre: a.text, donde: a });
+        }
         if (ts.isIdentifier(x.expression)) {
           llamadas.push({ objeto: null, nombre: x.expression.text, donde: x });
         } else if (ts.isPropertyAccessExpression(x.expression)) {
@@ -1479,7 +1557,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * intercambios—, y eso dejaba pasar una sustitución cualquiera.
            */
           if (suyos.size === 0) continue;
-          if (mios.size > 0 && [...suyos].some((n) => mios.has(n))) continue;
+          // TODAS las fuentes de la ruta manual tienen que estar justificadas: que compartan
+          // campo con la materialización o que nombren a su columna. Bastar con UNA dejaba
+          // pasar la que viniera acompañada —`contribucion = ${'${entrada.reviewId + entrada.contribucion}'}`
+          // comparte `contribucion` y guarda además el id de la review dentro del relato.
+          const justificado = (nombre: string): boolean =>
+            suyos.has(nombre) || pelar(nombre) === pelar(c);
+          if (mios.size > 0 && [...mios].every(justificado)) continue;
           /*
            * Y si no comparten campo, vale que el valor de la ruta manual NOMBRE A SU COLUMNA
            * —por el identificador de su interpolación o en el propio SQL—:
@@ -1497,7 +1581,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * sustitución cualquiera —`contribucion = ${'${entrada.reviewId}'}`—, que no comparte
            * identificador con nada y tampoco nombra a su columna.
            */
-          if ([...mios].some((n) => pelar(n) === pelar(c))) continue;
           /*
            * Y la salvedad del SQL vale sólo si NINGUNA interpolación llega al valor fuera de una
            * subconsulta. Con la mención a secas, `contribucion = coalesce(${'${entrada.reviewId}'}

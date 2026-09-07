@@ -712,12 +712,32 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        */
       const reasignadas = new Set<ts.Node>();
       const juntarConsumidos = (y: ts.Node): void => {
-        if (
-          ts.isBinaryExpression(y) &&
-          y.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-          ts.isIdentifier(y.left)
-        ) {
-          const d = declaracionDe(y, y.left.text);
+        /*
+         * Y CUALQUIER forma de reasignar, no sólo `=`. Un `contribucion += entrada.aprendizajes`
+         * cambia el valor igual y mirando sólo el `=` pasaba en verde: la misma avería con otro
+         * operador, que es como han llegado casi todas.
+         */
+        const reasignado = ((): ts.Identifier | null => {
+          if (
+            ts.isBinaryExpression(y) &&
+            y.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+            y.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+            ts.isIdentifier(y.left)
+          ) {
+            return y.left;
+          }
+          if (
+            (ts.isPrefixUnaryExpression(y) || ts.isPostfixUnaryExpression(y)) &&
+            (y.operator === ts.SyntaxKind.PlusPlusToken ||
+              y.operator === ts.SyntaxKind.MinusMinusToken) &&
+            ts.isIdentifier(y.operand)
+          ) {
+            return y.operand;
+          }
+          return null;
+        })();
+        if (reasignado !== null) {
+          const d = declaracionDe(y, reasignado.text);
           if (d !== null) reasignadas.add(d);
         }
         /*

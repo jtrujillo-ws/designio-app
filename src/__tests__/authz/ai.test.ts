@@ -735,13 +735,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * transacción ESPERÓ. El presupuesto solo acota el caso patológico; agotado, se sigue como
    * antes y es la aserción de la sonda la que cuenta qué pasó.
    */
-  async function esperaAQueAlguienEspere(pid: number, presupuestoMs = 10_000): Promise<void> {
+  async function esperaAQueAlguienEspere(
+    pid: number,
+    presupuestoMs = 10_000,
+    parar?: () => boolean,
+  ): Promise<void> {
     const admin = sqlAdmin();
     const limite = Date.now() + presupuestoMs;
     for (;;) {
       const [f] = await admin`select count(*)::int as n from pg_stat_activity
         where ${pid} = any (pg_blocking_pids(pid))`;
-      if ((f!.n as number) > 0 || Date.now() > limite) return;
+      if ((f!.n as number) > 0 || Date.now() > limite || parar?.()) return;
       await new Promise((r) => setTimeout(r, 20));
     }
   }
@@ -776,9 +780,80 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
     return {
       terminado,
       soltar,
-      esperaAQueAlguienEspere: (presupuestoMs?: number) =>
-        esperaAQueAlguienEspere(pid, presupuestoMs),
+      esperaAQueAlguienEspere: (presupuestoMs?: number, parar?: () => boolean) =>
+        esperaAQueAlguienEspere(pid, presupuestoMs, parar),
     };
+  }
+
+  type CandadoEnVuelo = Awaited<ReturnType<typeof candadoEnVuelo>>;
+
+  /**
+   * ¿La escritura llegó a ESPERAR — y espera en la clave del RETO, no en su fila?
+   *
+   * Las cuatro sondas de carrera de C4 traían cada una su propio bucle: cien vueltas de 25 ms
+   * y, agotadas, una cuenta de candados que la aserción presentaba como «nace sobre una foto».
+   * Nada sincronizaba con la escritura: esos 2,5 s eran un presupuesto de RELOJ para que la
+   * contendiente llegara al candado, y en una máquina descansada siempre sobraban. En la CI
+   * —cuatro procesos contra un Postgres compartido— no sobraron: la escritura llegó DESPUÉS de
+   * que la otra transacción soltara, la sonda contó cero y dijo que el guard no toma el candado
+   * del reto, que es lo contrario de lo que había pasado. Reproducido en local retrasando 3 s
+   * el arranque de esa escritura: mismo mensaje y misma línea.
+   *
+   * El reloj deja de ser la condición de salida. Se sale cuando la base dice que alguien espera
+   * por el backend que TIENE el candado —`pg_blocking_pids`, el instrumento que ya usaban las
+   * sondas escritas con `candadoEnVuelo`— o cuando la escritura se ASIENTA, que es la señal de
+   * que no llegó a esperar a nadie y de que ya no va a hacerlo. Ninguna de las dos es un plazo;
+   * el presupuesto solo acota el caso patológico.
+   *
+   * Lo que se AFIRMA sigue siendo la cuenta por clave y no `pg_blocking_pids`: este último no
+   * distingue el candado de aviso del de fila, y «no solo a su fila» es justo lo que estas
+   * cuatro sondas dicen. Esperar en la fila sale ahora deprisa y con la cuenta en cero, que es
+   * el fallo que corresponde.
+   */
+  async function esperaEnLaClaveDelReto(
+    candado: CandadoEnVuelo,
+    retoId: string,
+    escritura: Promise<unknown>,
+  ): Promise<number> {
+    const admin = sqlAdmin();
+    const asentada: { motivo: string | null } = { motivo: null };
+    escritura.then(
+      () => {
+        asentada.motivo = 'la escritura terminó sin llegar a esperar a nadie';
+      },
+      (e: Error) => {
+        asentada.motivo = `la escritura falló antes de esperar a nadie: ${e.message}`;
+      },
+    );
+    await candado.esperaAQueAlguienEspere(undefined, () => asentada.motivo !== null);
+    /*
+     * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
+     *
+     * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es un
+     * número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la cuenta
+     * sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite entera
+     * después de que el INSERT de propuestas empezara a tomar la clave del reto: «expected 3 to
+     * be 1». La sonda medía la contención de la máquina, no la carrera.
+     *
+     * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid` la
+     * alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA expresión
+     * que toma el candado.
+     */
+    const [f] = await admin`select count(*)::int as n
+      from pg_locks l, (select hashtextextended(
+        'designio:reto:' || ${retoId}::text, 42) as k) c
+      where l.locktype = 'advisory' and not l.granted
+        and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
+        and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
+    const n = f!.n as number;
+    /*
+     * No esperar a NADIE y esperar en otro sitio son fallos distintos, y el segundo es el que
+     * estas sondas nombran: ese se deja caer con la cuenta en cero y la prosa de cada una. Este
+     * mensaje cubre solo el primero, que sin él volvería a presentarse como «nace sobre una
+     * foto» —el diagnóstico equivocado del que sale todo esto—.
+     */
+    if (n === 0 && asentada.motivo !== null) throw new Error(asentada.motivo);
+    return n;
   }
 
   /** Un workspace propio para lo que se mide POR LISTA: cortes, orden y marcado. En el
@@ -9878,27 +9953,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('C4 no deja entrar una revisión cuyo veredicto llegó mientras esperaba el candado', { timeout: 30_000 }, async () => {
     await enWorkspaceLimpio('c4-veredicto-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
-      const admin = sqlAdmin();
       const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
 
       // El otro: toma el candado del reto y decide el concepto DENTRO, sin cerrar todavía.
-      let soltar!: () => void;
-      const puedeCerrar = new Promise<void>((r) => {
-        soltar = r;
-      });
-      let tomado!: () => void;
-      const yaTomado = new Promise<void>((r) => {
-        tomado = r;
-      });
-      const elOtro = admin.begin(async (tx) => {
+      const candado = await candadoEnVuelo(async (tx) => {
         await tx`select pg_advisory_xact_lock(
           hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
         await tx`update concepto set estado = 'pasa',
           decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
-        tomado();
-        await puedeCerrar;
       });
-      await yaTomado;
 
       // Y la escritura, que toma su instantánea AHORA —con el concepto todavía candidato para
       // ella— y se queda esperando el candado dentro del trigger.
@@ -9908,44 +9971,17 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó tarde', ${curadorId})`,
       );
       try {
-        // Hasta que de verdad esté bloqueada en el candado: se lee de `pg_locks`, no de un
-        // tiempo de espera, que es lo que haría intermitente a esta prueba.
-        /*
-         * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
-         *
-         * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es
-         * un número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la
-         * cuenta sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite
-         * entera después de que el INSERT de propuestas empezara a tomar la clave del reto:
-         * «expected 3 to be 1». La sonda medía la contención de la máquina, no la carrera.
-         *
-         * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid`
-         * la alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA
-         * expresión que toma el candado.
-         */
-        const esperandoLaClave = async () => {
-          const [f] = await admin`select count(*)::int as n
-            from pg_locks l, (select hashtextextended(
-              'designio:reto:' || ${retoC}::text, 42) as k) c
-            where l.locktype = 'advisory' and not l.granted
-              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
-              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
-          return f!.n as number;
-        };
-        for (let i = 0; i < 100; i++) {
-          if ((await esperandoLaClave()) > 0) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
-        const bloqueada = { n: await esperandoLaClave() };
+        // Hasta que de verdad esté bloqueada en el candado: la salida la da la base —quién
+        // espera por quién—, no un plazo, que es lo que haría intermitente a esta prueba.
         expect(
-          bloqueada!.n,
+          await esperaEnLaClaveDelReto(candado, retoC, escritura),
           'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
         ).toBe(1);
       } finally {
         // Pase lo que pase: si esto no corre, la otra transacción se queda abierta con el
         // candado del reto y la limpieza del workspace se bloquea detrás de ella.
-        soltar();
-        await elOtro;
+        candado.soltar();
+        await candado.terminado;
       }
       await expect(escritura).rejects.toThrow(/ya no es candidato|veredicto/i);
     });
@@ -9973,7 +10009,6 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('la PROPUESTA de C4 espera al candado del reto, no solo a su fila', { timeout: 30_000 }, async () => {
     await enWorkspaceLimpio('c4-propuesta-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
-      const admin = sqlAdmin();
       const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
       const contenido = {
         arquetipoId: lenteA,
@@ -9992,23 +10027,12 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         confianzaPropuesta: 'media',
       };
 
-      let soltar!: () => void;
-      const puedeCerrar = new Promise<void>((r) => {
-        soltar = r;
-      });
-      let tomado!: () => void;
-      const yaTomado = new Promise<void>((r) => {
-        tomado = r;
-      });
-      const elOtro = admin.begin(async (tx) => {
+      const candado = await candadoEnVuelo(async (tx) => {
         await tx`select pg_advisory_xact_lock(
           hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
         await tx`update concepto set estado = 'pasa',
           decidido_por = ${curadorId}, decidido_en = now() where id = ${conceptoId}`;
-        tomado();
-        await puedeCerrar;
       });
-      await yaTomado;
 
       const escritura = conUsuario(curadorId, async (tx) => {
         const [ll] = await tx`insert into llamada_ai
@@ -10026,40 +10050,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
       });
       try {
-        /*
-         * Contando SÓLO los que esperan ESTA clave, y no todos los avisos del clúster.
-         *
-         * La primera versión contaba `locktype = 'advisory' and not granted` a secas, y eso es
-         * un número GLOBAL: en cuanto otra prueba en paralelo espera cualquier otra clave, la
-         * cuenta sube y la afirmación «es 1» se vuelve intermitente. Se vio al correr la suite
-         * entera después de que el INSERT de propuestas empezara a tomar la clave del reto:
-         * «expected 3 to be 1». La sonda medía la contención de la máquina, no la carrera.
-         *
-         * `pg_advisory_xact_lock(bigint)` parte la clave en dos mitades de 32 bits —`classid`
-         * la alta, `objid` la baja—, así que se reconstruye la pregunta a partir de la MISMA
-         * expresión que toma el candado.
-         */
-        const esperandoLaClave = async () => {
-          const [f] = await admin`select count(*)::int as n
-            from pg_locks l, (select hashtextextended(
-              'designio:reto:' || ${retoC}::text, 42) as k) c
-            where l.locktype = 'advisory' and not l.granted
-              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
-              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
-          return f!.n as number;
-        };
-        for (let i = 0; i < 100; i++) {
-          if ((await esperandoLaClave()) > 0) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
-        const bloqueada = { n: await esperandoLaClave() };
         expect(
-          bloqueada!.n,
+          await esperaEnLaClaveDelReto(candado, retoC, escritura),
           'la propuesta no llegó a esperar el candado del reto: nace sobre una foto',
         ).toBe(1);
       } finally {
-        soltar();
-        await elOtro;
+        candado.soltar();
+        await candado.terminado;
       }
       await expect(escritura).rejects.toThrow(/ya no es candidato/i);
     });
@@ -11342,7 +11339,6 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('C4 no deja nacer una propuesta cuya lente se refutó mientras esperaba el candado', { timeout: 30_000 }, async () => {
     await enWorkspaceLimpio('c4-lente-en-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
-      const admin = sqlAdmin();
       const { conceptoId, lenteA, evA } = await conceptoConDosLentes(wsC, retoC, curadorId);
       const contenido = {
         arquetipoId: lenteA,
@@ -11361,25 +11357,14 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
         confianzaPropuesta: 'media',
       };
 
-      let soltar!: () => void;
-      const puedeCerrar = new Promise<void>((r) => {
-        soltar = r;
-      });
-      let tomado!: () => void;
-      const yaTomado = new Promise<void>((r) => {
-        tomado = r;
-      });
       // El otro: toma el candado del reto y REFUTA la lente dentro, sin cerrar todavía.
-      const elOtro = admin.begin(async (tx) => {
+      const candado = await candadoEnVuelo(async (tx) => {
         await tx`select pg_advisory_xact_lock(
           hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
         await tx`update arquetipo set estado = 'refutado',
           veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
           where id = ${lenteA} and workspace_id = ${wsC}`;
-        tomado();
-        await puedeCerrar;
       });
-      await yaTomado;
 
       // Y la propuesta, que toma su instantánea AHORA —con la lente todavía vigente para el
       // guard de linaje— y se queda esperando el candado dentro del guard de revisión.
@@ -11399,26 +11384,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
                   'entorno', ${ll!.id as string}, 0, true, ${curadorId})`;
       });
       try {
-        const esperandoLaClave = async () => {
-          const [f] = await admin`select count(*)::int as n
-            from pg_locks l, (select hashtextextended(
-              'designio:reto:' || ${retoC}::text, 42) as k) c
-            where l.locktype = 'advisory' and not l.granted
-              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
-              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
-          return f!.n as number;
-        };
-        for (let i = 0; i < 100; i++) {
-          if ((await esperandoLaClave()) > 0) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
         expect(
-          await esperandoLaClave(),
+          await esperaEnLaClaveDelReto(candado, retoC, escritura),
           'la propuesta no llegó a esperar el candado: la sonda no mide la carrera',
         ).toBe(1);
       } finally {
-        soltar();
-        await elOtro;
+        candado.soltar();
+        await candado.terminado;
       }
       await expect(escritura).rejects.toThrow(/no puede revisar|refutó/i);
     });
@@ -11680,27 +11652,15 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    */
   it('C4 a mano no deja entrar una revisión cuya lente se refutó mientras esperaba el candado', { timeout: 30_000 }, async () => {
     await enWorkspaceLimpio('c4-lente-refutada-carrera', async ({ ws: wsC, curadorId, retoId: retoC }) => {
-      const admin = sqlAdmin();
       const { conceptoId, lenteA } = await conceptoConDosLentes(wsC, retoC, curadorId);
 
-      let soltar!: () => void;
-      const puedeCerrar = new Promise<void>((r) => {
-        soltar = r;
-      });
-      let tomado!: () => void;
-      const yaTomado = new Promise<void>((r) => {
-        tomado = r;
-      });
-      const elOtro = admin.begin(async (tx) => {
+      const candado = await candadoEnVuelo(async (tx) => {
         await tx`select pg_advisory_xact_lock(
           hashtextextended('designio:reto:' || ${retoC}::text, 42))`;
         await tx`update arquetipo set estado = 'refutado',
           veredicto_razon = 'Las entrevistas no encontraron a nadie con este perfil'
           where id = ${lenteA} and workspace_id = ${wsC}`;
-        tomado();
-        await puedeCerrar;
       });
-      await yaTomado;
 
       const escritura = conUsuario(curadorId, (tx) =>
         tx`insert into revision_simulada
@@ -11708,26 +11668,13 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
           values (${wsC}, ${conceptoId}, ${lenteA}, 'Llegó después del veredicto', ${curadorId})`,
       );
       try {
-        const esperandoLaClave = async () => {
-          const [f] = await admin`select count(*)::int as n
-            from pg_locks l, (select hashtextextended(
-              'designio:reto:' || ${retoC}::text, 42) as k) c
-            where l.locktype = 'advisory' and not l.granted
-              and l.classid = ((c.k >> 32) & x'ffffffff'::bigint)::oid
-              and l.objid = (c.k & x'ffffffff'::bigint)::oid`;
-          return f!.n as number;
-        };
-        for (let i = 0; i < 100; i++) {
-          if ((await esperandoLaClave()) > 0) break;
-          await new Promise((r) => setTimeout(r, 25));
-        }
         expect(
-          await esperandoLaClave(),
+          await esperaEnLaClaveDelReto(candado, retoC, escritura),
           'la escritura no llegó a esperar el candado: la sonda no mide la carrera',
         ).toBe(1);
       } finally {
-        soltar();
-        await elOtro;
+        candado.soltar();
+        await candado.terminado;
       }
       await expect(escritura).rejects.toThrow(/se refutó mientras|refutado no describe/i);
     });
@@ -20066,6 +20013,36 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * lee del catálogo vivo y no de una copia: un censo que compara una lista escrita a mano
    * contra otra escrita a mano no comprueba nada.
    */
+  /**
+   * RF-08.6 — LA OTRA MITAD DEL CENSO DE PARIDAD, la que sólo la base puede contestar.
+   *
+   * `paridad-manual.test.ts` comprueba, con el parser, que desde la puerta manual declarada se
+   * alcanza un `insert into <tabla>`. Para saber cuál es esa tabla deriva el nombre del DESTINO
+   * —guiones a guiones bajos—, y esa regla es una suposición sobre el esquema que aquel fichero,
+   * sin base, no puede verificar. Aquí sí: si un destino se renombrara sin renombrar su tabla, o
+   * al revés, el barrido de allá seguiría buscando una cadena que ya no nombra nada y daría por
+   * incumplida una paridad que existe — o peor, la daría por cumplida contra una tabla ajena.
+   *
+   * Mi primer intento derivaba la tabla de `COLUMNA_DE_DESTINO` menos el `_id`, y era falso:
+   * la columna de C0 es `criterio_id` y su tabla `criterio_exito`. De ahí que esto se compruebe
+   * en vez de asumirse.
+   */
+  it('RF-08.6: la tabla de cada destino existe con el nombre que el censo de paridad deriva', async () => {
+    const admin = sqlAdmin();
+    const destinos = CAPACIDADES_ACTIVAS.map((c) => CAPACIDADES[c].destino).filter(
+      (d): d is NonNullable<typeof d> => d !== null,
+    );
+    expect(destinos.length, 'ninguna capacidad materializa: no hay nada que comprobar').toBeGreaterThan(0);
+    const derivadas = [...new Set(destinos.map((d) => d.replace(/-/g, '_')))].sort();
+    const filas = await admin`
+      select table_name from information_schema.tables
+      where table_schema = 'public' and table_name = any(${derivadas})`;
+    expect(
+      filas.map((f) => f.table_name as string).sort(),
+      'algún destino no tiene tabla con el nombre que el censo de paridad busca',
+    ).toEqual(derivadas);
+  });
+
   it('RF-08.7: el catálogo de métricas del código es el mismo que el de la base', async () => {
     const admin = sqlAdmin();
     const [fila] = await admin`select pg_get_constraintdef(c.oid) as def

@@ -312,6 +312,52 @@ export type LoteCapacidad = {
  * sin decir nada—. La comprobación que acompaña a este registro exige que cada capacidad
  * declarada tenga TODAS sus piezas, así que una a medias enrojece en vez de callar.
  */
+/**
+ * CÓMO SE HACE A MANO LO QUE ESTA CAPACIDAD PROPONE (RF-08.6 / SYS-21).
+ *
+ * «Degradación segura: caída del proveedor AI ⇒ los flujos manuales equivalentes están siempre
+ * presentes.» Eso se cumplía —las siete capacidades con destino tienen su ruta sin AI— pero como
+ * HECHO, no como garantía: la paridad estaba afirmada en cuatro comentarios repartidos y en
+ * ninguna parte declarada, así que una capacidad nueva podía llegar con destino y sin equivalente
+ * manual sin que nada se pusiera rojo. Un requisito que sólo vive en prosa se cumple hasta el día
+ * que alguien no lea la prosa.
+ *
+ * Se declara como DATO —módulo y función, no una referencia— por lo mismo que `ai.roles`: una
+ * referencia real arrastraría los servicios del método al grafo del contrato. El censo la resuelve
+ * con el parser de TypeScript y comprueba que la función existe y que desde ella se alcanza la
+ * escritura del destino, siguiendo el grafo: `escribirRevisionAMano` no inserta nada por sí misma
+ * —delega en el escritor que comparte con la materialización, que es justo como debe ser— y un
+ * censo que mirase un solo fichero la habría dado por incumplida.
+ */
+export type ParidadManual =
+  /**
+   * La capacidad materializa algo, y estos son los pasos por los que se hace sin AI.
+   *
+   * Es una SECUENCIA y no una puerta, y eso lo corrigió una revisión: materializar C2 escribe el
+   * insight y además sus afirmaciones, sus citas y sus contradicciones, y a mano eso son cuatro
+   * acciones. Declarando sólo la primera, borrar `agregarCita` habría dejado la invariante verde
+   * con la paridad ya rota. El censo deriva del materializador QUÉ hay que cubrir y comprueba que
+   * los pasos, juntos, lo cubren.
+   */
+  | {
+      clase: 'escritura';
+      /**
+       * Los pasos se nombran en la capa de SERVER FUNCTIONS y no en la de servicios, y eso lo
+       * corrigió una revisión: SYS-21 pide que la operación se pueda EJECUTAR con la AI apagada,
+       * y un servicio exportado que ningún adaptador expone no lo está. Declarando el servicio,
+       * borrar `aprobarItemImportacion` dejaba la invariante verde con la acción ya fuera del
+       * alcance de quien la necesita. Desde el adaptador, el grafo llega igual a la escritura —
+       * y además comprueba que hay por dónde llamarla.
+       */
+      pasos: readonly { modulo: string; funcion: string }[];
+    }
+  /**
+   * O la capacidad es INFORMATIVA y no materializa nada, así que no hay escritura que replicar.
+   * Se declara con su porqué en vez de omitirse: la diferencia entre «no hace falta» y «se nos
+   * olvidó» no se puede leer de un campo ausente.
+   */
+  | { clase: 'informativa'; porque: string };
+
 export type DefinicionCapacidad = {
   /** Cómo se lee en el selector de capacidad. */
   etiqueta: string;
@@ -340,6 +386,12 @@ export type DefinicionCapacidad = {
    * descartada», y eso sigue exigiendo revisor y fecha.
    */
   destino: Destino | null;
+  /**
+   * La ruta manual equivalente (RF-08.6). Obligatoria, y su `clase` tiene que concordar con
+   * `destino`: si materializa algo hay una escritura que replicar, y si no, no la hay. El censo
+   * compara las dos derivaciones en vez de fiarse de que quien la escriba se acuerde.
+   */
+  paridadManual: ParidadManual;
   ancla: AnclaCapacidad;
   /*
    * El contrato de la salida del modelo NO vive aquí, y esa ausencia es deliberada. Este
@@ -451,6 +503,12 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   CI: {
     etiqueta: 'Extracción de importación → evidencia',
     destino: 'evidencia',
+    /*
+     * `aprobarItem` y no `crearItem`, y esto lo destapó una revisión de este mismo PR: crear el
+     * ítem de la bandeja inserta `item_importacion`, no evidencia. Lo que CI propone es la
+     * EXTRACCIÓN, y a mano eso es curar el ítem y aprobarlo — ahí nace la evidencia.
+     */
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/evidencia/evidencia.functions', funcion: 'aprobarItemImportacion' }] },
     ancla: {
       columna: 'item_id',
       etiqueta: 'Item de la bandeja',
@@ -472,6 +530,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C0: {
     etiqueta: 'Borrador de reto → criterio de éxito',
     destino: 'criterio-exito',
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/metodo/metodo.functions', funcion: 'definirCriterio' }] },
     ancla: {
       columna: 'reto_id',
       etiqueta: 'Reto con criterios abiertos',
@@ -501,6 +560,11 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * en el docblock de `destino`, arriba.
      */
     destino: null,
+    paridadManual: {
+      clase: 'informativa',
+      porque:
+        'CT no materializa nada —RF-08.4: reporta huecos citando objetos y carece de «aprobar»—, así que no hay escritura que replicar. Lo que se hace sin ella es lo de siempre: leer la checklist del gate. La capacidad ahorra la lectura, no sustituye una decisión.',
+    },
     ancla: {
       columna: 'gate_id',
       etiqueta: 'Gate pendiente',
@@ -539,6 +603,15 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C2: {
     etiqueta: 'Insights del reto → insight con afirmaciones citadas',
     destino: 'insight',
+    paridadManual: {
+      clase: 'escritura',
+      pasos: [
+        { modulo: '@/lib/insight/insight.functions', funcion: 'proponerInsight' },
+        { modulo: '@/lib/insight/insight.functions', funcion: 'afirmarEnInsight' },
+        { modulo: '@/lib/insight/insight.functions', funcion: 'citarEvidencia' },
+        { modulo: '@/lib/insight/insight.functions', funcion: 'anotarContradiccion' },
+      ],
+    },
     /*
      * El RETO, la misma columna que C0. C2 es la primera capacidad que COMPARTE ancla, y eso
      * es lo que el registro anticipaba: dos capacidades pueden colgar del mismo objeto y no
@@ -604,6 +677,11 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * qué hacer con ella EN ESTE grafo.
      */
     destino: null,
+    paridadManual: {
+      clase: 'informativa',
+      porque:
+        'C5 propone cómo cerrar lo que la validación del grafo ya señala: el hueco lo nombra la validación, no la capacidad, y quien lo cierra edita el journey con las mismas puertas de siempre. No materializa un objeto propio, así que no hay puerta equivalente que declarar.',
+    },
     ancla: {
       columna: 'journey_id',
       etiqueta: 'Journey con señales abiertas',
@@ -633,6 +711,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C6: {
     etiqueta: 'Borrador del Metric Registry → entrada KPI',
     destino: 'entrada-kpi',
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/medicion/medicion.functions', funcion: 'agregarEntradaKpi' }] },
     /*
      * El REGISTRY, y no el reto, aunque el material salga del reto. `entrada_kpi.registry_id`
      * es NOT NULL, así que una propuesta anclada en el reto no sabría en qué registry
@@ -676,6 +755,13 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C7: {
     etiqueta: 'Conciliación del reto → borrador del post mortem',
     destino: 'outcome-review',
+    /*
+     * `guardarBorradorReview` y no `abrirOutcomeReview`, de la misma revisión: abrir la review
+     * crea la fila vacía, y lo que C7 materializa es el BORRADOR sobre una fila que ya existe
+     * —`update outcome_review`, igual que esta función—. La paridad se empareja con lo que la
+     * capacidad PRODUCE, no con lo que abre el expediente donde se guarda.
+     */
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/medicion/medicion.functions', funcion: 'guardarBorradorDelReview' }] },
     /*
      * EL POST MORTEM EN BORRADOR, y no el reto, por lo mismo que C6 se ancla en el registry: la
      * fila tiene que existir para que haya dónde materializar, y la política que la crea es la
@@ -730,6 +816,13 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C3: {
     etiqueta: 'Oportunidades del reto → pregunta HMW trazada a insights',
     destino: 'oportunidad',
+    paridadManual: {
+      clase: 'escritura',
+      pasos: [
+        { modulo: '@/lib/servicio/oportunidad.functions', funcion: 'proponerOportunidad' },
+        { modulo: '@/lib/servicio/oportunidad.functions', funcion: 'trazarInsight' },
+      ],
+    },
     /*
      * El RETO, la TERCERA capacidad que comparte esta columna —con C0 y C2—. Que sean tres y
      * no dos importa poco por sí mismo; lo que importa es que ninguna de las tres comparte
@@ -788,6 +881,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C4: {
     etiqueta: 'Concepto × arquetipos → revisión simulada y preguntas de test',
     destino: 'revision-simulada',
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/metodo/gobernanza.functions', funcion: 'escribirRevisionSimuladaAMano' }] },
     /*
      * EL CONCEPTO, y no el reto aunque los arquetipos sean del reto.
      *

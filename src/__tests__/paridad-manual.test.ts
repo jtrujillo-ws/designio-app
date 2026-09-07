@@ -528,6 +528,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const predicadosSinColumna = new Set<string>();
     const conjuntosImposibles = new Set<string>();
     const origenesSinLeer = new Set<string>();
+    const sentenciasQueNoEjecutan = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -639,23 +640,57 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * devuelve, así que ahí un cuerpo corto sigue sin ejecutarse.
      */
     const asimilaLoQueDevuelve = (quien: string): boolean => quien === ENTREGA_LA_TRANSACCION;
-    /** Si la función que envuelve a la plantilla la entrega a alguien que ESPERA su vuelta. */
-    const laEsperaQuienLaRecibe = (f: ts.Node): boolean => {
-      const recibe = f.parent as ts.Node | undefined;
-      if (recibe === undefined || !ts.isCallExpression(recibe)) return false;
-      const q = recibe.expression;
-      const quien = ts.isPropertyAccessExpression(q)
-        ? q.name.text
-        : ts.isIdentifier(q)
-          ? q.text
-          : null;
-      if (quien === null || !asimilaLoQueDevuelve(quien)) return false;
-      const posiciones = EJECUTAN_SU_CALLBACK.get(quien);
-      return (
-        posiciones !== undefined &&
-        posiciones.includes(recibe.arguments.indexOf(f as unknown as ts.Expression))
-      );
+    /**
+     * DÓNDE SE ENTREGA UNA FUNCIÓN: en el sitio, o guardada antes con un nombre.
+     *
+     * Mirando sólo al padre inmediato, `const persistir = (tx) => tx\`…\`; conUsuario(actorId,
+     * persistir)` no se veía como entregada, y eso rompía dos cosas a la vez: ni su vuelta se
+     * daba por esperada ni su parámetro se reconocía como el cliente de la base. Las dos
+     * preguntas se hacen ahora sobre la misma lectura.
+     */
+    const recepcionDe = (fn: ts.Node): { llamada: ts.CallExpression; indice: number }[] => {
+      const fuera: { llamada: ts.CallExpression; indice: number }[] = [];
+      const directo = fn.parent as ts.Node | undefined;
+      if (directo !== undefined && ts.isCallExpression(directo)) {
+        const i = directo.arguments.indexOf(fn as unknown as ts.Expression);
+        if (i >= 0) fuera.push({ llamada: directo, indice: i });
+      }
+      if (
+        directo !== undefined &&
+        ts.isVariableDeclaration(directo) &&
+        directo.initializer === (fn as unknown as ts.Expression) &&
+        ts.isIdentifier(directo.name)
+      ) {
+        const suyo = directo.name.text;
+        let ambito: ts.Node | undefined = directo.parent as ts.Node | undefined;
+        while (ambito !== undefined && !ts.isFunctionLike(ambito) && !ts.isSourceFile(ambito)) {
+          ambito = ambito.parent as ts.Node | undefined;
+        }
+        const ver = (y: ts.Node): void => {
+          if (ts.isCallExpression(y)) {
+            y.arguments.forEach((a, i) => {
+              if (ts.isIdentifier(a) && a.text === suyo) fuera.push({ llamada: y, indice: i });
+            });
+          }
+          ts.forEachChild(y, ver);
+        };
+        if (ambito !== undefined) ver(ambito);
+      }
+      return fuera;
     };
+    /** Si la función que envuelve a la plantilla la entrega a alguien que ESPERA su vuelta. */
+    const laEsperaQuienLaRecibe = (f: ts.Node): boolean =>
+      recepcionDe(f).some(({ llamada, indice }) => {
+        const q = llamada.expression;
+        const quien = ts.isPropertyAccessExpression(q)
+          ? q.name.text
+          : ts.isIdentifier(q)
+            ? q.text
+            : null;
+        if (quien === null || !asimilaLoQueDevuelve(quien)) return false;
+        const posiciones = EJECUTAN_SU_CALLBACK.get(quien);
+        return posiciones !== undefined && posiciones.includes(indice);
+      });
 
     /** Si quien recibe una función anónima la ejecuta. Lo que no, se nombra si lleva SQL. */
     const laEjecutaQuienLaRecibe = (x: ts.Node): boolean => {
@@ -1348,7 +1383,28 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             });
           }
         }
-        if (ts.isIdentifier(x.expression)) {
+        /*
+         * `f.call(…)`, `f.apply(…)` y `f.bind(…)` LLAMAN A `f`. Leídas como llamadas de
+         * propiedad se descartaban —el receptor no es un espacio de nombres—, así que un
+         * `await generarConProveedor.call(undefined, entrada)` dejaba fuera al proveedor y
+         * SYS-21 seguía en verde con la ruta manual llamando al modelo.
+         */
+        const porElReceptor =
+          ts.isPropertyAccessExpression(x.expression) &&
+          ['call', 'apply', 'bind'].includes(x.expression.name.text)
+            ? x.expression.expression
+            : null;
+        if (porElReceptor !== null && ts.isIdentifier(porElReceptor)) {
+          llamadas.push({ objeto: null, nombre: porElReceptor.text, donde: x });
+        } else if (porElReceptor !== null && ts.isPropertyAccessExpression(porElReceptor)) {
+          llamadas.push({
+            objeto: ts.isIdentifier(porElReceptor.expression)
+              ? porElReceptor.expression.text
+              : null,
+            nombre: porElReceptor.name.text,
+            donde: x,
+          });
+        } else if (ts.isIdentifier(x.expression)) {
           llamadas.push({ objeto: null, nombre: x.expression.text, donde: x });
         } else if (ts.isPropertyAccessExpression(x.expression)) {
           llamadas.push({
@@ -1918,6 +1974,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             }
           }
         }
+        /*
+         * Y LOS DOS SITIOS QUE LIGAN SIN SER SENTENCIAS DE BLOQUE: la cabecera de un `for` y el
+         * `catch`. Sin ellos, un `for (const persistir of […]) { await persistir(); }` no
+         * tapaba a un `persistir` importado y la llamada se acreditaba al import, con lo que
+         * borrar la escritura de verdad dejaba la invariante en verde.
+         */
+        if (
+          (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
+          a.initializer !== undefined &&
+          ts.isVariableDeclarationList(a.initializer)
+        ) {
+          for (const d of a.initializer.declarations) {
+            if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+          }
+        }
+        if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
+          const v = a.variableDeclaration;
+          if (ts.isIdentifier(v.name) && v.name.text === nombre) return v;
+        }
         a = a.parent as ts.Node | undefined;
       }
       return null;
@@ -1957,13 +2032,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
       const fn = p.parent as ts.Node;
       if (!ts.isFunctionLike(fn)) return false;
-      const llamada = fn.parent as ts.Node | undefined;
-      if (llamada === undefined || !ts.isCallExpression(llamada)) return false;
-      if (llamada.arguments.indexOf(fn as unknown as ts.Expression) !== 1) return false;
       if (fn.parameters.indexOf(p) !== 0) return false;
-      const quien = llamada.expression;
-      if (!ts.isIdentifier(quien) || ligaduraDe(quien, quien.text) !== null) return false;
-      return vieneDeLaBase(f, quien.text) === ENTREGA_LA_TRANSACCION;
+      return recepcionDe(fn).some(({ llamada, indice }) => {
+        if (indice !== 1) return false;
+        const quien = llamada.expression;
+        return (
+          ts.isIdentifier(quien) &&
+          ligaduraDe(quien, quien.text) === null &&
+          vieneDeLaBase(f, quien.text) === ENTREGA_LA_TRANSACCION
+        );
+      });
     };
 
     /** Y la etiqueta entera: lo que de verdad manda la sentencia a la base. */
@@ -2065,6 +2143,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         const guardas = guardasDe(decl);
         for (const consulta of sqlDe(decl)) {
+          /*
+           * Y UN `EXPLAIN` NO EJECUTA NADA. La búsqueda de la escritura no está anclada al
+           * comando, así que un `tx\`explain update outcome_review set …\`` se contaba con las
+           * mismas columnas y el mismo filtro que el `update` de verdad — y como devuelve filas
+           * de plan, hasta el `guardado.length` de C7 daba por bueno el guardado. No se ignora
+           * en silencio: se nombra, porque un `explain analyze` sí ejecuta y esa es una
+           * decisión de quien lo escriba, no del censo.
+           */
+          if (/^\s*explain\b/i.test(consulta.sql)) {
+            sentenciasQueNoEjecutan.add(consulta.etiqueta);
+            continue;
+          }
           for (const m of consulta.sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
             const tabla = m[2]!;
             if (CONTABILIDAD_AI.includes(tabla)) continue;
@@ -2259,6 +2349,31 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               const l = ligaduraDe(a, nombre);
               if (l.hay) return l;
             }
+            /*
+             * Y los dos sitios que ligan sin ser bloque ni función: la cabecera de un `for` y
+             * el `catch`. Tapan SIN destino, que es lo conservador — de lo que se recorre sale
+             * un elemento por vuelta, y de un `catch` un error.
+             */
+            if (
+              (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
+              a.initializer !== undefined &&
+              ts.isVariableDeclarationList(a.initializer)
+            ) {
+              for (const d of a.initializer.declarations) {
+                let hay = false;
+                nombresDe(d.name, (x) => {
+                  if (x === nombre) hay = true;
+                });
+                if (hay) return { hay: true, alias: null, via: null };
+              }
+            }
+            if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
+              let hay = false;
+              nombresDe(a.variableDeclaration.name, (x) => {
+                if (x === nombre) hay = true;
+              });
+              if (hay) return { hay: true, alias: null, via: null };
+            }
             if (a === decl) return { hay: false, alias: null, via: null };
             a = a.parent as ts.Node | undefined;
           }
@@ -2291,7 +2406,27 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             if (suyo?.original === '*') cola.push({ modulo: suyo.modulo, funcion: sombra.via.miembro });
             continue;
           }
-          const bajo = sombra.hay ? sombra.alias : nombre;
+          /*
+           * Y el alias se sigue por TODOS sus saltos. `const generar = generarConProveedor;
+           * const ejecutar = generar; await ejecutar()` resolvía un salto y se quedaba en una
+           * declaración local sin llamada dentro, así que el proveedor no entraba en el
+           * alcance y SYS-21 pasaba con la ruta manual llamando al modelo.
+           */
+          let bajo: string | null = sombra.hay ? sombra.alias : nombre;
+          for (let salto = 0; salto < 8 && bajo !== null; salto += 1) {
+            const otra = sombraEn(donde, bajo);
+            if (!otra.hay) break;
+            if (otra.via !== null) {
+              const suyo2 = imports.get(otra.via.objeto);
+              if (suyo2?.original === '*') {
+                cola.push({ modulo: suyo2.modulo, funcion: otra.via.miembro });
+              }
+              bajo = null;
+              break;
+            }
+            if (otra.alias === bajo) break;
+            bajo = otra.alias;
+          }
           if (bajo === null) continue;
           const importado = imports.get(bajo);
           if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
@@ -2625,6 +2760,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     expect(
       [...origenesSinLeer].sort(),
       'una interpolación sale de un nombre cuyo origen este censo no sabe leer: decide si cuenta',
+    ).toEqual([]);
+    expect(
+      [...sentenciasQueNoEjecutan].sort(),
+      'una escritura va detrás de un EXPLAIN, que no la ejecuta: decide si cuenta',
     ).toEqual([]);
   });
 });

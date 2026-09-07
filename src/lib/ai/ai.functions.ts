@@ -2,12 +2,14 @@ import { createServerFn } from '@tanstack/react-start';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
 import { requerirUsuarioId, usuarioIdDeRequest } from '@/lib/auth/guardia.server';
 import {
+  CorridaEvalInputSchema,
   GenerarPropuestasSchema,
   ObservabilidadInputSchema,
   PropuestasInputSchema,
   RegistrarConsentimientoSchema,
   RevisarPropuestaSchema,
 } from './ai.schemas';
+import { correrEvalDeGrounding, informeDeGrounding } from './ai.evals';
 import { observabilidadAI } from './ai.observabilidad';
 import {
   aceptarPropuesta,
@@ -118,8 +120,9 @@ export const rechazarPropuestaAI = createServerFn({ method: 'POST' })
  * RF-08.9 — el libro de costos del workspace, por capacidad.
  *
  * GET y sin contrato `{ok, …}` porque es una LECTURA: si falla, falla hacia el error boundary
- * del router como el resto de loaders. La puerta de rol la pone la pantalla; el servicio sólo
- * exige lo que la base ya exige, que es membresía viva.
+ * del router como el resto de loaders. La puerta de rol la pone el SERVICIO —`observabilidadAI`
+ * relee `workspace_role` y cierra la proyección—, y la pantalla no la repite: sin eso, cualquier
+ * miembro podía pedir a mano el cuadro con la factura de la boutique.
  */
 export const observabilidadDelWorkspace = createServerFn({ method: 'GET' })
   .inputValidator(ObservabilidadInputSchema)
@@ -139,6 +142,46 @@ export const observabilidadDelWorkspace = createServerFn({ method: 'GET' })
        * `catch` no veía nunca el rechazo.
        */
       if (e instanceof ErrorAutorizacion) return null;
+      throw e;
+    }
+  });
+
+/**
+ * RF-08.7 — el informe de grounding, y correr una eval.
+ *
+ * Dos funciones y no una: LEER el informe es de quien audita y no escribe nada; CORRER una
+ * eval escribe un hecho fechado en el workspace y es de quien lo lleva. Con una sola,
+ * cualquiera que abriera la pantalla habría dejado una corrida en la tabla — y una serie
+ * histórica que se llena sola al mirarla no compara nada.
+ *
+ * El error del rol vuelve como `{ok:false, error}` y no como excepción, por la misma razón que
+ * el resto del pipeline: la pantalla dice qué falta en vez de romperse.
+ */
+export const informeDeGroundingDelWorkspace = createServerFn({ method: 'GET' })
+  .inputValidator(CorridaEvalInputSchema)
+  .handler(async ({ data }) => {
+    const usuarioId = await requerirUsuarioId();
+    try {
+      return await informeDeGrounding(usuarioId, data.workspaceId);
+    } catch (e) {
+      // Cuenta desactivada con JWT aún vigente, o rol sin permiso: sin datos. La pantalla
+      // distingue «no te corresponde» de «aún no hay corridas» por otra vía, porque un
+      // informe vacío y una puerta cerrada no se parecen en nada para quien mira.
+      if (e instanceof ErrorAutorizacion || e instanceof ErrorAI) return null;
+      throw e;
+    }
+  });
+
+export const correrEvalDeGroundingDelWorkspace = createServerFn({ method: 'POST' })
+  .inputValidator(CorridaEvalInputSchema)
+  .handler(async ({ data }) => {
+    const actorId = await usuarioIdDeRequest();
+    if (!actorId) return { ok: false as const, error: 'Tu sesión expiró: vuelve a entrar' };
+    try {
+      return { ok: true as const, informe: await correrEvalDeGrounding(actorId, data.workspaceId) };
+    } catch (e) {
+      const mensaje = mensajeDe(e);
+      if (mensaje) return { ok: false as const, error: mensaje };
       throw e;
     }
   });

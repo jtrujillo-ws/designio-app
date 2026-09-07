@@ -308,6 +308,19 @@ export const CATALOGO_EXPORT = [
   { tabla: 'propuesta_ai', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'llamada_ai', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'reserva_ai', orden: 'creado_en, id', poda: { modo: 'fuera' } },
+  /*
+   * Y las dos de la corrida de grounding (RF-08.7), por la misma razón que el libro de costos:
+   * son RECUENTOS sobre lo que la boutique produjo —cuánto de lo aceptado tenía su cita en el
+   * material, cuánto hubo que corregir— y no material del cliente por ningún lado. Van al
+   * ARCHIVO del propietario porque llevan `workspace_id` y SYS-04 no admite excepciones, y
+   * quedan fuera del entregable: ninguna tiene `evidencia_id`, así que el eje de poda de este
+   * ámbito ni siquiera las alcanza.
+   *
+   * Que estén aquí lo cazó el censo, no mi memoria: una tabla nueva del workspace tiene esta
+   * obligación y la única forma de no olvidarla es que falle una prueba.
+   */
+  { tabla: 'corrida_eval', orden: 'corrida_en, id', poda: { modo: 'fuera' } },
+  { tabla: 'medicion_eval', orden: 'corrida_id, metrica, capacidad', poda: { modo: 'fuera' } },
   { tabla: 'consentimiento_item', orden: 'registrado_en, id', poda: { modo: 'fuera' } },
   { tabla: 'evento_dominio', orden: 'creado_en, id', poda: { modo: 'fuera' } },
   // Bookkeeping del sembrado de desarrollo: registra qué objetos creó el seed, para que

@@ -39,3 +39,23 @@ import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
  * que paga el cliente, y quien paga probablemente deba ver la factura.
  */
 export const ROLES_OBSERVABILIDAD_AI = ROLES_AUDITORIA;
+
+/**
+ * Quién puede LEER el informe de grounding (RF-08.7), derivado de la misma raíz.
+ *
+ * El informe responde a la pregunta de la auditoría con otras cifras —«¿qué tan de fiar es lo
+ * que esta capa produjo?»— y su respuesta interesa al cliente que administra tanto como a la
+ * boutique: son recuentos sobre la calidad del trabajo que se le entrega, no la factura ni los
+ * nombres de los modelos. Se deriva, y no se copia, por la razón de arriba: dos listas iguales
+ * escritas a mano se separan el día que una cambie.
+ *
+ * Vive aquí y no en `ai.schemas.ts` por el motivo de la cabecera, y esa es la única razón: el
+ * lateral la lee para decidir si pinta la fila, y `lateral.ts` no puede alcanzar el contrato.
+ * Quién puede CORRERLA es otra puerta —escribe un hecho fechado— y se queda con el contrato,
+ * porque solo la usa el servidor.
+ *
+ * La misma advertencia que arriba, y por escrito porque ya me costó una vez: que la RLS deje
+ * leer `corrida_eval` y `medicion_eval` a todo miembro —y así se queda— no convierte esto en
+ * «puerta de pantalla». La capa 2 cierra la proyección por rol igual que la auditoría.
+ */
+export const ROLES_INFORME_GROUNDING = ROLES_AUDITORIA;

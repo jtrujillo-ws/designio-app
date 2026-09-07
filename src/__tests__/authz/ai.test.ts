@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { cerrarPools, conUsuario, sqlAdmin } from '@/lib/db';
 import { ErrorAutorizacion } from '@/lib/auth/auth.servicio';
+import { ETIQUETA_ROL } from '@/lib/auth/auth.schemas';
 import {
   costoDeUso,
   INTENTOS_POR_GENERACION,
@@ -19,6 +20,8 @@ import {
 import {
   CONFIANZA_PROPUESTA_NUMERICA,
   ESTADOS_ANCLA,
+  METRICAS_DE_GROUNDING,
+  ROLES_CORREN_EVAL,
   type EstadoAncla,
   type ContenidoAsistenteGate,
   type ContenidoEntradaKpi,
@@ -32,8 +35,19 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
+import {
+  CAPACIDADES_CON_AFIRMACIONES,
+  correrEvalDeGrounding,
+  informeDeGrounding,
+} from '@/lib/ai/ai.evals';
+import { CAPACIDADES_QUE_DECLARAN_AFIRMACIONES } from '@/lib/ai/ai.contenido';
+import { agregarAfirmacion } from '@/lib/insight/insight.servicio';
 import { observabilidadAI } from '@/lib/ai/ai.observabilidad';
-import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.schemas';
+import {
+  METRICAS_SIN_MEDIR,
+  ROLES_OBSERVABILIDAD_AI,
+  rotuloSinCifra,
+} from '@/lib/ai/ai.schemas';
 import {
   arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
@@ -925,6 +939,10 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       await admin`delete from proyecto where workspace_id = ${wsL}`;
       await admin`delete from reto where workspace_id = ${wsL}`;
       await admin`delete from servicio where workspace_id = ${wsL}`;
+      // Las corridas de eval no cuelgan de nada del método —son recuentos— así que van al
+      // final, con el workspace. `medicion_eval` se va con la suya por la cascada de su FK
+      // compuesta: borrarla aparte sería escribir dos veces la misma regla.
+      await admin`delete from corrida_eval where workspace_id = ${wsL}`;
       await admin`delete from miembro where workspace_id = ${wsL}`;
       // Otra vez los eventos, y no es redundante: los escriben TRIGGERS, así que los borrados
       // de arriba dejan los suyos. El primer barrido limpia lo que la prueba produjo; éste,
@@ -20034,6 +20052,563 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
       from information_schema.column_privileges
       where table_name = 'entrada_kpi' and column_name = 'id' and grantee = 'designio_app'`;
     expect(gid?.puede ?? false).toBe(false);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════════════════
+  // RF-08.7 — LA CORRIDA DE EVALS DE GROUNDING
+  // ═══════════════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * LA LISTA DE MÉTRICAS ESTÁ EN DOS SITIOS, así que se comparan.
+   *
+   * El CHECK de `medicion_eval.metrica` y `METRICAS_DE_GROUNDING` dicen lo mismo, y es la quinta
+   * vez en esta épica que una enumeración escrita dos veces se separa sin que nada lo diga. Se
+   * lee del catálogo vivo y no de una copia: un censo que compara una lista escrita a mano
+   * contra otra escrita a mano no comprueba nada.
+   */
+  it('RF-08.7: el catálogo de métricas del código es el mismo que el de la base', async () => {
+    const admin = sqlAdmin();
+    const [fila] = await admin`select pg_get_constraintdef(c.oid) as def
+      from pg_constraint c
+      where c.conrelid = 'medicion_eval'::regclass and c.contype = 'c'
+        and pg_get_constraintdef(c.oid) like '%metrica%'`;
+    const def = (fila?.def ?? '') as string;
+    expect(def, 'sin el CHECK de metrica no hay nada que comparar').not.toBe('');
+    const enLaBase = [...def.matchAll(/'([a-z-]+)'::text/g)].map((m) => m[1]!).sort();
+    expect(enLaBase).toEqual([...METRICAS_DE_GROUNDING].sort());
+  });
+
+  /**
+   * Y LOS ROLES QUE PUEDEN CORRERLA, igual: la lista del producto contra las políticas.
+   *
+   * `ROLES_CORREN_EVAL` decide si la pantalla ofrece el botón; las políticas de INSERT deciden
+   * si la base lo acepta. Separadas, el día que una cambiara el producto ofrecería una acción
+   * que la base rechaza — con el gasto de la corrida ya hecho y un 42501 por explicación.
+   */
+  it('RF-08.7: los roles que corren una eval son los de las políticas de escritura', async () => {
+    const admin = sqlAdmin();
+    const politicas = await admin`select c.relname::text as tabla,
+             coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') as expresion
+      from pg_policy p join pg_class c on c.oid = p.polrelid
+      where c.relname in ('corrida_eval', 'medicion_eval') and p.polcmd = 'a'
+      order by 1`;
+    expect(politicas.map((x) => x.tabla)).toEqual(['corrida_eval', 'medicion_eval']);
+    for (const pol of politicas) {
+      const texto = pol.expresion as string;
+      for (const rol of ROLES_CORREN_EVAL) {
+        expect(texto, `${pol.tabla as string} no nombra a ${rol}`).toContain(`'${rol}'`);
+      }
+      /*
+       * Y en el otro sentido: ningún rol de MÁS en la base que el producto no ofrezca. El
+       * vocabulario sale de `ETIQUETA_ROL` —los roles que el producto conoce— y no de una
+       * heurística sobre la forma del literal: mi primer intento filtraba «lleva guion», y con
+       * eso `disenador` no era un rol y el censo comparaba una lista a la que le faltaba justo
+       * uno de los dos que quería comprobar. El censo tiene que fallar por lo que mide, no por
+       * cómo lo reconoce.
+       */
+      const vocabulario = new Set(Object.keys(ETIQUETA_ROL));
+      const nombrados = [...texto.matchAll(/'([a-z-]+)'::text/g)].map((m) => m[1]!);
+      const roles = nombrados.filter((r) => vocabulario.has(r));
+      expect(roles.length, 'el censo no reconoció ningún rol: mide su propia regex').toBeGreaterThan(0);
+      expect([...new Set(roles)].sort()).toEqual([...ROLES_CORREN_EVAL].sort());
+    }
+  });
+
+  /**
+   * REVOCAR DERECHOS NO SE CONVIERTE EN UN FALLO DE GROUNDING.
+   *
+   * El derecho de uso caduca por fecha y se puede revocar, así que si una revocación bajara el
+   * suelo de presencia, la métrica de grounding bajaría sola con el calendario — culpando al
+   * modelo de algo que hizo un humano meses después. Aquí se mide que no pasa, y POR DÓNDE sale:
+   * la cita se queda SIN VEREDICTO (el material que se recompone hoy ya no es el que vio el
+   * modelo, porque la evidencia revocada deja de entrar en él), no marcada como ausente. Un
+   * `0/1` y un `0/0 con una sin veredicto` se parecen en la primera cifra y dicen cosas
+   * opuestas.
+   *
+   * Y la MISMA revocación sí mueve `afirmaciones-no-soportadas`, que es la métrica que habla de
+   * derechos vivos. Las dos en la misma sonda: mover una sin la otra es justo lo que se mide.
+   *
+   * De paso queda medido lo que yo había supuesto mal al escribir el servicio. Creía que el
+   * recorte del pasaje —el marcador que sustituye al fragmento— envenenaría la medida, y no
+   * llega a hacerlo: `material_evidencia_visible` deja pasar el material a `lead-boutique`,
+   * `disenador` y `admin-cliente` SIEMPRE, así que quien corre la eval nunca ve un recorte. La
+   * medida se toma igualmente sobre el original CRUDO, y eso no es redundante: una medida que
+   * dependiera del rol de quien la corre daría cifras distintas para el mismo workspace según
+   * quién apretara el botón, y ese día llegaría sin que nada fallara.
+   */
+  it('RF-08.7: revocar los derechos deja la cita sin veredicto, no ausente, y sube las no soportadas', async () => {
+    await enWorkspaceLimpio('eval-suelo-crudo', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      // Antes de aceptar, la cita se mide y sale PRESENTE: sin esto la sonda podría estar
+      // midiendo un fixture cuyo fragmento nunca apareció, y el resto no diría nada.
+      expect(propuesta.citas.map((c) => c.presenteLiteral)).toEqual([true]);
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
+
+      const antes = await correrEvalDeGrounding(curadorId, wsC);
+      const leer = (inf: typeof antes, metrica: string) =>
+        inf.ultima!.mediciones.find((m) => m.metrica === metrica && m.capacidad === 'C2')!;
+      const cifras = (m: (typeof antes)['ultima'] extends null ? never : ReturnType<typeof leer>) =>
+        [m.numerador, m.denominador, m.sinVeredicto];
+      expect(cifras(leer(antes, 'suelo-presencia-literal'))).toEqual([1, 1, 0]);
+      expect(cifras(leer(antes, 'afirmaciones-no-soportadas'))).toEqual([0, 1, 0]);
+
+      // Y ahora se revocan los derechos del documento citado. Nadie tocó la propuesta.
+      await admin`update derecho_uso set estado = 'denegado', ambito = 'interno', vence_en = null
+        where workspace_id = ${wsC} and evidencia_id = ${ev}`;
+
+      /*
+       * Y la ficha del panel deja de enseñar el pasaje A QUIEN NO PUEDE RECIBIRLO, que es la
+       * lectura contra la que se contrasta. Medido, y no como yo lo había escrito:
+       * `material_evidencia_visible` deja pasar el material a `lead-boutique`, `disenador` y
+       * `admin-cliente` SIEMPRE, así que el recorte solo se ve desde un rol de cliente. Por eso
+       * esta mitad se mira con un stakeholder y no con quien corre la eval.
+       */
+      const email = `${marca}-eval-crudo-stk@test.demo`;
+      const [u] = await admin`insert into usuario (email, nombre, estado)
+        values (${email}, 'Stakeholder', 'activo') returning id`;
+      const stakeholder = u!.id as string;
+      await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+        values (${wsC}, ${stakeholder}, 'Stakeholder', ${email}, 'stakeholder')`;
+      const tras = await panelPropuestas(stakeholder, wsC);
+      const decidida = tras.decididas.find((x) => x.capacidad === 'C2')!;
+      expect(decidida.citas[0]!.fragmento).toBe(PASAJE_RETIRADO);
+      // Y desde la boutique el pasaje sigue viéndose: es lo que hace que la medida NO dependa
+      // de quién la corre — y lo que dejaría de ser cierto si algún día se midiera lo recortado.
+      const desdeLaBoutique = await panelPropuestas(curadorId, wsC);
+      expect(
+        desdeLaBoutique.decididas.find((x) => x.capacidad === 'C2')!.citas[0]!.fragmento,
+      ).not.toBe(PASAJE_RETIRADO);
+
+      const despues = await correrEvalDeGrounding(curadorId, wsC);
+      // El suelo NO acusa al modelo: la cita sale del denominador y se cuenta aparte. Con un
+      // `[0, 1, 0]` aquí, cada revocación de derechos habría restado puntos de grounding.
+      expect(
+        cifras(leer(despues, 'suelo-presencia-literal')),
+        'una revocación de derechos no es una cita ausente',
+      ).toEqual([0, 0, 1]);
+      // Y la afirmación se queda sin sostén VIVO, que es la métrica que habla de derechos.
+      expect(cifras(leer(despues, 'afirmaciones-no-soportadas'))).toEqual([1, 1, 0]);
+    });
+  });
+
+  /**
+   * UNA CITA SIN VEREDICTO NO CUENTA COMO FALLO: sale del denominador y se dice cuántas fueron.
+   *
+   * Cuando el material que se recompone hoy ya no es el que vio el modelo, medir contra el
+   * estado de hoy pinta en verde lo que una edición ajena añadió y en rojo la cita legítima que
+   * borró. La respuesta honesta es que no hay veredicto — y un denominador que las excluye en
+   * silencio no se puede comparar con el de la corrida anterior, que es para lo que existe la
+   * tabla. Por eso `sin_veredicto` se guarda.
+   */
+  it('RF-08.7: la cita cuyo material cambió sale del denominador y se cuenta aparte', async () => {
+    await enWorkspaceLimpio('eval-sin-veredicto', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
+
+      const antes = await correrEvalDeGrounding(curadorId, wsC);
+      const suelo = (inf: typeof antes) =>
+        inf.ultima!.mediciones.find(
+          (m) => m.metrica === 'suelo-presencia-literal' && m.capacidad === 'C2',
+        )!;
+      expect([suelo(antes).numerador, suelo(antes).denominador, suelo(antes).sinVeredicto]).toEqual(
+        [1, 1, 0],
+      );
+
+      // Alguien enlaza otro documento al mismo reto: el material que el panel recompone deja de
+      // ser el que el modelo leyó, y la huella guardada lo dice.
+      await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'AAA · Acta de la sesión',
+        resumen: 'Nada que ver con el funnel.',
+      });
+
+      const despues = await correrEvalDeGrounding(curadorId, wsC);
+      expect(
+        [suelo(despues).numerador, suelo(despues).denominador, suelo(despues).sinVeredicto],
+        'una cita sin veredicto no es una cita ausente: ni suma al numerador ni al denominador',
+      ).toEqual([0, 0, 1]);
+      // Y la tasa es «sin datos», no cero: dividir entre cero no es una medida.
+      expect(suelo(despues).tasa).toBeNull();
+    });
+  });
+
+  /**
+   * LAS CONTRADICCIONES SE MIDEN, y su universo es el de las capacidades que materializan
+   * insights — no todas.
+   *
+   * Escribí al planear esta fase que «contradicciones» no tenía definición operativa en el
+   * repositorio, y era falso: `contradiccion` existe desde el segundo día del esquema, el
+   * contenido de C2 la lleva como campo obligatorio y `materializarInsight` la escribe. Esta
+   * sonda es la que convierte esa corrección en algo que no se puede volver a perder.
+   *
+   * Y mide la otra mitad: en una capacidad que no materializa insights la fila se escribe SIN
+   * UNIVERSO —las tres cifras nulas— y no a cero. Un cero diría «medido y salió cero», que es
+   * otra afirmación.
+   */
+  it('RF-08.7: las contradicciones registradas se cuentan, y solo donde hay insights', async () => {
+    await enWorkspaceLimpio('eval-contradicciones', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const a = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      const b = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Encuesta de salida',
+        resumen: 'Un tercio dice que abandona por el precio, no por el documento.',
+      });
+      const contenido: ContenidoInsight = {
+        ...CONTENIDO_C2(a),
+        contradicciones: [
+          { evidenciaId: b, descripcion: 'Un tercio lo atribuye al precio, no al documento' },
+        ],
+      };
+      await conProveedor(
+        { ok: true, datos: { insights: [contenido] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
+
+      const informe = await correrEvalDeGrounding(curadorId, wsC);
+      const filas = informe.ultima!.mediciones.filter((m) => m.metrica === 'contradicciones');
+      const c2 = filas.find((m) => m.capacidad === 'C2')!;
+      expect([c2.numerador, c2.denominador]).toEqual([1, 1]);
+      // C0 materializa criterios de éxito, no insights: no tiene universo, y se dice.
+      const c0 = filas.find((m) => m.capacidad === 'C0')!;
+      expect([c0.numerador, c0.denominador, c0.sinVeredicto]).toEqual([null, null, null]);
+      // Y el agregado del workspace suma solo lo que TIENE universo, así que no es null.
+      const todas = filas.find((m) => m.capacidad === 'TODAS')!;
+      expect([todas.numerador, todas.denominador]).toEqual([1, 1]);
+    });
+  });
+
+  /**
+   * CADA CORRIDA MIDE SU PROPIA VERSIÓN DE LA CAPA AI.
+   *
+   * Es lo que hace comparables dos corridas, que es la pregunta de §17 —«fidelidad que no mejora
+   * entre releases»—. Midiendo todo lo aceptado, la cifra de hoy sería el promedio de tres
+   * versiones mezcladas y la mejora de la última quedaría diluida; peor, se movería sola cuando
+   * lo viejo envejece, sin que nadie hubiera cambiado nada.
+   */
+  it('RF-08.7: una propuesta de otra versión de prompt no entra en la corrida', async () => {
+    await enWorkspaceLimpio('eval-por-version', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const admin = sqlAdmin();
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
+
+      const antes = await correrEvalDeGrounding(curadorId, wsC);
+      const correccion = (inf: typeof antes) =>
+        inf.ultima!.mediciones.find(
+          (m) => m.metrica === 'correccion-humana' && m.capacidad === 'C2',
+        )!;
+      expect(correccion(antes).denominador).toBe(1);
+
+      // La propuesta pasa a declararse de una versión anterior. Solo la base puede hacerlo: el
+      // lineage está fuera del grant de UPDATE de la aplicación, que es justo lo que lo hace
+      // de fiar como filtro.
+      await admin`update propuesta_ai set prompt_version = 'ai-anterior'
+        where workspace_id = ${wsC} and id = ${propuesta.id}`;
+
+      const despues = await correrEvalDeGrounding(curadorId, wsC);
+      expect(
+        correccion(despues).denominador,
+        'una corrida que midiera propuestas de otra versión no compara la capa que dice medir',
+      ).toBe(0);
+      // La corrida sigue estampada con la versión que corre hoy, que es lo que responde
+      // «¿mejoró respecto de la anterior?».
+      expect(despues.ultima!.promptVersion).toBe(PROMPT_VERSION);
+    });
+  });
+
+  /**
+   * LA COMPARACIÓN ES LA MÉTRICA: el informe trae la última Y la anterior.
+   *
+   * El criterio 4 de SPEC-08 pide las cifras «comparadas contra la corrida anterior». Un informe
+   * con la corrida de hoy y sin la de antes no responde la pregunta para la que existe la tabla.
+   */
+  it('RF-08.7: el informe trae la última corrida y la anterior, en ese orden', async () => {
+    await enWorkspaceLimpio('eval-comparacion', async ({ ws: wsC, curadorId }) => {
+      const vacio = await informeDeGrounding(curadorId, wsC);
+      expect([vacio.ultima, vacio.anterior]).toEqual([null, null]);
+
+      const primera = await correrEvalDeGrounding(curadorId, wsC);
+      expect(primera.ultima).not.toBeNull();
+      // La primera no tiene contra qué compararse, y eso se DICE en vez de fingir un cero.
+      expect(primera.anterior).toBeNull();
+
+      const segunda = await correrEvalDeGrounding(curadorId, wsC);
+      expect(segunda.anterior?.id).toBe(primera.ultima!.id);
+      expect(segunda.ultima!.id).not.toBe(primera.ultima!.id);
+    });
+  });
+
+  /**
+   * Y LA CORRIDA DE LA VERSIÓN ANTERIOR NO LA DESPLAZA LA SEGUNDA DE ESTA.
+   *
+   * Es la comparación que §17 pide —«fidelidad que no mejora entre releases»— y con «las dos
+   * últimas» a secas se perdía en cuanto una versión se medía dos veces: la corrida de la
+   * versión previa salía de la ventana y el informe dejaba de poder responder la pregunta para
+   * la que existe, TENIENDO el dato guardado. Lo demostraba la propia pantalla, que ya avisaba
+   * de que un delta entre corridas de la misma versión sólo dice cuánto creció la muestra.
+   *
+   * Se mide con tres corridas y el reparto de versiones que lo rompe: V1, V2, V2. La de V1 no
+   * es «la anterior» —lo es la primera de V2— pero sí es contra la que se lee la regresión.
+   */
+  it('RF-08.7: la segunda corrida de una versión no expulsa a la de la versión anterior', async () => {
+    await enWorkspaceLimpio('eval-dos-versiones', async ({ ws: wsC, curadorId }) => {
+      const admin = sqlAdmin();
+      const vieja = await correrEvalDeGrounding(curadorId, wsC);
+      // La primera se reetiqueta como de OTRA versión. Sólo la base puede: `prompt_version` es
+      // lineage y está fuera del grant de UPDATE de la aplicación.
+      await admin`update corrida_eval set prompt_version = 'ai-anterior'
+        where workspace_id = ${wsC} and id = ${vieja.ultima!.id}`;
+
+      const primeraDeEsta = await correrEvalDeGrounding(curadorId, wsC);
+      expect(primeraDeEsta.anterior?.promptVersion).toBe('ai-anterior');
+      expect(primeraDeEsta.anteriorDeOtraVersion?.id).toBe(vieja.ultima!.id);
+
+      // Y la SEGUNDA de esta versión, que es donde se rompía: «la anterior» pasa a ser la de la
+      // misma versión —correcto, es la inmediatamente previa— y la de la versión vieja tiene
+      // que seguir viajando aparte.
+      const segundaDeEsta = await correrEvalDeGrounding(curadorId, wsC);
+      expect(segundaDeEsta.anterior?.id).toBe(primeraDeEsta.ultima!.id);
+      expect(segundaDeEsta.anterior?.promptVersion).toBe(PROMPT_VERSION);
+      expect(
+        segundaDeEsta.anteriorDeOtraVersion?.id,
+        'la corrida de la versión anterior se perdió: la regresión entre releases deja de leerse desde la segunda corrida de cada versión',
+      ).toBe(vieja.ultima!.id);
+    });
+  });
+
+  /**
+   * LA FIDELIDAD VIAJA DECLARADA Y SIN MEDIR, en todas las capacidades y a propósito.
+   *
+   * RF-08.7 la exige —«la cita dice lo que el objeto afirma»— y es un juicio semántico: una cita
+   * puede aparecer palabra por palabra en el material y no sostener lo que se afirma con ella,
+   * así que el suelo puede marcar el máximo sobre una cita infiel. No se calcula desde la base y
+   * no se inventa.
+   *
+   * Lo que esta sonda fija es que el hueco SE VEA: su fila se escribe igualmente, con las tres
+   * cifras nulas, para que la exigencia aparezca en el informe junto a las que sí se miden. Sin
+   * ella, un informe de cuatro parecía completo y la ausencia vivía en un comentario — que es
+   * exactamente la clase de nota que caduca con el commit que la contradice.
+   */
+  it('RF-08.7: la fidelidad de citas aparece en el informe, vacía, en todas las capacidades', async () => {
+    await enWorkspaceLimpio('eval-fidelidad', async ({ ws: wsC, curadorId, retoId: retoC }) => {
+      const ev = await evidenciaDelReto(wsC, retoC, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsC, capacidad: 'C2', anclaId: retoC }),
+      );
+      const panel = await panelPropuestas(curadorId, wsC);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      await aceptarPropuesta(curadorId, { workspaceId: wsC, propuestaId: propuesta.id });
+
+      const informe = await correrEvalDeGrounding(curadorId, wsC);
+      // La lista NO se escribe aquí: es la del contrato, que es la que lee la pantalla para
+      // decir «sin medir» en vez de «no aplica». Escrita a mano, esta sonda seguiría verde el
+      // día que las dos se separaran, que es justo lo que tiene que cazar.
+      expect(METRICAS_SIN_MEDIR.length, 'el censo se quedó sin métricas que mirar').toBeGreaterThan(
+        0,
+      );
+      const filas = informe.ultima!.mediciones.filter((m) => METRICAS_SIN_MEDIR.includes(m.metrica));
+      // Aparecen, y en TODAS: son exigencias del producto, no propiedades de una capacidad.
+      expect(filas.length, 'la fidelidad no llegó al informe').toBeGreaterThan(1);
+      for (const f of filas) {
+        expect([f.numerador, f.denominador, f.sinVeredicto, f.tasa]).toEqual([
+          null,
+          null,
+          null,
+          null,
+        ]);
+      }
+      /*
+       * Y LOS DOS VACÍOS CONVIVEN EN LA MISMA CORRIDA, que es lo que obliga a distinguirlos.
+       * `afirmaciones-no-soportadas` sale nula en una capacidad que no materializa insights —ahí
+       * la pregunta NO corresponde, y la pantalla dice «no aplica»—, mientras la fidelidad sale
+       * nula en todas porque corresponde y falta. Con un solo rótulo, la fila cuyo título dice
+       * «exigida y NO medida» se pintaba «no aplica», afirmando lo contrario de lo que es.
+       */
+      const noAplica = informe.ultima!.mediciones.find(
+        (m) => m.numerador === null && !METRICAS_SIN_MEDIR.includes(m.metrica),
+      );
+      expect(
+        noAplica,
+        'sin un «no aplica» de verdad, la distinción no se estaría midiendo',
+      ).toBeDefined();
+      // Y el rótulo los separa, que es la mitad que ve quien mira: los dos huecos escriben el
+      // mismo null y dicen lo contrario.
+      expect([rotuloSinCifra(filas[0]!.metrica), rotuloSinCifra(noAplica!.metrica)]).toEqual([
+        'sin medir',
+        'no aplica',
+      ]);
+      /*
+       * Y en el MISMO workspace el suelo sí trae cifras. Es lo que separa «declarada y no
+       * medida» de «aquí no hay datos»: si las dos salieran vacías, esta sonda pasaría con la
+       * corrida entera rota y no diría nada.
+       */
+      const suelo = informe.ultima!.mediciones.find(
+        (m) => m.metrica === 'suelo-presencia-literal' && m.capacidad === 'C2',
+      )!;
+      expect([suelo.numerador, suelo.denominador]).toEqual([1, 1]);
+    });
+  });
+
+  /**
+   * Y LAS DOS PUERTAS, que no son la misma.
+   *
+   * Leer el informe es de quien audita; correrlo escribe un hecho fechado y es de quien lleva el
+   * workspace. Con una sola puerta, cualquiera que abriera la pantalla habría dejado una corrida
+   * en la tabla — y una serie histórica que se llena sola al mirarla no compara nada.
+   */
+  /**
+   * UNA AFIRMACIÓN ESCRITA A MANO DESPUÉS NO ES DEL MODELO, y hasta esta ronda lo era.
+   *
+   * Al aceptar una propuesta de C2 el insight nace en `propuesto`, y la política de INSERT de
+   * `afirmacion` deja añadir más mientras siga ahí. La métrica contaba desde esa tabla, así que
+   * una afirmación humana sin citas empeoraba el grounding de la versión de prompt vigente sin
+   * que el modelo hubiera producido nada distinto — y `afirmacion` no guarda de dónde vino cada
+   * fila, así que la contaminación no se podía deshacer después.
+   */
+  it('RF-08.7: una afirmación añadida a mano tras aceptar no cuenta contra el modelo', async () => {
+    await enWorkspaceLimpio('eval-linaje', async ({ ws: wsL, curadorId, retoId: retoL }) => {
+      const ev = await evidenciaDelReto(wsL, retoL, curadorId, {
+        titulo: 'Analítica del funnel',
+        resumen: 'El 71% de los abandonos ocurre al cargar el documento.',
+      });
+      await conProveedor(
+        { ok: true, datos: { insights: [CONTENIDO_C2(ev)] }, intentos: [intento({ uso: null })] },
+        () => generarPropuestas(curadorId, { workspaceId: wsL, capacidad: 'C2', anclaId: retoL }),
+      );
+      const panel = await panelPropuestas(curadorId, wsL);
+      const propuesta = panel.pendientes.find((x) => x.capacidad === 'C2')!;
+      // `objetoId` es el insight que la aceptación materializó: es de ahí de donde cuelgan las
+      // afirmaciones, y por donde entra la que una persona añada después.
+      const { objetoId: insightId } = await aceptarPropuesta(curadorId, {
+        workspaceId: wsL,
+        propuestaId: propuesta.id,
+      });
+
+      const cifrasDeC2 = (i: Awaited<ReturnType<typeof correrEvalDeGrounding>>) => {
+        const m = i.ultima!.mediciones.find(
+          (x) => x.metrica === 'afirmaciones-no-soportadas' && x.capacidad === 'C2',
+        )!;
+        return [m.numerador, m.denominador, m.sinVeredicto];
+      };
+      const antes = cifrasDeC2(await correrEvalDeGrounding(curadorId, wsL));
+      // El modelo propuso una afirmación no-hipótesis, sostenida: 0 sin sostén de 1.
+      expect(antes).toEqual([0, 1, 0]);
+
+      // Y ahora una persona añade la suya, sin ninguna cita, sobre el MISMO insight.
+      const { afirmacionId } = await agregarAfirmacion(curadorId, {
+        workspaceId: wsL,
+        insightId,
+        texto: 'Y además el equipo cree que el problema es el copy del botón.',
+        esHipotesis: false,
+      });
+      /*
+       * La sonda comprueba que de verdad entró: sin esto mediría un fixture que la RLS rechazó
+       * —el insight podría haber nacido validado— y saldría verde sin haber tocado el caso.
+       */
+      const admin = sqlAdmin();
+      const [fila] = await admin`select count(*)::int as n from afirmacion
+        where insight_id = ${insightId} and workspace_id = ${wsL}`;
+      expect([afirmacionId !== undefined, fila!.n], 'la afirmación a mano no llegó a la tabla').toEqual([
+        true,
+        2,
+      ]);
+
+      // Y la medida NO se mueve: mide lo que el modelo propuso, no lo que hay hoy colgando.
+      expect(
+        cifrasDeC2(await correrEvalDeGrounding(curadorId, wsL)),
+        'una afirmación humana sin citas se contó como fallo del modelo',
+      ).toEqual([0, 1, 0]);
+    });
+  });
+
+  /**
+   * EL CENSO DE LA PUERTA: quién sabe leer afirmaciones y quién las tiene.
+   *
+   * El universo de la métrica se deriva del DESTINO —materializa un insight— y el extractor del
+   * payload se declara por capacidad. Son dos listas, y una capacidad nueva que materialice
+   * insights sin enseñar a leer sus afirmaciones no rompería nada: mediría cero de cero, que en
+   * una métrica de grounding se lee «salió limpio».
+   */
+  it('RF-08.7: toda capacidad que materializa insights sabe leer sus afirmaciones', () => {
+    expect(CAPACIDADES_QUE_DECLARAN_AFIRMACIONES.length, 'el censo no reconoció ninguna').toBe(
+      CAPACIDADES_CON_AFIRMACIONES.length,
+    );
+    expect(CAPACIDADES_QUE_DECLARAN_AFIRMACIONES).toEqual([...CAPACIDADES_CON_AFIRMACIONES].sort());
+    expect(CAPACIDADES_QUE_DECLARAN_AFIRMACIONES.length).toBeGreaterThan(0);
+  });
+
+  it('RF-08.7: el informe se lee con la puerta de auditoría y se corre con la de la boutique', async () => {
+    await enWorkspaceLimpio('eval-puertas', async ({ ws: wsC, curadorId }) => {
+      const admin = sqlAdmin();
+      const alta = async (rol: string, quien: string) => {
+        const email = `${marca}-eval-${rol}@test.demo`;
+        const [u] = await admin`insert into usuario (email, nombre, estado)
+          values (${email}, ${quien}, 'activo') returning id`;
+        const id = u!.id as string;
+        await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+          values (${wsC}, ${id}, ${quien}, ${email}, ${rol})`;
+        return id;
+      };
+      const adminCliente = await alta('admin-cliente', 'Admin del cliente');
+      const stakeholder = await alta('stakeholder', 'Stakeholder');
+
+      // El admin del cliente LEE —audita lo que la AI hizo— pero no corre: no escribe hechos
+      // en el workspace de la boutique.
+      const informe = await informeDeGrounding(adminCliente, wsC);
+      expect(informe.puedeCorrer).toBe(false);
+      await expect(correrEvalDeGrounding(adminCliente, wsC)).rejects.toThrow(ErrorAI);
+
+      // Y el stakeholder no llega ni al informe. El MOTIVO importa: una tabla vacía y «no te
+      // corresponde» no son lo mismo para quien mira.
+      await expect(informeDeGrounding(stakeholder, wsC)).rejects.toThrow(ErrorAI);
+
+      // El suelo es MÁS ancho que la puerta, y eso se mide en vez de suponerse: la RLS deja
+      // leer las dos tablas a todo miembro, así que lo que cierra la pantalla es la capa 2.
+      await correrEvalDeGrounding(curadorId, wsC);
+      const [visto] = await conUsuario(
+        stakeholder,
+        (tx) => tx`select count(*)::int as n from corrida_eval where workspace_id = ${wsC}`,
+      );
+      expect(
+        visto!.n,
+        'si la RLS también lo cerrara, esta sonda pasaría sin que la puerta de rol existiera',
+      ).toBe(1);
+    });
   });
 
 });

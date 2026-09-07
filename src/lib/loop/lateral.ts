@@ -1,7 +1,7 @@
 import { etiquetaDePendientes } from '@/lib/aprobaciones/aprobaciones.schemas';
 import { ROLES_CURADORES } from '@/lib/evidencia/evidencia.schemas';
 import { ROLES_AUDITORIA } from '@/lib/portal/portal.schemas';
-import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.roles';
+import { ROLES_INFORME_GROUNDING, ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.roles';
 import { ROLES_DISPOSICION } from '@/lib/disposicion/disposicion.schemas';
 
 /**
@@ -36,7 +36,8 @@ export type RutaDelWorkspace =
   | '/exportacion'
   | '/disposicion'
   | '/auditoria'
-  | '/observabilidad-ai';
+  | '/observabilidad-ai'
+  | '/evals-grounding';
 
 export type ContadorDelLateral = {
   n: number;
@@ -78,6 +79,7 @@ const NOMBRE_CORTO_DE_GOBIERNO: Partial<Record<RutaDelWorkspace, string>> = {
   '/personas': 'personas',
   '/auditoria': 'auditoría',
   '/observabilidad-ai': 'operación AI',
+  '/evals-grounding': 'grounding medido',
   '/exportacion': 'exportación',
   '/disposicion': 'disposición',
 };
@@ -195,6 +197,25 @@ export function agruparLateral({
             to: '/observabilidad-ai',
             etiqueta: 'Operación de la capa AI',
             abrev: 'OPS',
+          } as DestinoDelLateral,
+        ]
+      : []),
+    /*
+     * Y el informe de grounding (RF-08.7), tercera puerta con la misma raíz: la operación dice
+     * qué costó la capa AI y esta dice qué tan de fiar salió. Va aquí, en lo archivístico, y no
+     * junto a «Propuestas AI»: no es trabajo del día —nadie revisa propuestas desde aquí— sino
+     * la medida que se mira cuando se pregunta si mejora.
+     *
+     * La puerta se deriva de `ROLES_INFORME_GROUNDING`, que a su vez se deriva de la de la
+     * auditoría, y por eso vive en `ai.roles` y no en el contrato: la razón está escrita allí, y
+     * es la misma que trajo la de al lado —desde aquí no se puede alcanzar `ai.schemas`—.
+     */
+    ...((ROLES_INFORME_GROUNDING as readonly string[]).includes(rol)
+      ? [
+          {
+            to: '/evals-grounding',
+            etiqueta: 'Grounding medido',
+            abrev: 'GRD',
           } as DestinoDelLateral,
         ]
       : []),

@@ -111,8 +111,10 @@ describe('agrupación del lateral (4a)', () => {
       '/personas',
       '/auditoria',
       // §14 pone la observabilidad de la capa AI en la misma fila que la auditoría
-      // —«Auditoría y operación»—, así que va con su misma puerta de rol.
+      // —«Auditoría y operación»—, así que va con su misma puerta de rol; y el informe de
+      // grounding detrás, que contesta la otra mitad de la misma pregunta.
       '/observabilidad-ai',
+      '/evals-grounding',
       '/exportacion',
       '/disposicion',
     ]);
@@ -145,15 +147,22 @@ describe('agrupación del lateral (4a)', () => {
         ).map((d) => d.to);
         expect(new Set(rutas).size).toBe(rutas.length);
         /*
-         * Quince destinos, menos los dos que el rol puede no ver. Se cuentan por su PRESENCIA
-         * y no con un número por rol, que es lo que hace que este censo siga valiendo cuando
-         * se añade un destino con puerta: la auditoría y el cuadro de operación de la capa AI
-         * comparten la misma lista de roles a propósito (§14 los pone en la misma fila), así
-         * que o entran los dos o no entra ninguno — y si algún día se separan, este recuento
-         * lo dice en vez de dejarlo pasar.
+         * Dieciséis destinos, menos los que el rol puede no ver. El total se deriva de QUÉ
+         * puertas condicionadas trae este rol, no de un número escrito a mano por cada uno: con
+         * `14 - (…auditoría…)`, la SEGUNDA puerta por rol dejó el censo rojo sin haber roto
+         * nada, y arreglarlo restando otro literal habría hecho lo mismo con la tercera.
+         *
+         * Las tres comparten hoy la misma lista de roles a propósito (§14 pone auditoría y
+         * operación en la misma fila, y el grounding se deriva de ahí), así que o entran las
+         * tres o no entra ninguna — y si algún día se separan, este recuento lo dice en vez de
+         * dejarlo pasar.
          */
-        const conPuerta: RutaDelWorkspace[] = ['/auditoria', '/observabilidad-ai'];
-        const esperadas = 15 - conPuerta.filter((r) => !rutas.includes(r)).length;
+        const conPuerta: RutaDelWorkspace[] = [
+          '/auditoria',
+          '/observabilidad-ai',
+          '/evals-grounding',
+        ];
+        const esperadas = 16 - conPuerta.filter((r) => !rutas.includes(r)).length;
         expect(rutas).toHaveLength(esperadas);
       }
     }
@@ -166,7 +175,7 @@ describe('agrupación del lateral (4a)', () => {
       importacionPendientes: 0,
     });
     expect(notaDeGobierno(lead.gobierno)).toBe(
-      'Personas, auditoría, operación AI, exportación y disposición: se abren cuando se buscan, no cada día.',
+      'Personas, auditoría, operación AI, grounding medido, exportación y disposición: se abren cuando se buscan, no cada día.',
     );
     const sponsor = agruparLateral({
       rol: 'sponsor',

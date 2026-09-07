@@ -991,6 +991,69 @@ export const CITAS_DEL_CONTENIDO = Object.fromEntries(
   ]),
 ) as Record<CapacidadActiva, (contenido: ContenidoPropuesta) => CitaDelContenido[]>;
 
+/** Una afirmación tal como la PROPUSO el modelo, con los documentos que citó para sostenerla. */
+export type AfirmacionDelContenido = {
+  texto: string;
+  /** SYS-20: lo extrapolado se marca, y queda fuera del universo de «sin sostén». */
+  esHipotesis: boolean;
+  /** Los `evidenciaId` que la sostienen, canónicos. Vacío es posible en una hipótesis. */
+  evidenciaIds: string[];
+};
+
+/** El extractor de las capacidades que no proponen afirmaciones, compartido para poder censarlo. */
+const SIN_AFIRMACIONES = (): AfirmacionDelContenido[] => [];
+
+/**
+ * LAS AFIRMACIONES DEL CONTENIDO, que NO son las filas de `afirmacion`.
+ *
+ * La distinción es la que se le escapó a la eval de grounding: al aceptar una propuesta de C2 el
+ * insight nace en estado `propuesto`, y la política de INSERT de `afirmacion` deja añadir más
+ * mientras siga ahí. O sea que entre la aceptación y la validación una persona puede colgar del
+ * MISMO insight una afirmación suya. Contándolas desde la tabla, una afirmación humana sin citas
+ * empeoraba el grounding de la versión de prompt vigente sin que el modelo hubiera escrito nada
+ * distinto — y como la tabla no guarda de dónde vino cada fila, no había forma de separarlas
+ * después.
+ *
+ * Las otras tres métricas ya se anclaban al PAYLOAD (`sueloDePresencia` lee
+ * `contenido_original`, `correccionHumana` el estado de la propuesta); ésta era la única que
+ * leía filas vivas como si fueran del modelo. Aquí se cierra esa asimetría.
+ *
+ * Es un Record sobre TODAS las capacidades y no un `if` por la de turno: una capacidad nueva que
+ * proponga afirmaciones no compila hasta que diga cómo se leen, en vez de medir cero en silencio.
+ */
+export const AFIRMACIONES_DEL_CONTENIDO: Record<
+  CapacidadActiva,
+  (contenido: ContenidoPropuesta) => AfirmacionDelContenido[]
+> = {
+  CI: SIN_AFIRMACIONES,
+  C0: SIN_AFIRMACIONES,
+  CT: SIN_AFIRMACIONES,
+  C2: (c) =>
+    (c as ContenidoInsight).afirmaciones.map((a) => ({
+      texto: a.texto,
+      esHipotesis: a.esHipotesis,
+      // Minúsculas por lo mismo que `conIdsCanonicos`: por la superficie concedida entra un uuid
+      // en mayúscula, y aquí se compara contra ids que salen de la base.
+      evidenciaIds: a.citas.map((x) => x.evidenciaId.toLowerCase()),
+    })),
+  /*
+   * C4 tiene hallazgos, que se le parecen y NO son afirmaciones de un insight: no materializan
+   * uno —su destino es `revision-simulada`— así que no entran en el universo de esta métrica.
+   * Devolver aquí sus hallazgos los metería por la puerta de atrás.
+   */
+  C4: SIN_AFIRMACIONES,
+  C5: SIN_AFIRMACIONES,
+  C6: SIN_AFIRMACIONES,
+  C3: SIN_AFIRMACIONES,
+  C7: SIN_AFIRMACIONES,
+};
+
+/** Qué capacidades declaran afirmaciones, para poder censarlo contra el registro de destinos. */
+export const CAPACIDADES_QUE_DECLARAN_AFIRMACIONES = Object.entries(AFIRMACIONES_DEL_CONTENIDO)
+  .filter(([, leer]) => leer !== SIN_AFIRMACIONES)
+  .map(([capacidad]) => capacidad)
+  .sort();
+
 /**
  * Y el `evidenciaId` con él, que es la misma pregunta un campo más allá.
  *

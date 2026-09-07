@@ -484,7 +484,12 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   CI: {
     etiqueta: 'Extracción de importación → evidencia',
     destino: 'evidencia',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/evidencia/evidencia.servicio', funcion: 'crearItem' },
+    /*
+     * `aprobarItem` y no `crearItem`, y esto lo destapó una revisión de este mismo PR: crear el
+     * ítem de la bandeja inserta `item_importacion`, no evidencia. Lo que CI propone es la
+     * EXTRACCIÓN, y a mano eso es curar el ítem y aprobarlo — ahí nace la evidencia.
+     */
+    paridadManual: { clase: 'escritura', modulo: '@/lib/evidencia/evidencia.servicio', funcion: 'aprobarItem' },
     ancla: {
       columna: 'item_id',
       etiqueta: 'Item de la bandeja',
@@ -723,7 +728,13 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C7: {
     etiqueta: 'Conciliación del reto → borrador del post mortem',
     destino: 'outcome-review',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/medicion/medicion.servicio', funcion: 'abrirOutcomeReview' },
+    /*
+     * `guardarBorradorReview` y no `abrirOutcomeReview`, de la misma revisión: abrir la review
+     * crea la fila vacía, y lo que C7 materializa es el BORRADOR sobre una fila que ya existe
+     * —`update outcome_review`, igual que esta función—. La paridad se empareja con lo que la
+     * capacidad PRODUCE, no con lo que abre el expediente donde se guarda.
+     */
+    paridadManual: { clase: 'escritura', modulo: '@/lib/medicion/medicion.servicio', funcion: 'guardarBorradorReview' },
     /*
      * EL POST MORTEM EN BORRADOR, y no el reto, por lo mismo que C6 se ancla en el registry: la
      * fila tiene que existir para que haya dónde materializar, y la política que la crea es la

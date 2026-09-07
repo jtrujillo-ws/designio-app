@@ -109,70 +109,162 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
   });
 
   /**
-   * Y LA MITAD QUE DE VERDAD CUESTA: que esa puerta ESCRIBA el destino.
+   * Y LA MITAD QUE DE VERDAD CUESTA: que ESA FUNCIÓN escriba el destino.
    *
-   * Un nombre que existe no prueba nada — podría exportarse y no tocar la tabla. Pero tampoco vale
-   * mirar sólo su fichero: `escribirRevisionAMano` no inserta nada por sí misma, delega en el
-   * escritor que comparte con la materialización, y eso es exactamente como debe ser (un solo
-   * sitio que escribe, dos caminos que llegan). Un censo de un fichero la habría dado por
-   * incumplida y habría empujado a duplicar el insert para ponerlo verde, que es lo contrario de
-   * lo que conviene.
+   * La primera versión de esta sonda sembraba el recorrido en el MÓDULO y no en la función
+   * declarada, y una revisión la tumbó con dos falsos positivos de este mismo PR:
    *
-   * Así que se sigue el grafo de imports desde el módulo declarado, igual que el censo del
-   * lateral, y se busca la escritura de la tabla del destino en cualquier punto alcanzable. De
-   * dónde sale ese nombre de tabla —y por qué no de la columna, que fue mi primer intento y era
-   * falso— está en `tablaDelDestino`.
+   *  · CI declaraba `crearItem`, que inserta `item_importacion`. El `insert into evidencia` está
+   *    en `aprobarItem`, otra función del mismo fichero. El censo lo daba por bueno.
+   *  · C7 declaraba `abrirOutcomeReview`, que abre la fila vacía. Lo que C7 materializa es el
+   *    BORRADOR, con un `update outcome_review` — y eso lo hace `guardarBorradorReview`.
+   *
+   * O sea que el censo comprobaba que en algún punto del grafo alguien escribía la tabla, que es
+   * casi siempre cierto y no dice nada: borrar la acción manual de verdad lo habría dejado verde.
+   * Un censo que no puede fallar es peor que no tenerlo, porque además tranquiliza.
+   *
+   * Ahora se recorre el grafo de LLAMADAS desde la función declarada: su cuerpo, y de ahí a lo
+   * que llama —local o importado— hasta encontrar la escritura. Sigue haciendo falta seguir el
+   * grafo, y por el motivo de siempre: `escribirRevisionAMano` no escribe, delega en el escritor
+   * que comparte con la materialización, que es como debe ser.
+   *
+   * Y la escritura es INSERT **o** UPDATE, porque materializar no siempre es crear una fila:
+   * C7 rellena una que ya existe, exactamente igual que su ruta manual. Exigir un insert habría
+   * declarado incumplida la paridad mejor emparejada de las siete.
    */
   it('desde esa puerta se alcanza la escritura del destino, siguiendo el grafo', () => {
-    let caminado = 0;
+    /** Las funciones declaradas en un fichero, por nombre: `function f()` y `const f = () => {}`. */
+    const funcionesDe = (arbol: ts.SourceFile): Map<string, ts.Node> => {
+      const m = new Map<string, ts.Node>();
+      for (const st of arbol.statements) {
+        if (ts.isFunctionDeclaration(st) && st.name) m.set(st.name.text, st);
+        else if (ts.isVariableStatement(st)) {
+          for (const d of st.declarationList.declarations) {
+            if (ts.isIdentifier(d.name) && d.initializer) m.set(d.name.text, d.initializer);
+          }
+        }
+      }
+      return m;
+    };
+
+    /** Qué nombre viene de qué módulo, para saltar de un fichero a otro por la llamada. */
+    const importesDe = (arbol: ts.SourceFile, f: string): Map<string, string> => {
+      const m = new Map<string, string>();
+      for (const st of arbol.statements) {
+        if (!ts.isImportDeclaration(st) || st.importClause?.isTypeOnly) continue;
+        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (!destino) continue;
+        const b = st.importClause?.namedBindings;
+        if (b && ts.isNamedImports(b)) {
+          for (const e of b.elements) if (!e.isTypeOnly) m.set(e.name.text, destino);
+        }
+        if (st.importClause?.name) m.set(st.importClause.name.text, destino);
+      }
+      return m;
+    };
+
+    /** Los nombres que un cuerpo LLAMA, que es por donde sigue el grafo. */
+    const llamadasEn = (n: ts.Node): string[] => {
+      const nombres: string[] = [];
+      const ver = (x: ts.Node): void => {
+        if (ts.isCallExpression(x)) {
+          if (ts.isIdentifier(x.expression)) nombres.push(x.expression.text);
+          else if (ts.isPropertyAccessExpression(x.expression)) nombres.push(x.expression.name.text);
+        }
+        ts.forEachChild(x, ver);
+      };
+      ts.forEachChild(n, ver);
+      return nombres;
+    };
+
+    /**
+     * EL VERBO NO SE ELIGE: se deriva de cómo materializa la propia capa AI.
+     *
+     * Primero puse «insert **o** update», y la revisión que trajo este arreglo tenía razón en más
+     * de lo que dijo: con esa laxitud, `abrirOutcomeReview` —que abre la fila vacía— seguía
+     * pasando como paridad de C7, porque INSERTA la tabla. Lo comprobé neutralizando: verde.
+     * Arreglé la declaración y la sonda seguía sin poder cazarla.
+     *
+     * La paridad que RF-08.6 pide es de FLUJO EQUIVALENTE, así que lo que hay que exigir es que
+     * la puerta manual haga la misma clase de escritura que hace la materialización. Y eso no se
+     * escribe a mano: se lee de `ai.servicio.ts`. Seis destinos se materializan con `insert into`
+     * y `outcome_review` con `update`, que es justo la asimetría que se me escapó.
+     *
+     * Si algún día hubiera dos verbos distintos sobre la misma tabla, la derivación deja de ser
+     * unívoca y esta sonda lo dice en vez de elegir uno.
+     */
+    const verboDeMaterializacion = (tabla: string): string => {
+      const servicio = readFileSync(`${raiz}/src/lib/ai/ai.servicio.ts`, 'utf8');
+      const hallados = [
+        ...new Set(
+          [...servicio.matchAll(new RegExp(`(insert\\s+into|update)\\s+${tabla}\\b`, 'gi'))].map((m) =>
+            m[1]!.toLowerCase().replace(/\\s+/g, ' '),
+          ),
+        ),
+      ];
+      expect(
+        hallados,
+        `la materialización de «${tabla}» no se pudo derivar sin ambigüedad de ai.servicio.ts`,
+      ).toHaveLength(1);
+      return hallados[0]!;
+    };
+
+    const escribe = (texto: string, tabla: string, verbo: string): boolean =>
+      new RegExp(`${verbo.replace(' ', '\\s+')}\\s+${tabla}\\b`, 'i').test(texto);
+
+    let masLargo = 0;
     for (const cap of CAPACIDADES_ACTIVAS) {
       const def = CAPACIDADES[cap];
       if (def.paridadManual.clase !== 'escritura' || def.destino === null) continue;
       const tabla = tablaDelDestino(def.destino);
+      const verbo = verboDeMaterializacion(tabla);
       const entrada = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, def.paridadManual.modulo);
       expect(entrada, `${cap}: módulo irresoluble`).not.toBeNull();
 
-      const visto = new Set<string>([entrada!]);
-      const cola = [entrada!];
-      let escribe = false;
-      while (cola.length > 0 && !escribe) {
-        const f = cola.shift()!;
-        const arbol = leer(f);
-        if (new RegExp(`insert\\s+into\\s+${tabla}\\b`, 'i').test(arbol.text)) {
-          escribe = true;
+      const visto = new Set<string>();
+      const cola: { modulo: string; funcion: string }[] = [
+        { modulo: entrada!, funcion: def.paridadManual.funcion },
+      ];
+      let alcanza = false;
+      let pasos = 0;
+      while (cola.length > 0 && !alcanza) {
+        const { modulo, funcion } = cola.shift()!;
+        const clave = `${modulo}#${funcion}`;
+        if (visto.has(clave)) continue;
+        visto.add(clave);
+        const arbol = leer(modulo);
+        const decl = funcionesDe(arbol).get(funcion);
+        // Un nombre que no resuelve a una función de este repositorio no es un fallo: puede ser
+        // un helper de una librería. Simplemente no hay por dónde seguir por ahí.
+        if (!decl) continue;
+        pasos += 1;
+        if (escribe(decl.getText(), tabla, verbo)) {
+          alcanza = true;
           break;
         }
-        for (const st of arbol.statements) {
-          if (!ts.isImportDeclaration(st)) continue;
-          if (st.importClause?.isTypeOnly) continue;
-          const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
-          if (!destino || visto.has(destino)) continue;
-          visto.add(destino);
-          cola.push(destino);
+        const imports = importesDe(arbol, modulo);
+        const locales = funcionesDe(arbol);
+        for (const nombre of llamadasEn(decl)) {
+          if (imports.has(nombre)) cola.push({ modulo: imports.get(nombre)!, funcion: nombre });
+          else if (locales.has(nombre)) cola.push({ modulo, funcion: nombre });
         }
       }
-      /*
-       * La guardia contra el resolutor roto va ABAJO y no aquí, y esto lo corrigió la primera
-       * ejecución: exigir que cada capacidad hubiera recorrido más de un módulo declaraba rota
-       * la más sana de todas —CI escribe en su propio fichero de entrada, así que el barrido
-       * termina sin expandir— y el censo se ponía rojo sobre el caso bueno. El fallo estaba en
-       * la MEDIDA. La guardia sólo tiene sentido cuando hizo falta caminar.
-       */
-      if (!escribe || visto.size > 1) caminado = Math.max(caminado, visto.size);
+      masLargo = Math.max(masLargo, pasos);
       expect(
-        escribe,
-        `${cap}: desde ${def.paridadManual.modulo}#${def.paridadManual.funcion} no se alcanza «insert into ${tabla}» por ningún camino`,
+        alcanza,
+        `${cap}: desde ${def.paridadManual.modulo}#${def.paridadManual.funcion} no se alcanza «${verbo} ${tabla}» —el mismo verbo con el que la capa AI lo materializa— por ninguna llamada`,
       ).toBe(true);
     }
+
     /*
-     * Y AQUÍ la guardia, sobre el conjunto: alguna capacidad tuvo que necesitar el grafo, o este
-     * censo no está probando que sepa seguirlo. C4 es la que lo obliga —`escribirRevisionAMano`
-     * delega en el escritor que comparte con la materialización— y es justo el caso por el que
-     * este barrido existe en vez de un grep por fichero.
+     * Que el recorrido haya SALTADO de una función a otra en algún caso, o esto no estaría
+     * probando que sepa seguir llamadas y un resolutor roto pasaría con todo verde. C4 es la que
+     * lo obliga: `escribirRevisionAMano` delega en el escritor que comparte con la
+     * materialización, y es el caso por el que este grafo existe en vez de leer un cuerpo.
      */
     expect(
-      caminado,
-      'ninguna capacidad necesitó el grafo: el barrido no se está ejercitando y un resolutor roto pasaría',
+      masLargo,
+      'ninguna paridad necesitó saltar de una función a otra: el grafo de llamadas no se ejercita',
     ).toBeGreaterThan(1);
   });
 });

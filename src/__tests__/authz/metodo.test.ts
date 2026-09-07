@@ -238,6 +238,12 @@ describeAuthz('método: etapas, gates y checklists', () => {
     );
     // …y con el criterio completo, G0 aprueba.
     await editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase });
+    // Antes de aprobar, la proyección dice que los criterios AÚN se pueden tocar: es el dato
+    // con el que la pantalla decide ofrecer el formulario, y lo contesta la misma función que
+    // la política usa para rechazar la escritura. Sin esta línea, un alias mal escrito lo
+    // dejaría `undefined` —o sea, «no congelado»— y la pantalla ofrecería el formulario justo
+    // donde la base rechaza.
+    expect((await proyectoMetodo(leadId, ws, proyectoId))?.reto.criteriosCongelados).toBe(false);
     const ok = await aprobarGate(sponsorId, { workspaceId: ws, gateId: g0.id });
     expect(ok.numero).toBe(0);
 
@@ -266,6 +272,17 @@ describeAuthz('método: etapas, gates y checklists', () => {
     await expect(
       agregarCriterio(leadId, { workspaceId: ws, retoId, ...criterioBase }),
     ).rejects.toThrow(/congelados/);
+    // Y el motivo llega DICHO, no como un P0001 crudo. El guard corre en el insert y en el
+    // update con dos causas distintas, y `mensajeDe` no traduce ese código: sin esto, quien
+    // tuviera el formulario abierto cuando otro aprueba G0 recibía «intenta de nuevo» —un
+    // consejo imposible, porque reintentar no puede funcionar—.
+    await expect(
+      editarCriterio(leadId, { workspaceId: ws, criterioId, ...criterioBase }),
+    ).rejects.toThrow(/el G0 del reto ya fue aprobado/);
+    // Y la pantalla se entera: el mismo hecho que las dos líneas de arriba imponen, aquí
+    // ANTICIPADO, para que el formulario a mano se retire en vez de prometer un envío que
+    // ya no cabe.
+    expect((await proyectoMetodo(leadId, ws, proyectoId))?.reto.criteriosCongelados).toBe(true);
   });
 
   it('el rol del gate gobierna: el lead no aprueba G0 ni el sponsor G1; los pendientes bloquean listándose', async () => {

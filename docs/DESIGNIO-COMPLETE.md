@@ -503,7 +503,7 @@ contexto está en `21` y el de la capa AI en `22`.
 
 | Bloque | Construido | En vuelo | Diseñado, pendiente |
 |---|---|---|---|
-| Workspace, auth, roles, portal, auditoría | ✔ | | Correo saliente real (hoy el enlace de invitación se muestra en pantalla), notificaciones |
+| Workspace, auth, roles, portal, auditoría | ✔ | | Correo saliente real (hoy el enlace de invitación se muestra en pantalla), notificaciones; **baja de miembros** desde la app (RF-01.4: sin política de DELETE, grant, server function ni pantalla; hoy solo por la conexión administrativa, ver `15`); **hilos del portal sobre retos y evidencias** (existen en el modelo y en las server functions, sin pantalla que los abra, ver `12`) |
 | Árbol, servicios, segmentos, búsqueda, biblioteca del cliente | ✔ | | Servicios afectados adicionales de un reto en la UI |
 | Bandeja, evidencia, adjuntos, derechos de uso | ✔ | | Escaneo de malware, object storage, transcripción y diarización (C1) |
 | Insights, citas, contradicciones | ✔ | | Clustering (fuera del MVP) |

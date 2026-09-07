@@ -462,7 +462,9 @@ dependen de contratos de otros módulos: `ai.contenido` valida las respuestas de
 `FechaCalendarioSchema` de `evidencia` (la fecha de una evidencia propuesta por CI), `CODIGOS_SENAL`
 de `journey` (las señales que C5 puede nombrar), `TOPE_NARRATIVA` de `medicion` (los textos de C7) y
 `MAX_PREGUNTA` y `MAX_RAZON` de `servicio` (las HMW de C3), así que cambiar uno de esos límites
-cambia qué respuestas acepta la capa AI.
+cambia qué respuestas acepta la capa AI. Y desde #55 `metodo` valida las fechas de un criterio de
+éxito (línea base y post mortem) con `FechaCalendarioSchema` de `evidencia`, tanto en las server
+functions como en el formulario: cambiar ese contrato cambia qué criterios acepta el método.
 Cambiar una de esas listas cambia esos módulos. El resto de esquemas
 Zod y tipos se importan libremente entre módulos como contratos compartidos. El detalle de tablas por
 contexto está en `21` y el de la capa AI en `22`.
@@ -783,8 +785,11 @@ módulo aparte (ADR-0007).
   segunda condición no se puede deducir de nada que la pantalla traiga. Si otro aprueba G0 o firma
   el registry con el formulario abierto, el servicio anticipa la causa bajo el candado del reto en
   vez de devolver un «intenta de nuevo».
-- **G0 congela los criterios**: después de aprobado no se editan ni se añaden (`reto_admite_criterios`);
-  el cambio es una reapertura trazada de la etapa 0.
+- **G0 congela los criterios**: después de aprobado no se editan ni se añaden; el predicado es
+  `reto_criterios_congelados`, que compone `reto_g0_congela_criterios` (G0 aprobado, salvo que la
+  etapa 0 esté reabierta) y `reto_registry_firmado` (el registry firmado también los congela);
+  `reto_admite_criterios` solo dice si el reto está `candidato` o `activo`, no si están congelados.
+  El cambio tras G0 es una reapertura trazada de la etapa 0.
 
 ## Etapas, gates y checklist
 

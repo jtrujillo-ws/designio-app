@@ -406,19 +406,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       };
       juntar(n);
 
-      /** Lo que una región NOMBRA, sin entrar en los cuerpos con nombre que haya dentro. */
+      /**
+       * Lo que una región LLAMA, sin entrar en los cuerpos con nombre que haya dentro.
+       *
+       * Llamar y nombrar no son lo mismo: con `console.debug(persistir)` y sin la llamada real,
+       * contar toda mención daba por vivo al ayudante y su SQL seguía sumando. Sólo cuenta
+       * aparecer como CALLEE, que es lo único que lo ejecuta.
+       *
+       * El límite, dicho: un ayudante que sólo se pasara como callback —`items.map(persistir)`—
+       * se leería como muerto. Medido, hoy ninguna de las siete secuencias lo hace, y ese fallo
+       * sale ROJO y nombrando la escritura que falta, no verde: pide una decisión en vez de
+       * tranquilizar.
+       */
       const nombraA = (region: ts.Node): string[] => {
         const nombres: string[] = [];
         const ver = (x: ts.Node): void => {
           if (x !== region && ts.isFunctionLike(x) && nombreDe(x) !== null) return;
-          if (ts.isIdentifier(x)) {
-            const padre = x.parent as ts.Node | undefined;
-            // Declararse no es nombrarse: si no, todo ayudante se daría vida a sí mismo.
-            const esSuPropiaDeclaracion =
-              padre !== undefined &&
-              ((ts.isFunctionDeclaration(padre) && padre.name === x) ||
-                (ts.isVariableDeclaration(padre) && padre.name === x));
-            if (!esSuPropiaDeclaracion) nombres.push(x.text);
+          if (ts.isCallExpression(x) && ts.isIdentifier(x.expression)) {
+            nombres.push(x.expression.text);
           }
           ts.forEachChild(x, ver);
         };
@@ -623,15 +628,19 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /** Las llamadas VIVAS de una función, con el objeto sobre el que se hacen si lo hay. */
-    const llamadasEn = (n: ts.Node): { objeto: string | null; nombre: string }[] => {
-      const llamadas: { objeto: string | null; nombre: string }[] = [];
+    const llamadasEn = (
+      n: ts.Node,
+    ): { objeto: string | null; nombre: string; donde: ts.Node }[] => {
+      const llamadas: { objeto: string | null; nombre: string; donde: ts.Node }[] = [];
       recorrerVivo(n, (x) => {
         if (!ts.isCallExpression(x)) return;
-        if (ts.isIdentifier(x.expression)) llamadas.push({ objeto: null, nombre: x.expression.text });
-        else if (ts.isPropertyAccessExpression(x.expression)) {
+        if (ts.isIdentifier(x.expression)) {
+          llamadas.push({ objeto: null, nombre: x.expression.text, donde: x });
+        } else if (ts.isPropertyAccessExpression(x.expression)) {
           llamadas.push({
             objeto: ts.isIdentifier(x.expression.expression) ? x.expression.expression.text : null,
             nombre: x.expression.name.text,
+            donde: x,
           });
         }
       });
@@ -926,7 +935,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * Un alias corriente (`const escribir = enlazarInsight`) NO tapa: ahí el respaldo por
          * nombre sigue siendo la única forma de llegar.
          */
-        const sombras = new Map<string, string | null>();
         const nombresDe = (b: ts.BindingName, poner: (n: string) => void): void => {
           if (ts.isIdentifier(b)) poner(b.text);
           else if (ts.isObjectBindingPattern(b) || ts.isArrayBindingPattern(b)) {
@@ -935,27 +943,70 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             }
           }
         };
-        const ligadas = (x: ts.Node): void => {
-          if (x !== decl && ts.isFunctionDeclaration(x) && x.name) sombras.set(x.name.text, null);
-          if (ts.isParameter(x)) nombresDe(x.name, (n) => sombras.set(n, null));
-          if (ts.isVariableDeclaration(x)) {
-            /*
-             * Un alias simple —`const escribir = enlazarInsight`— tapa el nombre PERO conserva
-             * su destino: si se tapara sin más, el recorrido perdería el escritor y el censo
-             * declararía rota una ruta intacta. Cualquier otra ligadura —desestructurar, una
-             * llamada que devuelve un callback— tapa sin destino, que es lo que corresponde:
-             * ese nombre ya no es el del módulo.
-             */
-            const alias =
-              x.initializer !== undefined && ts.isIdentifier(x.initializer)
-                ? x.initializer.text
-                : null;
-            nombresDe(x.name, (n) => sombras.set(n, ts.isIdentifier(x.name) ? alias : null));
+        /**
+         * QUÉ LIGA UN ÁMBITO, mirado en el sitio de CADA llamada y no en todo el fichero.
+         *
+         * Doblando en un solo mapa las ligaduras de cualquier descendiente, el parámetro de un
+         * callback anidado tapaba el import que usa el manejador de fuera y el censo daba por
+         * incumplida una ruta intacta. Se resuelve subiendo desde la llamada hasta la función
+         * declarada, que es lo que hace el lenguaje.
+         *
+         * Un alias simple —`const escribir = enlazarInsight`— tapa el nombre PERO conserva su
+         * destino; cualquier otra ligadura —desestructurar, una llamada que devuelve un
+         * callback— tapa sin destino, que es lo que corresponde: ese nombre ya no es el del
+         * módulo.
+         */
+        const ligaduraDe = (ambito: ts.Node, nombre: string): { hay: boolean; alias: string | null } => {
+          let hallado: { hay: boolean; alias: string | null } = { hay: false, alias: null };
+          const mirar = (x: ts.Node): void => {
+            if (hallado.hay) return;
+            if (x !== ambito && ts.isFunctionLike(x)) return;
+            if (ts.isFunctionDeclaration(x) && x.name?.text === nombre && x !== ambito) {
+              hallado = { hay: true, alias: null };
+              return;
+            }
+            if (ts.isParameter(x) && (x.parent as ts.Node) === ambito) {
+              nombresDe(x.name, (n) => {
+                if (n === nombre) hallado = { hay: true, alias: null };
+              });
+            }
+            if (ts.isVariableDeclaration(x)) {
+              const alias =
+                x.initializer !== undefined && ts.isIdentifier(x.initializer)
+                  ? x.initializer.text
+                  : null;
+              nombresDe(x.name, (n) => {
+                if (n === nombre) {
+                  hallado = { hay: true, alias: ts.isIdentifier(x.name) ? alias : null };
+                }
+              });
+            }
+            ts.forEachChild(x, mirar);
+          };
+          // Los parámetros del propio ámbito cuelgan de él, así que se miran aparte.
+          if (ts.isFunctionLike(ambito)) {
+            for (const par of ambito.parameters) {
+              nombresDe(par.name, (n) => {
+                if (n === nombre) hallado = { hay: true, alias: null };
+              });
+            }
           }
-          ts.forEachChild(x, ligadas);
+          if (!hallado.hay) mirar(ambito);
+          return hallado;
         };
-        ligadas(decl);
-        for (const { objeto, nombre } of llamadasEn(decl)) {
+        const sombraEn = (donde: ts.Node, nombre: string): { hay: boolean; alias: string | null } => {
+          let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
+          for (;;) {
+            if (a === undefined) return { hay: false, alias: null };
+            if (ts.isFunctionLike(a) || ts.isBlock(a) || ts.isSourceFile(a)) {
+              const l = ligaduraDe(a, nombre);
+              if (l.hay) return l;
+            }
+            if (a === decl) return { hay: false, alias: null };
+            a = a.parent as ts.Node | undefined;
+          }
+        };
+        for (const { objeto, nombre, donde } of llamadasEn(decl)) {
           // `servicio.crear(…)` con `import * as servicio`: el módulo lo dice el espacio.
           const espacio = objeto === null ? undefined : imports.get(objeto);
           if (espacio?.original === '*') {
@@ -969,7 +1020,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * real ya quitada.
            */
           if (objeto !== null) continue;
-          const bajo = sombras.has(nombre) ? sombras.get(nombre)! : nombre;
+          const sombra = sombraEn(donde, nombre);
+          const bajo = sombra.hay ? sombra.alias : nombre;
           if (bajo === null) continue;
           const importado = imports.get(bajo);
           if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
@@ -1059,16 +1111,19 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               if (campos.size === 0 || suyos === undefined || suyos.size === 0) return false;
               if ([...campos].some((n) => suyos.has(n))) return false;
               /*
-               * Y sólo se acusa si ese campo aparece en OTRA columna de la misma escritura: eso
-               * es un intercambio, y es lo que hay que cazar. Que las dos capas nombren distinto
-               * un mismo dato NO lo es — medido: C0 escribe `reto_id` desde `p.anclaId` en la
-               * materialización y desde `entrada.retoId` a mano, y ahí no hay nada roto. Sin
-               * esta condición, el censo declaraba rota la única capacidad que ya sabíamos que
-               * está bien en este eje.
+               * Y si no coinciden, todavía vale que el campo de la ruta manual NOMBRE A SU
+               * COLUMNA: `reto_id` desde `entrada.retoId` es correcto aunque la materialización
+               * lo escriba desde `p.anclaId`, porque las dos capas nombran distinto el mismo
+               * dato. Medido: sin esta salvedad el censo declaraba rota C0, que en este eje está
+               * bien.
+               *
+               * La primera versión sólo acusaba si el campo aparecía en OTRA columna —o sea,
+               * sólo los intercambios—, y eso dejaba pasar una sustitución cualquiera:
+               * `contribucion = ${entrada.reviewId}` no comparte identificador con nada y se
+               * colaba. Comparar contra la columna cubre las dos cosas sin listar excepciones.
                */
-              return [...cubierto.get(e)!.columnas].some(
-                ([otra, ajenos]) => otra !== c && [...campos].some((n) => ajenos.has(n)),
-              );
+              const pelado = (n: string): string => n.toLowerCase().replace(/_/g, '');
+              return ![...suyos].some((n) => pelado(n) === pelado(c));
             })
             .map(([c, campos]) => `${e}.${c} ← ${[...campos].sort().join('|')}`),
         )

@@ -698,9 +698,22 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return null;
       };
+      const esAsincrona = (f: ts.Node): boolean =>
+        ts.canHaveModifiers(f) &&
+        (ts.getModifiers(f) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
       const consumidas = new Set<ts.Node>();
       const juntarConsumidos = (y: ts.Node): void => {
-        if (ts.isAwaitExpression(y) || ts.isReturnStatement(y)) {
+        /*
+         * Y UN `return` SÓLO CONSUME SI LA FUNCIÓN ES ASÍNCRONA, igual que el `return`
+         * directo. La comprobación estaba puesta en `seEjecuta` para la plantilla que se
+         * devuelve tal cual, pero no en la puerta de la variable: un
+         * `const pendiente = tx\`…\`; return pendiente` dentro de un ayudante SÍNCRONO daba
+         * por ejecutada la consulta aunque quien llamara tirase el valor, que es justo lo
+         * que el arreglo anterior perseguía por el otro lado.
+         */
+        const dispara =
+          ts.isAwaitExpression(y) || (ts.isReturnStatement(y) && esAsincrona(funcionDe(y)));
+        if (dispara) {
           const nombres = new Set<string>();
           valorConsumido(y.expression, nombres);
           for (const nombre of nombres) {
@@ -731,9 +744,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * Un `void`, un argumento de otra llamada, o quedarse dentro de un objeto o una lista,
          * no la ejecutan.
          */
-        const esAsincrona = (f: ts.Node): boolean =>
-          ts.canHaveModifiers(f) &&
-          (ts.getModifiers(f) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
         const seEjecuta = (desde: ts.Node, saltos = 0): boolean => {
           if (saltos > 12) return false;
           let hijo: ts.Node = desde;
@@ -1243,11 +1253,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         columnas: { columna: string; operador: string; indice: number }[];
         literales: { columna: string; operador: string; valor: string }[];
       } => ({ columnas: [], literales: [] });
-      if (verbo !== 'update') return nada();
       const resto = sql.slice(desde);
-      const set = /\bset\b/i.exec(resto);
-      if (!set) return nada();
-      const cuerpo = resto.slice(set.index + set[0].length);
+      let cuerpo: string;
+      if (verbo === 'update') {
+        const set = /\bset\b/i.exec(resto);
+        if (!set) return nada();
+        cuerpo = resto.slice(set.index + set[0].length);
+      } else {
+        /*
+         * Y UN `insert … select` TAMBIÉN ACOTA. Lo que su WHERE deje fuera no se inserta, y
+         * este censo lo tiraba: cortaba la lista del select en el `where` de nivel cero y
+         * seguía. Un `where false` colgado del `insert into afirmacion … select …` dejaba las
+         * columnas proyectadas idénticas, no metía NINGUNA fila, y la paridad en verde.
+         *
+         * Un `values (…)` no lleva `where` a nivel cero, así que ahí esto no encuentra nada y
+         * la sentencia se cuenta igual que antes.
+         */
+        cuerpo = resto;
+      }
       let hondo = 0;
       let enTexto = false;
       let donde = -1;
@@ -1295,7 +1318,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
       }
       /*
-       * CADA CONJUNTO DE LA CADENA TIENE QUE NOMBRAR UNA COLUMNA, Y UNA SOLA VEZ.
+       * CADA CONJUNTO DE LA CADENA TIENE QUE NOMBRAR UNA COLUMNA, Y UNA SOLA VEZ. Con o sin
+       * el alias de su tabla delante: el WHERE de un `insert … select` los lleva —`s.id`,
+       * `s.workspace_id`— y sin admitirlos el censo denunciaba una sentencia intacta.
        *
        * Mirando únicamente los predicados que la materialización exige, un `and false` —o un
        * `and id is null` junto al `id = ${'${…}'}` correcto— dejaba el mapa de filtros
@@ -1350,7 +1375,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       for (const bruto of conjuntos) {
         const trozo = bruto.trim();
         if (trozo === '') continue;
-        const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i(\d+)\b/i.exec(trozo);
+        const m = /^(?:[a-z_][a-z0-9_]*\s*\.\s*)?([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i(\d+)\b/i.exec(
+          trozo,
+        );
         if (m) {
           columnas.push({
             columna: m[1]!.toLowerCase(),
@@ -1362,7 +1389,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         // Lo que no se registra SÍ se mira: tiene que nombrar una columna. Un `and false` no
         // la nombra, y anula la sentencia entera sin tocar el mapa de filtros.
-        const col = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|<=|>=|<|>|\bis\b|\bin\b|\blike\b|\bilike\b|@>)/i.exec(trozo);
+        const col =
+          /^(?:[a-z_][a-z0-9_]*\s*\.\s*)?([a-z_][a-z0-9_]*)\s*(=|<>|!=|<=|>=|<|>|\bis\b|\bin\b|\blike\b|\bilike\b|@>)/i.exec(
+            trozo,
+          );
         if (col === null) {
           predicadosSinColumna.add(trozo.slice(0, 60));
           continue;
@@ -1374,7 +1404,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * `and estado = 'completado'` en el guardado del borrador deja una sentencia que no
          * toca NINGUNA fila —el borrador nunca está completado— con la paridad en verde.
          */
-        const lit = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=)\s*'([^']*)'\s*$/i.exec(trozo);
+        const lit = /^(?:[a-z_][a-z0-9_]*\s*\.\s*)?([a-z_][a-z0-9_]*)\s*(=|<>|!=)\s*'([^']*)'\s*$/i.exec(
+          trozo,
+        );
         if (lit) {
           literales.push({
             columna: lit[1]!.toLowerCase(),
@@ -2159,11 +2191,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     ).toEqual([]);
     expect(
       [...predicadosSinColumna].sort(),
-      'un UPDATE lleva un predicado que este censo no sabe leer, o repite una columna: puede anular la sentencia entera',
+      'una escritura lleva un predicado que este censo no sabe leer, o repite una columna: puede anular la sentencia entera',
     ).toEqual([]);
     expect(
       [...conjuntosImposibles].sort(),
-      'un UPDATE acota por un valor que su propia ruta ya descartó: no toca ninguna fila',
+      'una escritura acota por un valor que su propia ruta ya descartó: no toca ninguna fila',
     ).toEqual([]);
   });
 });

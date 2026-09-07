@@ -337,14 +337,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * lectura del SQL, y la de las llamadas seguía bajando a todas partes: un ayudante muerto
      * que en vez de traer el SQL DELEGARA en otro módulo seguía arrastrando su escritura. Una
      * regla en dos sitios se aplica en uno.
+     *
+     * La vida se deriva de lo ALCANZABLE y no de contar apariciones, que fue la primera versión
+     * y no bastaba: dos ayudantes muertos que se nombraran entre sí —o uno recursivo— llegaban
+     * a dos apariciones y pasaban por vivos. Se parte de lo que se nombra FUERA de todo cuerpo
+     * con nombre y se expande por punto fijo: sólo entra el que alguien vivo nombra.
      */
     const recorrerVivo = (n: ts.Node, visitar: (x: ts.Node) => void): void => {
-      const usos = new Map<string, number>();
-      const contar = (x: ts.Node): void => {
-        if (ts.isIdentifier(x)) usos.set(x.text, (usos.get(x.text) ?? 0) + 1);
-        ts.forEachChild(x, contar);
-      };
-      contar(n);
       /** El nombre con el que se declara una función anidada, si lo tiene. */
       const nombreDe = (x: ts.Node): string | null => {
         if (ts.isFunctionDeclaration(x)) return x.name?.text ?? null;
@@ -359,11 +358,52 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return null;
       };
+
+      const nombradas = new Map<string, ts.Node>();
+      const juntar = (x: ts.Node): void => {
+        if (x !== n && ts.isFunctionLike(x)) {
+          const nom = nombreDe(x);
+          if (nom !== null && !nombradas.has(nom)) nombradas.set(nom, x);
+        }
+        ts.forEachChild(x, juntar);
+      };
+      juntar(n);
+
+      /** Lo que una región NOMBRA, sin entrar en los cuerpos con nombre que haya dentro. */
+      const nombraA = (region: ts.Node): string[] => {
+        const nombres: string[] = [];
+        const ver = (x: ts.Node): void => {
+          if (x !== region && ts.isFunctionLike(x) && nombreDe(x) !== null) return;
+          if (ts.isIdentifier(x)) {
+            const padre = x.parent as ts.Node | undefined;
+            // Declararse no es nombrarse: si no, todo ayudante se daría vida a sí mismo.
+            const esSuPropiaDeclaracion =
+              padre !== undefined &&
+              ((ts.isFunctionDeclaration(padre) && padre.name === x) ||
+                (ts.isVariableDeclaration(padre) && padre.name === x));
+            if (!esSuPropiaDeclaracion) nombres.push(x.text);
+          }
+          ts.forEachChild(x, ver);
+        };
+        ver(region);
+        return nombres;
+      };
+
+      const vivas = new Set<string>();
+      const cola = nombraA(n);
+      while (cola.length > 0) {
+        const nom = cola.shift()!;
+        if (vivas.has(nom)) continue;
+        const cuerpo = nombradas.get(nom);
+        if (!cuerpo) continue;
+        vivas.add(nom);
+        cola.push(...nombraA(cuerpo));
+      }
+
       const ver = (x: ts.Node): void => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);
-          // Su propia declaración ya cuenta una vez: hace falta OTRA aparición para estar viva.
-          if (nombre !== null && (usos.get(nombre) ?? 0) < 2) return;
+          if (nombre !== null && !vivas.has(nombre)) return;
         }
         visitar(x);
         ts.forEachChild(x, ver);
@@ -375,6 +415,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       const trozos: string[] = [];
       recorrerVivo(n, (x) => {
         if (!ts.isTaggedTemplateExpression(x)) return;
+        /*
+         * Una consulta de postgres.js es PEREZOSA: no sale hacia la base hasta que alguien la
+         * espera. Así que una plantilla que es toda la sentencia —sin `await`, sin `return`, sin
+         * asignarse a nada— no se ejecuta, y ni TypeScript ni las reglas de lint la rechazan.
+         * Contarla dejaría la invariante en verde justo cuando la operación manual ha dejado de
+         * ocurrir, que es lo mismo que pasaba con el comentario y con la cadena.
+         */
+        if (x.parent !== undefined && ts.isExpressionStatement(x.parent)) return;
         const t = x.template;
         const literales = ts.isNoSubstitutionTemplateLiteral(t)
           ? [t.text]
@@ -439,6 +487,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
       for (const destino of comodines) {
         if (exportadasDe(destino).has(nombre)) return { modulo: destino, original: nombre };
+      }
+      /*
+       * `export default …` no se indexa por «default»: una declaración con nombre entra en el
+       * mapa por SU nombre. Sin esto, delegar por un import por defecto —un cambio que no altera
+       * ninguna conducta— hacía que el censo dijera que la ruta manual ya no escribe nada.
+       */
+      if (nombre === 'default') {
+        for (const st of arbol.statements) {
+          if (
+            ts.isFunctionDeclaration(st) &&
+            st.name &&
+            st.modifiers?.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)
+          ) {
+            return { modulo: f, original: st.name.text };
+          }
+          if (ts.isExportAssignment(st) && !st.isExportEquals && ts.isIdentifier(st.expression)) {
+            return { modulo: f, original: st.expression.text };
+          }
+        }
       }
       return null;
     };
@@ -627,6 +694,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             cola.push({ modulo: espacio.modulo, funcion: nombre });
             continue;
           }
+          /*
+           * Y sólo las llamadas SUELTAS caen a estos dos respaldos. Resolviendo también las de
+           * propiedad, `logger.persistir()` casaba con un `persistir` importado que no tiene
+           * nada que ver y arrastraba su escritura: la invariante seguía verde con la llamada
+           * real ya quitada.
+           */
+          if (objeto !== null) continue;
           const importado = imports.get(nombre);
           if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
           else if (locales.has(nombre)) cola.push({ modulo: actual.modulo, funcion: nombre });

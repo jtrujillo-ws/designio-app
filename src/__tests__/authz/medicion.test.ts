@@ -1110,7 +1110,11 @@ describeAuthz('medición: registry, snapshots y outcome review', () => {
         ventanaDias: 30,
         fechaPostMortem: null,
       }),
-    ).rejects.toThrow(/registry del reto está firmado/);
+      // El motivo llega DICHO por el servicio, no como el `raise` crudo del guard: `mensajeDe`
+      // no traduce `P0001`, así que antes este texto salía del guard y llegaba a la pantalla
+      // convertido en «intenta de nuevo». Ahora la causa se anticipa con las mismas funciones
+      // que el guard impone, y la firma se nombra antes que el G0 porque no tiene vuelta atrás.
+    ).rejects.toThrow(/El Metric Registry del reto ya está firmado/);
 
     // Ni por SQL directo: la política mira el registry además de la etapa. Un UPDATE
     // que el USING filtra no lanza — simplemente no toca ninguna fila, que es la forma

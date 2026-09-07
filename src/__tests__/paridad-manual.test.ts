@@ -366,6 +366,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const callbacksSinInvocar = new Set<string>();
     const predicadosSinColumna = new Set<string>();
     const conjuntosImposibles = new Set<string>();
+    const origenesSinLeer = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -702,7 +703,23 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         ts.canHaveModifiers(f) &&
         (ts.getModifiers(f) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
       const consumidas = new Set<ts.Node>();
+      /*
+       * Y UNA VARIABLE QUE SE REASIGNA DEJA DE VALER. El consumo se apunta contra la
+       * declaración, así que con `let pendiente = tx\`…\`; pendiente = Promise.resolve();
+       * await pendiente` lo que se espera es OTRO valor y la consulta perezosa no sale nunca:
+       * borrar la escritura de verdad dejaba la paridad en verde. No se sigue el valor que
+       * llega —eso es otro análisis—; se deja de contar, que falla hacia rojo.
+       */
+      const reasignadas = new Set<ts.Node>();
       const juntarConsumidos = (y: ts.Node): void => {
+        if (
+          ts.isBinaryExpression(y) &&
+          y.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+          ts.isIdentifier(y.left)
+        ) {
+          const d = declaracionDe(y, y.left.text);
+          if (d !== null) reasignadas.add(d);
+        }
         /*
          * Y UN `return` SÓLO CONSUME SI LA FUNCIÓN ES ASÍNCRONA, igual que el `return`
          * directo. La comprobación estaba puesta en `seEjecuta` para la plantilla que se
@@ -721,9 +738,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             if (decl !== null) consumidas.add(decl);
           }
         }
-        ts.forEachChild(y, juntarConsumidos);
       };
-      juntarConsumidos(n);
+      /*
+       * Y SÓLO DE LOS CUERPOS VIVOS. Bajando a toda función anidada, un ayudante al que no
+       * llama nadie con un `return pendiente` dentro daba por consumida la declaración de
+       * fuera: la consulta perezosa se contaba aunque ese `return` no se ejecute jamás. Es la
+       * misma regla que el recorrido del SQL ya aplica, y aquí faltaba.
+       */
+      recorrerVivo(n, juntarConsumidos);
       const trozos: Consulta[] = [];
       recorrerVivo(n, (x) => {
         if (!ts.isTaggedTemplateExpression(x)) return;
@@ -793,7 +815,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             return seEjecuta(padre, saltos + 1);
           }
           if (ts.isVariableDeclaration(padre) && padre.initializer === hijo && ts.isIdentifier(padre.name)) {
-            return consumidas.has(padre);
+            return consumidas.has(padre) && !reasignadas.has(padre);
           }
           return false;
         };
@@ -855,6 +877,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           return null;
         };
         const fuenteLigada = (el: ts.BindingElement, raiz: ts.Expression | null): Fuente => {
+          /*
+           * Un REST no nombra un campo: lo que liga es TODO lo que queda del objeto. Sin mirar
+           * el `...`, `const { ...contribucion } = entrada` se leía como la taquigrafía
+           * `{ contribucion }`, o sea como el campo homónimo, y la salvedad de «el campo nombra
+           * a su columna» lo aceptaba — con la interpolación guardando el objeto entero.
+           */
+          if (el.dotDotDotToken !== undefined) {
+            origenesSinLeer.add(
+              `${ts.isIdentifier(el.name) ? el.name.text : '(patrón)'} (resto de un desestructurado)`,
+            );
+            return null;
+          }
           if (el.propertyName !== undefined) {
             if (ts.isComputedPropertyName(el.propertyName)) {
               return { nodo: el.propertyName.expression };
@@ -880,12 +914,27 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                 if (!ts.isVariableStatement(st)) continue;
                 for (const d of st.declarationList.declarations) {
                   if (!d.initializer) continue;
+                  const suyo = esPatron(d.name)
+                    ? elementoLigado(d.name, nombre) !== null
+                    : ts.isIdentifier(d.name) && d.name.text === nombre;
+                  if (!suyo) continue;
+                  /*
+                   * Y UN NOMBRE QUE SE REASIGNA NO TIENE UN ORIGEN QUE LEER. Con
+                   * `let contribucion = entrada.contribucion; contribucion = entrada.aprendizajes`,
+                   * el inicializador dice el campo correcto y lo que llega a la interpolación es
+                   * otro: C7 guardaba los aprendizajes dentro de la contribución con la
+                   * comparación en verde. No se sigue la asignación que llega —eso es otro
+                   * análisis—; se NOMBRA, que es lo que este censo hace con lo que no sabe leer.
+                   */
+                  if (reasignadas.has(d)) {
+                    origenesSinLeer.add(`${nombre} (reasignado antes de interpolarse)`);
+                    return null;
+                  }
                   if (esPatron(d.name)) {
-                    const el = elementoLigado(d.name, nombre);
-                    if (el === null) continue;
+                    const el = elementoLigado(d.name, nombre)!;
                     return fuenteLigada(el, d.initializer);
                   }
-                  if (!ts.isIdentifier(d.name) || d.name.text !== nombre) {
+                  if (!ts.isIdentifier(d.name)) {
                     continue;
                   }
                   /*
@@ -1640,6 +1689,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return original !== null && CLIENTES_DE_LA_BASE.includes(original);
       }
       if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression)) {
+        // Y el RECEPTOR se mira igual que el nombre suelto: con `import * as db`, un parámetro
+        // o un local llamado `db` tapa al módulo, y `db.sql()` deja de ser la fábrica de verdad.
+        if (ligaduraDe(e.expression, e.expression.text) !== null) return false;
         const via = importesDe(leer(f), f).get(e.expression.text);
         return (
           via !== undefined &&
@@ -1831,25 +1883,58 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * una ruta INTACTA, que es el otro modo de fallo y el que empuja a «arreglar» lo que
          * no está roto. Un `const` de un bloque pertenece a ese bloque.
          */
-        const ligaduraDe = (ambito: ts.Node, nombre: string): { hay: boolean; alias: string | null } => {
+        /*
+         * …CON UNA EXCEPCIÓN QUE SÍ TIENE DESTINO: lo que sale de un MIEMBRO de un espacio de
+         * nombres. `const generar = proveedor.generarConProveedor` —o desestructurarlo— tapaba
+         * el nombre sin destino, así que el recorrido no llegaba a `proveedor.server.ts` y la
+         * ruta manual podía llamar al modelo con SYS-21 en verde. El espacio dice el módulo y
+         * el miembro dice la función: eso es un destino, y se sigue.
+         */
+        type Sombra = {
+          hay: boolean;
+          alias: string | null;
+          via: { objeto: string; miembro: string } | null;
+        };
+        /** De `X.y` o de `{ y }`/`{ y: z }` sobre `X`: el espacio y el miembro, si los hay. */
+        const miembroDeEspacio = (d: ts.VariableDeclaration, nombre: string): Sombra['via'] => {
+          const init = d.initializer;
+          if (init === undefined) return null;
+          if (
+            ts.isIdentifier(d.name) &&
+            ts.isPropertyAccessExpression(init) &&
+            ts.isIdentifier(init.expression)
+          ) {
+            return { objeto: init.expression.text, miembro: init.name.text };
+          }
+          if (!ts.isObjectBindingPattern(d.name) || !ts.isIdentifier(init)) return null;
+          for (const el of d.name.elements) {
+            if (el.dotDotDotToken !== undefined || !ts.isIdentifier(el.name)) continue;
+            if (el.name.text !== nombre) continue;
+            const suyo = el.propertyName;
+            if (suyo !== undefined && !ts.isIdentifier(suyo)) return null;
+            return { objeto: init.text, miembro: (suyo ?? el.name).text };
+          }
+          return null;
+        };
+        const ligaduraDe = (ambito: ts.Node, nombre: string): Sombra => {
           if (ts.isFunctionLike(ambito)) {
             for (const par of ambito.parameters) {
               let hay = false;
               nombresDe(par.name, (n) => {
                 if (n === nombre) hay = true;
               });
-              if (hay) return { hay: true, alias: null };
+              if (hay) return { hay: true, alias: null, via: null };
             }
           }
           const cuerpo = ts.isFunctionLike(ambito)
             ? ((ambito as ts.FunctionLikeDeclaration).body as ts.Node | undefined)
             : ambito;
           if (cuerpo === undefined || (!ts.isBlock(cuerpo) && !ts.isSourceFile(cuerpo))) {
-            return { hay: false, alias: null };
+            return { hay: false, alias: null, via: null };
           }
           for (const st of cuerpo.statements) {
             if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) {
-              return { hay: true, alias: null };
+              return { hay: true, alias: null, via: null };
             }
             if (!ts.isVariableStatement(st)) continue;
             for (const d of st.declarationList.declarations) {
@@ -1862,20 +1947,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                 d.initializer !== undefined && ts.isIdentifier(d.initializer)
                   ? d.initializer.text
                   : null;
-              return { hay: true, alias: ts.isIdentifier(d.name) ? alias : null };
+              return {
+                hay: true,
+                alias: ts.isIdentifier(d.name) ? alias : null,
+                via: miembroDeEspacio(d, nombre),
+              };
             }
           }
-          return { hay: false, alias: null };
+          return { hay: false, alias: null, via: null };
         };
-        const sombraEn = (donde: ts.Node, nombre: string): { hay: boolean; alias: string | null } => {
+        const sombraEn = (donde: ts.Node, nombre: string): Sombra => {
           let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
           for (;;) {
-            if (a === undefined) return { hay: false, alias: null };
+            if (a === undefined) return { hay: false, alias: null, via: null };
             if (ts.isFunctionLike(a) || ts.isBlock(a) || ts.isSourceFile(a)) {
               const l = ligaduraDe(a, nombre);
               if (l.hay) return l;
             }
-            if (a === decl) return { hay: false, alias: null };
+            if (a === decl) return { hay: false, alias: null, via: null };
             a = a.parent as ts.Node | undefined;
           }
         };
@@ -1894,6 +1983,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            */
           if (objeto !== null) continue;
           const sombra = sombraEn(donde, nombre);
+          // Un alias que sale de un miembro de espacio de nombres YA dice a dónde va.
+          if (sombra.hay && sombra.via !== null) {
+            const suyo = imports.get(sombra.via.objeto);
+            if (suyo?.original === '*') cola.push({ modulo: suyo.modulo, funcion: sombra.via.miembro });
+            continue;
+          }
           const bajo = sombra.hay ? sombra.alias : nombre;
           if (bajo === null) continue;
           const importado = imports.get(bajo);
@@ -2224,6 +2319,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     expect(
       [...conjuntosImposibles].sort(),
       'una escritura acota por un valor que su propia ruta ya descartó: no toca ninguna fila',
+    ).toEqual([]);
+    expect(
+      [...origenesSinLeer].sort(),
+      'una interpolación sale de un nombre cuyo origen este censo no sabe leer: decide si cuenta',
     ).toEqual([]);
   });
 });

@@ -1708,8 +1708,14 @@ y ejecuta `serve.ts`. No hay worker, cola ni cron construidos.
    guards serializan con candado y releen (`IS001`). La **exportación** es la excepción
    deliberada: escribe su permiso y su auditoría (`registrar_exportacion`,
    `confirmar_exportacion`) dentro de la misma transacción `repeatable read` que lee el
-   catálogo, para que el recibo comparta foto con lo que emite; puede hacerlo porque
-   `evento_dominio` y `exportacion_registro` son append-only y no tienen guards que serialicen.
+   catálogo, para que el recibo comparta foto con lo que emite; puede hacerlo porque ninguna
+   de las dos escrituras puede chocar con otra transacción: `evento_dominio` solo recibe un
+   INSERT, y `exportacion_registro` **no es append-only** —`registrar_exportacion` inserta la
+   fila incompleta y `confirmar_exportacion` la sella con un UPDATE— pero ese UPDATE alcanza
+   solo la fila que **esta misma transacción** escribió (la busca por `xmin`), así que nunca
+   toca una versión que otra transacción haya cambiado tras la foto; las dos escrituras viven
+   en funciones definer sin grant de INSERT ni UPDATE para la app, y ninguna de las dos tablas
+   tiene guards que serialicen y releen.
 5. Los errores de Postgres se traducen al contrato del módulo (`42501` sin permiso, `23503`
    referencia inexistente, `23514` regla del pipeline, códigos propios `DR001`, `DS003`, `IS001`).
 

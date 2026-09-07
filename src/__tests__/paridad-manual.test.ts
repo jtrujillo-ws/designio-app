@@ -259,12 +259,33 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
     };
     const mirar = (n: ts.Node): void => {
-      if (ts.isFunctionLike(n)) return; // `var` no cruza la frontera de una función.
-      if (
-        ts.isVariableStatement(n) &&
-        (n.declarationList.flags & ts.NodeFlags.BlockScoped) === 0
-      ) {
-        for (const d of n.declarationList.declarations) recoger(d.name, d);
+      /*
+       * LAS DOS FRONTERAS que un `var` no cruza hacia fuera: una función y un bloque estático
+       * de clase. Un bloque estático NO es function-like, así que este barrido se metía dentro
+       * y apuntaba sus `var` como ligaduras de la función o del fichero de alrededor: una
+       * llamada legítima al import con ese nombre se descartaba. ROJO SOBRE CÓDIGO QUE FUNCIONA.
+       */
+      if (ts.isFunctionLike(n) || ts.isClassStaticBlockDeclaration(n)) return;
+      /*
+       * Y LAS DOS FORMAS de declarar a ámbito de función: la sentencia de variable y la cabecera
+       * de un `for`/`for…of`/`for…in`. Sólo se leía la primera, así que tras un
+       * `for (var definirCriterio of …) {}` la llamada de DESPUÉS —el `var` sigue vivo al salir
+       * del bucle— se le acreditaba al import.
+       *
+       * Se enumeran aquí las dos, y las dos fronteras de arriba, a propósito: es el tercer
+       * hallazgo sobre esta misma lectura (rondas 9, 11 y 11) y cada vez había sido por
+       * parchear el caso señalado en vez de escribir la regla entera. Éstas son todas las
+       * formas y todas las fronteras que `var` tiene en este lenguaje.
+       */
+      const lista: ts.VariableDeclarationList | null = ts.isVariableStatement(n)
+        ? n.declarationList
+        : (ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n)) &&
+            n.initializer !== undefined &&
+            ts.isVariableDeclarationList(n.initializer)
+          ? n.initializer
+          : null;
+      if (lista !== null && (lista.flags & ts.NodeFlags.BlockScoped) === 0) {
+        for (const d of lista.declarations) recoger(d.name, d);
       }
       ts.forEachChild(n, mirar);
     };
@@ -301,6 +322,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * invocación manual de verdad: ROJO SOBRE CÓDIGO QUE FUNCIONA, y regresión de mi propio
        * arreglo de la ronda anterior. Por eso se mira POR QUÉ HIJO se ha subido.
        */
+      // Y dentro de un bloque estático, sus propios `var` SÍ ligan: es su ámbito.
+      if (ts.isClassStaticBlockDeclaration(a)) {
+        const v = varsDe(a.body).get(nombre);
+        if (v !== undefined) return v;
+      }
       const cuerpo = cuerpoDeLaFuncion(a);
       if (cuerpo !== null && hijo === cuerpo) {
         const v = varsDe(cuerpo).get(nombre);

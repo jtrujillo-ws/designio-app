@@ -471,14 +471,40 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * campo, la del cliente de la base y la del destino de una llamada—, porque las tres se
      * apoyaban en el inicializador de la declaración y ninguna miraba lo que pasaba después.
      */
-    const nombreReasignado = (y: ts.Node): ts.Identifier | null => {
+    const nombresReasignados = (y: ts.Node): ts.Identifier[] => {
+      /*
+       * Y el lado izquierdo puede ser un PATRÓN, no un nombre: `({ aprendizajes: contribucion }
+       * = entrada)` reasigna igual y no es un identificador, así que no entraba. Se recogen
+       * TODOS los destinos de dentro —taquigrafía, renombrado, resto, listas, anidados y sus
+       * valores por defecto—, que es lo que el patrón liga.
+       */
+      const destinos = (e: ts.Expression, poner: (i: ts.Identifier) => void): void => {
+        if (ts.isIdentifier(e)) return poner(e);
+        if (ts.isParenthesizedExpression(e)) return destinos(e.expression, poner);
+        // `q = 1` dentro de un patrón es un valor por defecto: el destino es su izquierda.
+        if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+          return destinos(e.left, poner);
+        }
+        if (ts.isSpreadElement(e)) return destinos(e.expression, poner);
+        if (ts.isArrayLiteralExpression(e)) {
+          for (const el of e.elements) if (!ts.isOmittedExpression(el)) destinos(el, poner);
+          return;
+        }
+        if (!ts.isObjectLiteralExpression(e)) return;
+        for (const pr of e.properties) {
+          if (ts.isShorthandPropertyAssignment(pr)) poner(pr.name);
+          else if (ts.isPropertyAssignment(pr)) destinos(pr.initializer, poner);
+          else if (ts.isSpreadAssignment(pr)) destinos(pr.expression, poner);
+        }
+      };
+      const fuera: ts.Identifier[] = [];
       if (
         ts.isBinaryExpression(y) &&
         y.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
-        y.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
-        ts.isIdentifier(y.left)
+        y.operatorToken.kind <= ts.SyntaxKind.LastAssignment
       ) {
-        return y.left;
+        destinos(y.left, (i) => fuera.push(i));
+        return fuera;
       }
       if (
         (ts.isPrefixUnaryExpression(y) || ts.isPostfixUnaryExpression(y)) &&
@@ -486,9 +512,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           y.operator === ts.SyntaxKind.MinusMinusToken) &&
         ts.isIdentifier(y.operand)
       ) {
-        return y.operand;
+        return [y.operand];
       }
-      return null;
+      // `for (contribucion of …)` también reasigna, y ahí no hay operador que mirar.
+      if (
+        (ts.isForOfStatement(y) || ts.isForInStatement(y)) &&
+        !ts.isVariableDeclarationList(y.initializer)
+      ) {
+        destinos(y.initializer, (i) => fuera.push(i));
+      }
+      return fuera;
     };
     const etiquetasDesconocidas = new Set<string>();
     const callbacksSinInvocar = new Set<string>();
@@ -877,8 +910,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * cambia el valor igual y mirando sólo el `=` pasaba en verde: la misma avería con otro
          * operador, que es como han llegado casi todas.
          */
-        const reasignado = nombreReasignado(y);
-        if (reasignado !== null) {
+        for (const reasignado of nombresReasignados(y)) {
           const d = declaracionDe(y, reasignado.text);
           if (d !== null) reasignadas.add(d);
         }
@@ -1916,8 +1948,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       let hay = false;
       const ver = (y: ts.Node): void => {
         if (hay) return;
-        const izq = nombreReasignado(y);
-        if (izq !== null && izq.text === nombre && ligaduraDe(izq, nombre) === d) hay = true;
+        for (const izq of nombresReasignados(y)) {
+          if (izq.text === nombre && ligaduraDe(izq, nombre) === d) hay = true;
+        }
         ts.forEachChild(y, ver);
       };
       ver(ambito);
@@ -2125,8 +2158,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const reasignadasAqui = new Set<ts.Node>();
         {
           const anotar = (y: ts.Node): void => {
-            const izq = nombreReasignado(y);
-            if (izq !== null) {
+            for (const izq of nombresReasignados(y)) {
               const d = ligaduraLexica(izq, izq.text);
               if (d !== null) reasignadasAqui.add(d);
             }

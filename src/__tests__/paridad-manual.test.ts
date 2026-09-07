@@ -182,6 +182,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const funcionesDe = (arbol: ts.SourceFile): Map<string, ts.Node> => {
       const m = new Map<string, ts.Node>();
       for (const st of arbol.statements) {
+        /*
+         * Una declaración por defecto SIN nombre —`export default function () {…}`, que es una
+         * forma válida— no tiene con qué indexarse, y el recorrido llega buscando «default».
+         * Sin esta entrada se paraba y daba por incumplida una ruta intacta.
+         */
+        if (
+          ts.isFunctionDeclaration(st) &&
+          !st.name &&
+          st.modifiers?.some((x) => x.kind === ts.SyntaxKind.DefaultKeyword)
+        ) {
+          m.set('default', st);
+        }
         if (ts.isFunctionDeclaration(st) && st.name) m.set(st.name.text, st);
         else if (ts.isVariableStatement(st)) {
           for (const d of st.declarationList.declarations) {
@@ -324,7 +336,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * `contribucion = ${entrada.aprendizajes}` da el mismo conjunto de columnas que el correcto
      * y guarda el relato en el campo equivocado con el censo en verde.
      */
-    type Consulta = { sql: string; campos: string[][] };
+    type Consulta = { sql: string; campos: string[][]; etiqueta: string };
+
+    /*
+     * QUIÉN ETIQUETA LA PLANTILLA. Contando toda plantilla etiquetada, un `sqlText\`…\`` o un
+     * `String.raw\`…\`` que formatee o registre una sentencia contaba como escritura: borrar la
+     * consulta de verdad y dejar el texto formateado mantenía la invariante en verde.
+     *
+     * Se reconocen las etiquetas del cliente de este repositorio —la transacción y los dos
+     * accesos de `db.ts`—, y lo que NO se reconoce no se ignora en silencio: una plantilla con
+     * una escritura y una etiqueta desconocida tumba el censo nombrándola. Así, el día que
+     * aparezca otra forma de consultar, esto pide una decisión en vez de contarla o perderla.
+     */
+    const ETIQUETAS_DE_LA_BASE = ['tx', 'sql', 'sqlAdmin', 'admin'];
+    const etiquetaDeBase = (t: string): boolean => {
+      const base = t.replace(/\([^)]*\)\s*$/, '');
+      const ultimo = base.split('.').pop() ?? '';
+      return ETIQUETAS_DE_LA_BASE.includes(ultimo.trim());
+    };
+    const etiquetasDesconocidas = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -486,8 +516,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           return;
         }
         const t = x.template;
+        const etiqueta = x.tag.getText();
         if (ts.isNoSubstitutionTemplateLiteral(t)) {
-          trozos.push({ sql: soloSql(t.text), campos: [] });
+          trozos.push({ sql: soloSql(t.text), campos: [], etiqueta });
           return;
         }
         /*
@@ -508,7 +539,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         t.templateSpans.forEach((sp, k) => {
           sql += testigo(k) + sp.literal.text;
         });
-        trozos.push({ sql: soloSql(sql), campos });
+        trozos.push({ sql: soloSql(sql), campos, etiqueta });
       });
       return trozos;
     };
@@ -862,6 +893,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           for (const m of consulta.sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
             const tabla = m[2]!;
             if (CONTABILIDAD_AI.includes(tabla)) continue;
+            if (!etiquetaDeBase(consulta.etiqueta)) {
+              etiquetasDesconocidas.add(consulta.etiqueta);
+              continue;
+            }
             const verbo = m[1]!.toLowerCase().replace(/\s+/g, ' ');
             const clave = `${verbo} ${tabla}`;
             const y = escrituras.get(clave) ?? {
@@ -1053,5 +1088,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         `${cap}: la secuencia manual (${secuencia}) escribe lo mismo que ${suyos[0]} pero no acota la fila igual`,
       ).toEqual([]);
     }
+
+    /*
+     * AL FINAL, cuando ya se ha recorrido todo: antes del bucle este conjunto está vacío
+     * SIEMPRE, y la aserción no podía fallar. Se vio midiendo —la sonda que se movía era otra—,
+     * y es el mismo modo de fallo que persigue el resto del fichero.
+     */
+    expect(
+      [...etiquetasDesconocidas].sort(),
+      'una plantilla escribe en la base con una etiqueta que este censo no reconoce: decide si cuenta',
+    ).toEqual([]);
   });
 });

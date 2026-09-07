@@ -631,7 +631,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const receptorValido = (x: ts.CallExpression, quien: string): boolean => {
       const como = RECEPTOR_EXIGIDO.get(quien) ?? 'cualquiera';
       if (como === 'cualquiera') return true;
-      if (como === 'suelto') return ts.isIdentifier(x.expression);
+      /*
+       * Y `suelto` NO ES SÓLO LA FORMA: tiene que ser DE VERDAD la de la base. Bastaba con
+       * que el nombre a secas se llamara `conUsuario` para dar por ejecutado su callback, así
+       * que una función local con ese nombre —que se lo guarde o lo tire— hacía contar SQL
+       * que nunca se manda. El nombre se resuelve hasta `db.ts`, y una ligadura local (lo que
+       * TAPA al import) descalifica: ahí ya no se sabe qué es.
+       */
+      if (como === 'suelto') {
+        if (!ts.isIdentifier(x.expression)) return false;
+        if (ligaduraDe(x.expression, x.expression.text) !== null) return false;
+        return vieneDeLaBase(x.getSourceFile().fileName, x.expression.text) === quien;
+      }
       if (!ts.isPropertyAccessExpression(x.expression)) return false;
       let a: ts.Expression = x.expression.expression;
       for (let i = 0; i < 12; i += 1) {
@@ -824,9 +835,42 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return null;
       };
+      /** Los nombres que liga un patrón: `(p)`, `({ p })`, `([p])`, `(...p)`, y anidados. */
+      const ligaEsteNombre = (b: ts.BindingName, nombre: string): boolean => {
+        if (ts.isIdentifier(b)) return b.text === nombre;
+        for (const e of b.elements) {
+          if (ts.isOmittedExpression(e)) continue;
+          if (ligaEsteNombre(e.name, nombre)) return true;
+        }
+        return false;
+      };
+      /*
+       * Y UN PARÁMETRO TAPA AL AYUDANTE DE FUERA, igual que lo tapa una declaración. El
+       * ascenso sólo miraba bloques y ficheros, así que con un `[nada].map((persistir) =>
+       * persistir())` al lado de un `const persistir = async () => await tx\`…\`` que no
+       * llama nadie, la llamada al PARÁMETRO daba por vivo al ayudante de fuera y su SQL
+       * contaba: en ejecución sólo corre el elemento del array, y borrar la escritura de
+       * verdad dejaba la paridad en verde.
+       *
+       * Sin cuerpo que mirar, el ayudante no vive y su escritura desaparece: el censo se pone
+       * ROJO nombrando lo que falta, que es el fallo que este fichero quiere.
+       */
       const cuerpoDesde = (donde: ts.Node, nombre: string): ts.Node | null => {
         let a: ts.Node | undefined = donde;
         while (a !== undefined) {
+          if (
+            ts.isFunctionLike(a) &&
+            a.parameters.some((p) => ligaEsteNombre(p.name, nombre))
+          ) {
+            return null;
+          }
+          if (
+            ts.isCatchClause(a) &&
+            a.variableDeclaration !== undefined &&
+            ligaEsteNombre(a.variableDeclaration.name, nombre)
+          ) {
+            return null;
+          }
           const hallada = declaradaEn(a, nombre);
           if (hallada !== null) return hallada;
           a = a.parent as ts.Node | undefined;
@@ -1463,11 +1507,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * `await generarConProveedor.call(undefined, entrada)` dejaba fuera al proveedor y
          * SYS-21 seguía en verde con la ruta manual llamando al modelo.
          *
-         * `f.bind(…)` NO está en esa lista: no ejecuta nada, sólo fabrica otra función. Al
-         * meterlo con las otras dos, un `persistirManual.bind(null, actorId, entrada)` que
-         * nadie llegase a invocar se apuntaba el SQL de `persistirManual`, y esa escritura
-         * la sonda la daba por hecha sin que ocurriera. Quien invoque la función atada ya
-         * cuenta por su propia llamada.
+         * `f.bind(…)` NO VA CON ELLAS, y tampoco se ignora: no ejecuta nada, sólo fabrica
+         * otra función, así que lo que cuenta es INVOCAR LO QUE DEVUELVE. Con `bind` en esa
+         * lista, un `persistirManual.bind(null, actorId, entrada)` que nadie llegase a
+         * invocar se apuntaba el SQL de `persistirManual` sin que ocurriera. Pero quitarlo
+         * del todo abría el agujero contrario, y por el lado peligroso: un
+         * `const generar = generarConProveedor.bind(null); await generar(entrada)` dejaba al
+         * proveedor fuera del grafo con SYS-21 en verde y la ruta manual llamando al modelo,
+         * porque el alias tiene por inicializador una LLAMADA y por ahí no resuelve nadie.
+         * Así que la atadura se sigue hasta su objetivo, pero SÓLO desde la invocación:
+         * `f.bind(…)(…)` en el sitio, o el nombre bajo el que se guardó.
          */
         /*
          * Y `obj['nombre'](…)` es la misma llamada que `obj.nombre(…)`: con la clave escrita
@@ -1478,6 +1527,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           if (ts.isPropertyAccessExpression(e)) return { objeto: e.expression, nombre: e.name.text };
           if (ts.isElementAccessExpression(e) && ts.isStringLiteral(e.argumentExpression)) {
             return { objeto: e.expression, nombre: e.argumentExpression.text };
+          }
+          return null;
+        };
+        /** Lo que se llamará al invocar un `f.bind(…)`: su receptor, saltando ataduras. */
+        const desatar = (e: ts.Expression): ts.Expression | null => {
+          let y: ts.Expression = e;
+          for (let i = 0; i < 8; i += 1) {
+            while (
+              ts.isParenthesizedExpression(y) ||
+              ts.isAsExpression(y) ||
+              ts.isNonNullExpression(y)
+            ) {
+              y = y.expression;
+            }
+            if (!ts.isCallExpression(y)) return i === 0 ? null : y;
+            const a = comoPropiedad(y.expression);
+            if (a === null || a.nombre !== 'bind') return i === 0 ? null : y;
+            y = a.objeto;
           }
           return null;
         };
@@ -1494,6 +1561,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           ts.isNonNullExpression(llamado)
         ) {
           llamado = llamado.expression;
+        }
+        /*
+         * La atadura, en sus dos formas: invocada en el sitio (`f.bind(null)(…)`) y guardada
+         * bajo un nombre (`const g = f.bind(null); g(…)`). Un alias REASIGNADO no cuenta, por
+         * lo mismo que el resto de ligaduras de este censo.
+         */
+        const enElSitio = desatar(llamado);
+        if (enElSitio !== null) {
+          llamado = enElSitio;
+        } else if (ts.isIdentifier(llamado)) {
+          const liga = ligaduraDe(llamado, llamado.text);
+          if (liga !== null && ts.isVariableDeclaration(liga) && liga.initializer) {
+            const guardada = seReasigna(liga) ? null : desatar(liga.initializer);
+            if (guardada !== null) llamado = guardada;
+          }
         }
         const acceso = comoPropiedad(llamado);
         const porElReceptor =

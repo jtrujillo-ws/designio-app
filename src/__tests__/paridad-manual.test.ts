@@ -401,7 +401,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * como llamada. La lista es la misma que decide si se baja a un callback anónimo, y por
      * el mismo motivo: es lo que este repositorio usa para ejecutar lo que recibe.
      */
-    const argumentosEjecutados = (x: ts.CallExpression): ts.Identifier[] => {
+    const argumentosEjecutados = (x: ts.CallExpression): ts.Expression[] => {
       const q = x.expression;
       const quien = ts.isPropertyAccessExpression(q)
         ? q.name.text
@@ -409,7 +409,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           ? q.text
           : null;
       if (quien === null || !EJECUTAN_SU_CALLBACK.includes(quien)) return [];
-      return x.arguments.filter((a): a is ts.Identifier => ts.isIdentifier(a));
+      // El nombre a secas y el acceso a propiedad: `map(persistir)` y
+      // `map(proveedor.generar)` ejecutan lo mismo, y quedarse con el primero dejaba
+      // al espacio de nombres —la forma normal de llamar a otro módulo— fuera del grafo.
+      return x.arguments.filter(
+        (a) => ts.isIdentifier(a) || ts.isPropertyAccessExpression(a),
+      ) as ts.Expression[];
     };
 
     const EJECUTAN_SU_CALLBACK = [
@@ -539,7 +544,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             if (ts.isIdentifier(x.expression)) {
               nombres.push({ nombre: x.expression.text, donde: x });
             }
-            for (const a of argumentosEjecutados(x)) nombres.push({ nombre: a.text, donde: a });
+            for (const a of argumentosEjecutados(x)) {
+              // Para la VIDA sólo cuenta el nombre a secas: un ayudante local no se declara
+              // detrás de un punto.
+              if (ts.isIdentifier(a)) nombres.push({ nombre: a.text, donde: a });
+            }
           }
           ts.forEachChild(x, ver);
         };
@@ -665,6 +674,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * Un `void`, un argumento de otra llamada, o quedarse dentro de un objeto o una lista,
          * no la ejecutan.
          */
+        const esAsincrona = (f: ts.Node): boolean =>
+          ts.canHaveModifiers(f) &&
+          (ts.getModifiers(f) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
         const seEjecuta = (desde: ts.Node, saltos = 0): boolean => {
           if (saltos > 12) return false;
           let hijo: ts.Node = desde;
@@ -681,7 +693,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
           if (padre === undefined) return false;
           if (ts.isAwaitExpression(padre) && padre.expression === hijo) return true;
-          if (ts.isReturnStatement(padre) && padre.expression === hijo) return true;
+          /*
+           * Un `return` dispara la consulta sólo si la función es ASÍNCRONA: ahí la máquina de
+           * promesas la ASIMILA —la espera antes de resolver—. En una función síncrona el
+           * `return` se limita a entregar la consulta perezosa a quien llame, y si ése tira el
+           * valor no sale nada: `function persistir(tx) { return tx\`…\`; }` seguido de
+           * `persistir(tx)` contaba la escritura sin que ocurriera.
+           */
+          if (ts.isReturnStatement(padre) && padre.expression === hijo) {
+            return esAsincrona(funcionDe(padre));
+          }
+          // El cuerpo CORTO de una flecha es un `return` con otra forma, y se mide igual.
+          if (ts.isArrowFunction(padre) && padre.body === hijo) return esAsincrona(padre);
           // `Promise.all([q1, q2])`: la lista y la llamada sólo cuentan si LA LLAMADA se espera.
           if (ts.isArrayLiteralExpression(padre) && padre.elements.includes(hijo as ts.Expression)) {
             const llamada = padre.parent as ts.Node | undefined;
@@ -842,7 +865,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       recorrerVivo(n, (x) => {
         if (!ts.isCallExpression(x)) return;
         for (const a of argumentosEjecutados(x)) {
-          llamadas.push({ objeto: null, nombre: a.text, donde: a });
+          if (ts.isIdentifier(a)) {
+            llamadas.push({ objeto: null, nombre: a.text, donde: a });
+          } else if (ts.isPropertyAccessExpression(a)) {
+            llamadas.push({
+              objeto: ts.isIdentifier(a.expression) ? a.expression.text : null,
+              nombre: a.name.text,
+              donde: a,
+            });
+          }
         }
         if (ts.isIdentifier(x.expression)) {
           llamadas.push({ objeto: null, nombre: x.expression.text, donde: x });
@@ -1365,43 +1396,50 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * callback— tapa sin destino, que es lo que corresponde: ese nombre ya no es el del
          * módulo.
          */
+        /**
+         * Lo que un ámbito liga POR SÍ MISMO, sin bajar a los de dentro.
+         *
+         * Bajando a todos los hijos, un `const escribir = …` dentro de un `if` contaba como
+         * ligadura del bloque de FUERA, y entonces una llamada legítima de fuera se leía como
+         * tapada por un nombre que allí no existe. Eso no rechaza una escritura falsa: rechaza
+         * una ruta INTACTA, que es el otro modo de fallo y el que empuja a «arreglar» lo que
+         * no está roto. Un `const` de un bloque pertenece a ese bloque.
+         */
         const ligaduraDe = (ambito: ts.Node, nombre: string): { hay: boolean; alias: string | null } => {
-          let hallado: { hay: boolean; alias: string | null } = { hay: false, alias: null };
-          const mirar = (x: ts.Node): void => {
-            if (hallado.hay) return;
-            if (x !== ambito && ts.isFunctionLike(x)) return;
-            if (ts.isFunctionDeclaration(x) && x.name?.text === nombre && x !== ambito) {
-              hallado = { hay: true, alias: null };
-              return;
-            }
-            if (ts.isParameter(x) && (x.parent as ts.Node) === ambito) {
-              nombresDe(x.name, (n) => {
-                if (n === nombre) hallado = { hay: true, alias: null };
-              });
-            }
-            if (ts.isVariableDeclaration(x)) {
-              const alias =
-                x.initializer !== undefined && ts.isIdentifier(x.initializer)
-                  ? x.initializer.text
-                  : null;
-              nombresDe(x.name, (n) => {
-                if (n === nombre) {
-                  hallado = { hay: true, alias: ts.isIdentifier(x.name) ? alias : null };
-                }
-              });
-            }
-            ts.forEachChild(x, mirar);
-          };
-          // Los parámetros del propio ámbito cuelgan de él, así que se miran aparte.
           if (ts.isFunctionLike(ambito)) {
             for (const par of ambito.parameters) {
+              let hay = false;
               nombresDe(par.name, (n) => {
-                if (n === nombre) hallado = { hay: true, alias: null };
+                if (n === nombre) hay = true;
               });
+              if (hay) return { hay: true, alias: null };
             }
           }
-          if (!hallado.hay) mirar(ambito);
-          return hallado;
+          const cuerpo = ts.isFunctionLike(ambito)
+            ? ((ambito as ts.FunctionLikeDeclaration).body as ts.Node | undefined)
+            : ambito;
+          if (cuerpo === undefined || (!ts.isBlock(cuerpo) && !ts.isSourceFile(cuerpo))) {
+            return { hay: false, alias: null };
+          }
+          for (const st of cuerpo.statements) {
+            if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) {
+              return { hay: true, alias: null };
+            }
+            if (!ts.isVariableStatement(st)) continue;
+            for (const d of st.declarationList.declarations) {
+              let hay = false;
+              nombresDe(d.name, (n) => {
+                if (n === nombre) hay = true;
+              });
+              if (!hay) continue;
+              const alias =
+                d.initializer !== undefined && ts.isIdentifier(d.initializer)
+                  ? d.initializer.text
+                  : null;
+              return { hay: true, alias: ts.isIdentifier(d.name) ? alias : null };
+            }
+          }
+          return { hay: false, alias: null };
         };
         const sombraEn = (donde: ts.Node, nombre: string): { hay: boolean; alias: string | null } => {
           let a: ts.Node | undefined = donde.parent as ts.Node | undefined;

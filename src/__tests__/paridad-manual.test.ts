@@ -1080,6 +1080,29 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         cola.push(...nombraA(cuerpo));
       }
 
+      /*
+       * Y UNA RAMA QUE NO SE EJECUTA NUNCA TAMPOCO ESCRIBE. Este recorrido filtraba cuerpos de
+       * función y nada más, así que un `if (false) { await tx\`update …\` }` se visitaba entero
+       * y acreditaba la escritura: el manejador declarado podía volver sin persistir nada con la
+       * paridad en verde.
+       *
+       * Sólo la condición LITERAL, que es la que se lee sin adivinar: `if (false)` no ejecuta su
+       * rama, `if (true)` no ejecuta su `else`, y un `while (false)` no ejecuta su cuerpo.
+       * Deliberadamente NO se intenta plegar constantes ni seguir un `const MUERTO = false`:
+       * decidir qué es constante es justo por donde este censo empezaría a poner en rojo código
+       * intacto, y ése es el otro modo de fallo, el que enseña a desconfiar de la sonda.
+       */
+      const ramaMuerta = (x: ts.Node): ts.Node | null => {
+        if (ts.isIfStatement(x)) {
+          if (x.expression.kind === ts.SyntaxKind.FalseKeyword) return x.thenStatement;
+          if (x.expression.kind === ts.SyntaxKind.TrueKeyword) return x.elseStatement ?? null;
+          return null;
+        }
+        if (ts.isWhileStatement(x) && x.expression.kind === ts.SyntaxKind.FalseKeyword) {
+          return x.statement;
+        }
+        return null;
+      };
       const ver = (x: ts.Node): void => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);
@@ -1087,7 +1110,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           if (nombre === null && !laEjecutaQuienLaRecibe(x)) return;
         }
         visitar(x);
-        ts.forEachChild(x, ver);
+        const muerta = ramaMuerta(x);
+        ts.forEachChild(x, (y) => {
+          if (y !== muerta) ver(y);
+        });
       };
       ver(n);
     };

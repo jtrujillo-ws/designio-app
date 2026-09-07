@@ -417,12 +417,26 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         if (!ts.isTaggedTemplateExpression(x)) return;
         /*
          * Una consulta de postgres.js es PEREZOSA: no sale hacia la base hasta que alguien la
-         * espera. Así que una plantilla que es toda la sentencia —sin `await`, sin `return`, sin
-         * asignarse a nada— no se ejecuta, y ni TypeScript ni las reglas de lint la rechazan.
-         * Contarla dejaría la invariante en verde justo cuando la operación manual ha dejado de
-         * ocurrir, que es lo mismo que pasaba con el comentario y con la cadena.
+         * espera. Así que una plantilla cuyo valor se TIRA —la sentencia entera, o envuelta en
+         * un `void`, unos paréntesis o un `as`— no se ejecuta, y ni TypeScript ni las reglas de
+         * lint la rechazan. Contarla dejaría la invariante en verde justo cuando la operación
+         * manual ha dejado de ocurrir, que es lo mismo que pasaba con el comentario y con la
+         * cadena.
+         *
+         * Se sube por las envolturas que no consumen el valor antes de mirar dónde acaba: la
+         * primera versión miraba sólo el padre inmediato, y `void tx\`…\`` se colaba por ahí.
          */
-        if (x.parent !== undefined && ts.isExpressionStatement(x.parent)) return;
+        let arriba: ts.Node | undefined = x.parent;
+        while (
+          arriba !== undefined &&
+          (ts.isVoidExpression(arriba) ||
+            ts.isParenthesizedExpression(arriba) ||
+            ts.isAsExpression(arriba) ||
+            ts.isNonNullExpression(arriba))
+        ) {
+          arriba = arriba.parent as ts.Node | undefined;
+        }
+        if (arriba !== undefined && ts.isExpressionStatement(arriba)) return;
         const t = x.template;
         const literales = ts.isNoSubstitutionTemplateLiteral(t)
           ? [t.text]
@@ -750,6 +764,30 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         const imports = importesDe(arbol, actual.modulo);
         const locales = funcionesDe(arbol);
+        /*
+         * LO QUE LA PROPIA FUNCIÓN LIGA TAPA AL MÓDULO. Si el manejador declara su `persistir`
+         * —o lo recibe como parámetro— y lo llama, resolverlo contra un `persistir` importado
+         * traía las escrituras de OTRO sitio: la invariante seguía verde aunque este manejador
+         * ya no alcanzara ninguna.
+         *
+         * Sólo tapan las funciones anidadas con nombre y los parámetros, que es lo que el
+         * recorrido ya sabe leer por su cuenta —o lo que no puede resolver de ninguna manera—.
+         * Un alias corriente (`const escribir = enlazarInsight`) NO tapa: ahí el respaldo por
+         * nombre sigue siendo la única forma de llegar.
+         */
+        const sombras = new Set<string>();
+        const ligadas = (x: ts.Node): void => {
+          if (x !== decl && ts.isFunctionLike(x)) {
+            if (ts.isFunctionDeclaration(x) && x.name) sombras.add(x.name.text);
+            const padre = x.parent as ts.Node | undefined;
+            if (padre && ts.isVariableDeclaration(padre) && ts.isIdentifier(padre.name)) {
+              sombras.add(padre.name.text);
+            }
+          }
+          if (ts.isParameter(x) && ts.isIdentifier(x.name)) sombras.add(x.name.text);
+          ts.forEachChild(x, ligadas);
+        };
+        ligadas(decl);
         for (const { objeto, nombre } of llamadasEn(decl)) {
           // `servicio.crear(…)` con `import * as servicio`: el módulo lo dice el espacio.
           const espacio = objeto === null ? undefined : imports.get(objeto);
@@ -764,6 +802,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * real ya quitada.
            */
           if (objeto !== null) continue;
+          if (sombras.has(nombre)) continue;
           const importado = imports.get(nombre);
           if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
           else if (locales.has(nombre)) cola.push({ modulo: actual.modulo, funcion: nombre });

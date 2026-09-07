@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import {
   criteriosCompletos,
@@ -150,18 +151,48 @@ describe('la puerta manual de los criterios existe en la pantalla', () => {
     return salida;
   };
 
+  /**
+   * A quién LLAMA un fichero, leído con el parser y no con una expresión regular.
+   *
+   * Buscar `definirCriterio(` en el texto cuenta también lo que aparece dentro de un
+   * comentario o de una cadena. Una sonda que se conforma con la MENCIÓN puede quedarse
+   * verde con el hueco reabierto, que es exactamente el modo de fallo contra el que existe
+   * — y el mismo que el censo de #54 tuvo que corregir tres veces, ahí con el SQL.
+   *
+   * Medido: quitando la llamada real y dejando su nombre en un comentario, la lectura del
+   * árbol se pone ROJA y la expresión regular se queda VERDE.
+   */
+  const llamadasDe = (fichero: string): Set<string> => {
+    const arbol = ts.createSourceFile(
+      fichero,
+      readFileSync(fichero, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX,
+    );
+    const nombres = new Set<string>();
+    const ver = (n: ts.Node): void => {
+      if (ts.isCallExpression(n)) {
+        if (ts.isIdentifier(n.expression)) nombres.add(n.expression.text);
+        else if (ts.isPropertyAccessExpression(n.expression)) nombres.add(n.expression.name.text);
+      }
+      ts.forEachChild(n, ver);
+    };
+    ver(arbol);
+    return nombres;
+  };
+
   it('algún componente llama a definirCriterio y a editarCriterioDeReto', () => {
     const dir = join(raiz, 'src');
     expect(existsSync(dir), `no está el árbol de fuentes en ${dir}`).toBe(true);
     const ficheros = pantallas(dir);
     expect(ficheros.length, 'no se encontró ninguna pantalla que mirar').toBeGreaterThan(10);
 
+    const porFichero = new Map(ficheros.map((f) => [f, llamadasDe(f)]));
     for (const adaptador of ['definirCriterio', 'editarCriterioDeReto']) {
-      // Se busca la LLAMADA y no la mención: importarlo y no usarlo deja el hueco igual, y
-      // era la forma exacta que tenía el fallo.
-      const llaman = ficheros.filter((f) =>
-        new RegExp(`\\b${adaptador}\\s*\\(`).test(readFileSync(f, 'utf8')),
-      );
+      // La LLAMADA, no la mención: importarlo y no usarlo deja el hueco igual, y era la forma
+      // exacta que tenía el fallo.
+      const llaman = ficheros.filter((f) => porFichero.get(f)!.has(adaptador));
       expect(
         llaman.map((f) => f.slice(raiz.length + 1)),
         `${adaptador} no lo llama ninguna pantalla: sin AI no hay forma de hacerlo a mano (SYS-21/SYS-22)`,

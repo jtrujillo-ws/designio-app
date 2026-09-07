@@ -264,7 +264,16 @@ function FormularioCriterio({
   });
 
   return (
-    <div
+    /*
+     * Un `form` y no un `div`: terminar un campo de una línea y pulsar Enter tiene que
+     * enviar, que es lo que espera quien escribe con el teclado y lo que hacen los demás
+     * editores de esta casa. Dentro de los `textarea` Enter sigue metiendo un salto de línea.
+     */
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (reparos.length === 0) void onEnviar(datos);
+      }}
       style={{
         display: 'flex',
         flexDirection: 'column',
@@ -351,17 +360,13 @@ function FormularioCriterio({
         </span>
       )}
       <div style={{ display: 'flex', gap: 8 }}>
-        <Button
-          size="sm"
-          disabled={ocupado || reparos.length > 0}
-          onClick={() => void onEnviar(datos)}
-        >
+        <Button size="sm" type="submit" disabled={ocupado || reparos.length > 0}>
           {criterio ? 'Guardar' : 'Definir criterio'}
         </Button>
         <Button size="sm" variant="ghost" disabled={ocupado} onClick={onCancelar}>
           Cancelar
         </Button>
       </div>
-    </div>
+    </form>
   );
 }

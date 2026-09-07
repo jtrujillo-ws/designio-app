@@ -1474,7 +1474,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
           return null;
         };
-        const acceso = comoPropiedad(x.expression);
+        /*
+         * Y las envolturas TRANSPARENTES no esconden a quien se llama:
+         * `(generarConProveedor as typeof generarConProveedor)(entrada)` no era ni un nombre ni
+         * un acceso a propiedad, así que la llamada no entraba en el grafo y el proveedor se
+         * quedaba fuera con SYS-21 en verde.
+         */
+        let llamado: ts.Expression = x.expression;
+        while (
+          ts.isParenthesizedExpression(llamado) ||
+          ts.isAsExpression(llamado) ||
+          ts.isNonNullExpression(llamado)
+        ) {
+          llamado = llamado.expression;
+        }
+        const acceso = comoPropiedad(llamado);
         const porElReceptor =
           acceso !== null && ['call', 'apply', 'bind'].includes(acceso.nombre)
             ? acceso.objeto
@@ -1489,8 +1503,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             nombre: porElReceptor.name.text,
             donde: x,
           });
-        } else if (ts.isIdentifier(x.expression)) {
-          llamadas.push({ objeto: null, nombre: x.expression.text, donde: x });
+        } else if (ts.isIdentifier(llamado)) {
+          llamadas.push({ objeto: null, nombre: llamado.text, donde: x });
         } else if (acceso !== null) {
           llamadas.push({
             objeto: ts.isIdentifier(acceso.objeto) ? acceso.objeto.text : null,
@@ -2644,7 +2658,30 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           // comparte `contribucion` y guarda además el id de la review dentro del relato.
           const justificado = (nombre: string): boolean =>
             suyos.has(nombre) || pelar(nombre) === pelar(c);
-          if (mios.size > 0 && [...mios].every(justificado)) continue;
+          /*
+           * Y no basta con que los CAMPOS interpolados estén justificados: el valor tiene que
+           * SER la interpolación. Con `contribucion = ${'${entrada.contribucion}'} || \'alterado\''
+           * los campos casan y el contenido guardado es otro, así que la salvedad aceptaba una
+           * ruta manual que escribe algo distinto de lo que la materialización escribe.
+           *
+           * Se admiten las envolturas TRANSPARENTES —paréntesis y casts—, que no cambian el
+           * contenido. Lo que combine, concatene o llame a una función, no.
+           */
+          const soloLaInterpolacion = (t: string): boolean => {
+            let y = t.trim();
+            for (;;) {
+              const antes = y;
+              y = y.replace(/::\s*[a-z_][a-z0-9_]*(\s*\[\s*\])?$/i, '').trim();
+              if (/^\(([\s\S]*)\)$/.test(y)) y = y.slice(1, -1).trim();
+              if (y === antes) break;
+            }
+            return /^:i\d+$/.test(y);
+          };
+          if (mios.size > 0 && [...mios].every(justificado)) {
+            if (soloLaInterpolacion(x.valores.get(c) ?? '')) continue;
+            campos.push(`${e}.${c} ← el valor lleva la interpolación dentro de otra expresión`);
+            continue;
+          }
           /*
            * Y si no comparten campo, vale que el valor de la ruta manual NOMBRE A SU COLUMNA
            * —por el identificador de su interpolación o en el propio SQL—:

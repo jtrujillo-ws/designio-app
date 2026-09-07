@@ -765,11 +765,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
       return fuera;
     };
-    /** Si la función que envuelve a la plantilla la entrega a alguien que ESPERA su vuelta. */
+    /**
+     * Si la función que envuelve a la plantilla la entrega a alguien que ESPERA su vuelta.
+     *
+     * Y aquí también hay que preguntar POR EL RECEPTOR, no sólo por el último nombre tras el
+     * punto. Esta lectura se fiaba del nombre a secas mientras la de al lado ya no: un ayudante
+     * vivo que devuelve una consulta perezosa y se pasa además a un `registro.conUsuario(actorId,
+     * persistir)` —un método local que sólo la guarda— daba su vuelta por asimilada, y su SQL
+     * contaba aunque la consulta no llegara nunca a la base. La misma «forma no es identidad»
+     * de la ronda anterior, en la tercera lectura del mismo concepto.
+     */
     const laEsperaQuienLaRecibe = (f: ts.Node): boolean =>
       recepcionDe(f).some(({ llamada, indice }) => {
         const quien = nombreDeQuienLlama(llamada.expression);
         if (quien === null || !asimilaLoQueDevuelve(quien)) return false;
+        if (!receptorValido(llamada, quien)) return false;
         const posiciones = EJECUTAN_SU_CALLBACK.get(quien);
         return posiciones !== undefined && posiciones.includes(indice);
       });
@@ -1056,8 +1066,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return null;
       };
+      /*
+       * `async` PROMETE, PERO UN `async function*` NO EJECUTA NADA HASTA QUE SE ITERA.
+       *
+       * Bastaba con llevar el modificador `async` para dar por mandada la consulta que la
+       * función devuelve. Un generador asíncrono alcanzable —`async function* persistir() {
+       * return tx\`update …\`; }` con su objeto generador creado y nunca recorrido— se
+       * apuntaba la escritura con el cuerpo sin correr y nada llegando a la base. Llamar a un
+       * generador no es ejecutarlo: es fabricar el iterador.
+       */
       const esAsincrona = (f: ts.Node): boolean =>
         ts.canHaveModifiers(f) &&
+        (f as ts.FunctionLikeDeclaration).asteriskToken === undefined &&
         (ts.getModifiers(f) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
       const consumidas = new Set<ts.Node>();
       /*

@@ -6,7 +6,7 @@ language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 69b79d6, 2026-09-06). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 80a976a, 2026-09-06). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,7 +17,7 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `69b79d6`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `80a976a`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
 > [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
@@ -25,8 +25,9 @@ language: es
 > [#47](https://github.com/jtrujillo-ws/designio-app/pull/47),
 > [#49](https://github.com/jtrujillo-ws/designio-app/pull/49),
 > [#50](https://github.com/jtrujillo-ws/designio-app/pull/50),
-> [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) y
-> [#48](https://github.com/jtrujillo-ws/designio-app/pull/48)). Donde el paquete de diseño y el código
+> [#51](https://github.com/jtrujillo-ws/designio-app/pull/51),
+> [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) y
+> [#52](https://github.com/jtrujillo-ws/designio-app/pull/52)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -38,7 +39,8 @@ language: es
 El documento sigue los **destinos del lateral del workspace 1:1**: cada destino del lateral
 (Loop, Bandeja de importación, Aprobaciones, Evidencia, Insights, Biblioteca, Journeys, Versions y
 releases, Propuestas AI, Personas, Segmentos, Exportación, Disposición, Auditoría) tiene su capítulo,
-y las pantallas de detalle (proyecto, journey, design version) cuelgan del capítulo que las abre. Los
+y las pantallas de detalle (proyecto, journey, design version) cuelgan del capítulo que las abre; el
+destino «Operación de la capa AI» (#52) cuelga del capítulo 10, porque lee el mismo libro. Los
 capítulos van en el orden del loop; el lateral, desde #51, agrupa esos mismos destinos por clase
 (lo que espera, material y razonamiento, diseño y entrega, gobierno), sin quitar ni añadir ninguno.
 Tiene cuatro partes:
@@ -62,7 +64,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49, #50, #51 y #48 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49, #50, #51, #48 y #52 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -357,7 +359,7 @@ cruzados y la guía de abajo los enumera.
 flowchart LR
   subgraph CLI["Navegador"]
     direction TB
-    R["React 19 · TanStack Router<br/>18 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
+    R["React 19 · TanStack Router<br/>19 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
     UI["Design system y componentes<br/>src/components"]
   end
   subgraph SRV["Servidor · Bun 1.3 · TanStack Start"]
@@ -448,7 +450,10 @@ viajan entre módulos como comportamiento, no solo como tipo: `ROLES_CURADORES` 
 `evidencia`) decide en `ai` quién pide una generación y en `loop` a quién se le promueve la bandeja;
 `ROLES_DERECHOS` (`evidencia`) fija en `aprobaciones` quién decide derechos pendientes; y
 `ROLES_AUDITORIA` (`portal`) y `ROLES_DISPOSICION` (`disposicion`) deciden en `loop` qué destinos
-ve cada rol y con qué rótulo. Cambiar una de esas listas cambia esos módulos. El resto de esquemas
+ve cada rol y con qué rótulo, y `ROLES_OBSERVABILIDAD_AI` (definida en `ai.roles.ts`, un módulo sin
+Zod, como alias de `ROLES_AUDITORIA`) decide en `loop` quién ve la operación de la capa AI: desde #52
+un censo del grafo de módulos impide que el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`.
+Cambiar una de esas listas cambia esos módulos. El resto de esquemas
 Zod y tipos se importan libremente entre módulos como contratos compartidos. El detalle de tablas por
 contexto está en `21` y el de la capa AI en `22`.
 
@@ -466,7 +471,8 @@ contexto está en `21` y el de la capa AI en `22`.
 | Journeys, blueprints, validación, snapshot | `/journeys`, `/journey/$id` | `journey` | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot`, `catalogo_journey` | 07 |
 | Design versions, diff, releases, effective state, conciliación | `/design-versions`, `/design-version/$id` | `entrega` | `design_version`, `elemento_cambio`, `release`, `release_elemento`, `effective_state`, `constatacion` | 08 |
 | Metric Registry, snapshots, outcome review | `/proyecto/$id` (sección medición) | `medicion` | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` | 09 |
-| Propuestas AI (CI, C0, CT, C2, C3, C5, C6, C7) | `/propuestas` | `ai` | `propuesta_ai`, `llamada_ai`, `reserva_ai` | 10 |
+| Propuestas AI (CI, C0, CT, C2, C3, C4, C5, C6, C7) | `/propuestas` | `ai` | `propuesta_ai`, `llamada_ai`, `reserva_ai` | 10 |
+| Operación de la capa AI (coste, latencia, error y aceptación por capacidad) | `/observabilidad-ai` | `ai` (`ai.observabilidad.ts`) | `llamada_ai`, `reserva_ai`, `propuesta_ai` (solo lectura) | 10 |
 | Aprobaciones pendientes por rol | `/aprobaciones` | `aprobaciones` (proyección) | lee `gate_instancia`, `derecho_uso`, `insight`, `design_version` | 11 |
 | Hilos del portal y auditoría | `/proyecto/$id`, `/design-version/$id`, `/auditoria` | `portal` | `hilo_comentario`, `comentario`, `evento_dominio` | 12 |
 | Biblioteca del cliente | `/biblioteca` | `memoria` (proyección) | lee `arquetipo`, `insight`, `decision`, `reto`, `segmento` | 13 |
@@ -505,7 +511,7 @@ contexto está en `21` y el de la capa AI en `22`.
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
 | Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones como discrepancias propuestas (RF-06.8); C7 solo lee las ya registradas dentro del borrador del post mortem (discrepancia 20) |
 | Metric Registry (con borrador AI de entradas KPI, C6), snapshots, outcome review (con borrador AI de la narrativa, C7), veredicto | ✔ | | Recordatorios por cadencia, series ancladas a fechas de release |
-| Pipeline PropuestaAI, presupuesto, degradación, consentimiento | ✔ (CI, C0, CT, C2, C3, C4, C5, C6, C7) | | C1 (transcripción), plan de releases asistido; BYOAI con secret manager; evals de grounding programadas |
+| Pipeline PropuestaAI, presupuesto, degradación, consentimiento, operación de la capa AI (RF-08.9) | ✔ (CI, C0, CT, C2, C3, C4, C5, C6, C7; cuadro de coste, latencia, error y aceptación por capacidad) | | C1 (transcripción), plan de releases asistido; BYOAI con secret manager; evals de grounding programadas |
 | Exportación (archivo y entregable), disposición acordada | ✔ | | Exportación de adjuntos por object storage |
 | Despliegue Railway, CI de seis checks, suite authz contra Postgres real | ✔ | | E2E Playwright, scheduler y cron, backups verificados |
 
@@ -532,7 +538,7 @@ del handoff: un **lateral en negro violeta** que navega el árbol y un contenido
 
 | Zona | Contenido |
 |---|---|
-| **Lateral** | Marca tipográfica `designio.`; selector de **workspace activo** (una fila por membresía; cambiarlo remonta la pantalla); árbol **Cliente → Servicios → Retos → Proyectos** con el estado de cada reto pintado con el color del journey en que está (`J2`… `J7`, `cerrado`, o punteado para candidatos nacidos del post mortem); fila «+ Nuevo servicio» que abre un formulario en el sitio; y los destinos del workspace agrupados por clase desde [#51](https://github.com/jtrujillo-ws/designio-app/pull/51): **«Te espera»** arriba del árbol con exactamente los destinos que tienen contador (Aprobaciones con lo pendiente del rol, Bandeja con lo sin curar; a cero el bloque no existe y la fila vuelve a su estante), dos estantes de consulta siempre visibles, **«Material y razonamiento»** (Bandeja, Aprobaciones cuando no esperan, Evidencia, Insights, Oportunidades HMW, Segmentos) y **«Diseño y entrega»** (Journeys, Versions y releases, Propuestas AI con el sufijo «propone», Biblioteca), y **«Gobierno del workspace»** plegado en una fila que cuenta lo que el rol ve (Personas, Exportación, Disposición y, para los roles que la ven, Auditoría), con una nota que nombra solo esos destinos y la preferencia de abierto o cerrado recordada en el navegador por usuario y workspace |
+| **Lateral** | Marca tipográfica `designio.`; selector de **workspace activo** (una fila por membresía; cambiarlo remonta la pantalla); árbol **Cliente → Servicios → Retos → Proyectos** con el estado de cada reto pintado con el color del journey en que está (`J2`… `J7`, `cerrado`, o punteado para candidatos nacidos del post mortem); fila «+ Nuevo servicio» que abre un formulario en el sitio; y los destinos del workspace agrupados por clase desde [#51](https://github.com/jtrujillo-ws/designio-app/pull/51): **«Te espera»** arriba del árbol con exactamente los destinos que tienen contador (Aprobaciones con lo pendiente del rol, Bandeja con lo sin curar; a cero el bloque no existe y la fila vuelve a su estante), dos estantes de consulta siempre visibles, **«Material y razonamiento»** (Bandeja, Aprobaciones cuando no esperan, Evidencia, Insights, Oportunidades HMW, Segmentos) y **«Diseño y entrega»** (Journeys, Versions y releases, Propuestas AI con el sufijo «propone», Biblioteca), y **«Gobierno del workspace»** plegado en una fila que cuenta lo que el rol ve (Personas, Exportación, Disposición y, para los roles que las ven, Auditoría y, desde #52, Operación de la capa AI), con una nota que nombra solo esos destinos y la preferencia de abierto o cerrado recordada en el navegador por usuario y workspace |
 | **Topbar** | Buscador del workspace (busca de verdad: servicios, retos, proyectos, journeys, design versions, evidencia e insights, hasta 5 por clase y 20 en total, mínimo 2 caracteres) y salida de sesión. No repite marca, cliente ni usuario: esos son del lateral |
 | **Cabecera de arco** | Servicio seleccionado (estado de ruta `?servicio=`), reto y proyecto actuales, cifras del reto (criterios, gates cerrados, release vivo) y la barra del arco J1→J7 |
 | **Spotlight** | El journey **en curso** con su descripción, el gate abierto y el enlace a la pantalla donde se trabaja; con el loop cerrado enseña J7 hecho |
@@ -544,7 +550,7 @@ del handoff: un **lateral en negro violeta** que navega el árbol y un contenido
 Regla pura (`src/lib/loop/lateral.ts`), compartida entre cliente y servidor y probada sin pintar
 nada: la bandeja solo cuenta para quien la cura (lead y diseñador), así que a un sponsor no se le
 promueve a «Te espera»; el filtrado por rol es el de siempre (Auditoría solo para
-`ROLES_AUDITORIA`; Disposición se enseña a todos y solo cambia el rótulo a «Constancias que
+`ROLES_AUDITORIA`, Operación de la capa AI solo para `ROLES_OBSERVABILIDAD_AI`, que es la misma lista; Disposición se enseña a todos y solo cambia el rótulo a «Constancias que
 conservas» para quien no decide la disposición); ningún destino se pierde ni se repite al agrupar.
 En el riel estrecho cada fila es su abreviatura de tres letras y los estantes los separa un
 hairline. El árbol pinta sus cuatro niveles (ADR-0003): cada proyecto del reto cuelga como subfila
@@ -1313,6 +1319,36 @@ el lead porque su destino, `outcome_review`, solo lo escribe `lead-boutique` (ca
 sus `roles` en el registro). `agente-ai` no aparece en ningún
 predicado de escritura.
 
+## Operación de la capa AI (`/observabilidad-ai`)
+
+**Estado: Construido** — PR [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) «El libro de costos AI tiene lector, y sus números dicen lo
+que miden» (RF-08.9, RF-09.14). `llamada_ai` guardaba desde la Fase 0 una línea por intento con
+capacidad, modelo, credencial, desenlace, tokens, coste y latencia, y nadie la leía salvo el tope
+diario. El lector (`ai.observabilidad.ts`, `observabilidadAI`) calcula **por capacidad y para el
+workspace**, sin llamar a ningún modelo: llamadas cerradas, sin respuesta, en vuelo y **huérfanas**,
+coste en USD, latencia p50 y p95, tasa de error, propuestas por estado y tasas de aceptación y
+corrección. Las capacidades salen del **registro**, no de las filas: una activa sin llamadas aparece
+en cero y una que el registro ya no cubre aparece con su gasto.
+
+- **Lo que los números no fingen**: una línea `despachada` con reserva viva está **en vuelo** y no
+  es un error; una `despachada` sin reserva viva es **huérfana** (el cierre falló después de que el
+  proveedor respondiera) y viaja con su propio número, con el mismo predicado `reservaSigueViva`
+  que usa el presupuesto, para que no haya dos reglas. El coste desconocido dice **por qué**: sin
+  tarifa del modelo (hubo uso; se arregla registrándola) o sin uso devuelto por el proveedor
+  (timeout, 5xx; no se arregla). La sin-respuesta cuenta **dentro** de las cerradas para la tasa de
+  error, porque para quien pidió la generación es un fallo. CT y C5 **no tienen** tasa de
+  aceptación (solo se rechazan). Un valor distinto de cero jamás se presenta como cero
+  (`formatearTasa`: «< 0,01» y «> 99,99») y un cero no es «sin datos» (`null` sin llamadas cerradas
+  o sin propuestas decididas).
+- **Tres capas de puerta, distintas a propósito**: la RLS de `llamada_ai` sigue pidiendo solo
+  membresía (el tope diario y el estado de la capacidad los lee todo el panel de propuestas); la
+  **proyección** se cierra a `ROLES_OBSERVABILIDAD_AI` (admin del cliente, lead y diseñador, la
+  misma lista que la auditoría) y sin membresía viva no devuelve un informe en ceros; y el loader de
+  la pantalla no la pide si el rol no puede verla. El lateral la ofrece bajo «Gobierno del
+  workspace» con la abreviatura OPS.
+- **Pregunta de producto abierta** (anotada en `30`): quién ve la factura de la AI cuando BYOAI
+  exista y la credencial sea del cliente.
+
 ## Fuente
 
 SPEC-08 (RF-08.1 a RF-08.9), ADR-0012, SYS-17 a SYS-21. PRs [#14/b7e04b7](https://github.com/jtrujillo-ws/designio-app/commit/b7e04b7),
@@ -1730,10 +1766,12 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
 | `ai.schemas.ts` | Vocabulario: capacidades, estados, lineage, registro `CAPACIDADES` (ancla, destino, lote, columnas), contratos de entrada, tipos del panel |
 | `ai.contenido.ts` | Esquemas Zod de salida por capacidad (`ESQUEMA_DE_CONTENIDO`), dónde guarda citas cada una (`CITAS_DEL_CONTENIDO`), qué es testimonio intocable (`TESTIMONIO_ADICIONAL`), centinela `designio:contenido-ai-solo-servidor` para el check de bundle |
 | `ai.prompts.ts` | Prompts de sistema y de usuario por capacidad, delimitación del material como datos, `MAX_MATERIAL`, `PROMPT_VERSION` atada por huella, medida de presencia literal de citas |
-| `ai.degradacion.ts` | Módulo puro: política de modelos, tope de respaldo, intentos por generación, tarifas, vocabulario de desenlaces, clasificación de fallos por forma (status/name), `evaluarCapacidadAI` (nunca lanza) |
+| `ai.degradacion.ts` | Módulo puro: política de modelos, tope de respaldo, intentos por generación, tarifas, vocabulario de desenlaces, clasificación de fallos por forma (status/name), `evaluarCapacidadAI` (nunca lanza), `formatearCosteUsd` y `formatearTasa` (un valor distinto de cero nunca se presenta como cero) |
 | `proveedor.server.ts` | Adaptador del SDK: **no lanza nunca**, timeout duro, `maxRetries: 0`, una degradación por operación, uso medido (tokens y costo) por intento, `credencialesAI` (BYOAI: hoy solo entorno) |
 | `ai.servicio.ts` | Orquestación: rol curador, presupuesto sobre `llamada_ai`, reserva, libro anticipado, materiales por capacidad, validación de ids contra el material, revisión y materialización |
-| `ai.functions.ts` | Server functions: panel, generar, aceptar, rechazar, registrar consentimiento |
+| `ai.functions.ts` | Server functions: panel, generar, aceptar, rechazar, registrar consentimiento, observabilidad del workspace |
+| `ai.observabilidad.ts` | Lector de RF-08.9: coste, latencia p50/p95, tasas de error y aceptación por capacidad, sobre `llamada_ai` y `propuesta_ai`, con `reservaSigueViva` compartido con el presupuesto; cerrado a `ROLES_OBSERVABILIDAD_AI` |
+| `ai.roles.ts` | Puertas de rol de la capa AI sin Zod (`ROLES_OBSERVABILIDAD_AI`), para que el lateral no arrastre el contrato AI (censo del grafo de módulos en la suite) |
 
 ## Persistencia
 
@@ -1893,7 +1931,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (24 archivos, uno por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, oportunidad, concepto, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#48): **973 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#52): **988 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1905,7 +1943,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) y [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -1918,7 +1956,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones como **discrepancias propuestas** entre la design version y lo constatado, a confirmar por el lead (la spec sigue vigente; C7 solo lee las desviaciones ya registradas dentro del borrador del post mortem, y la migración de #47 argumenta contra un detector que proponga constataciones: decisión de producto pendiente, discrepancia 20) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
-| SPEC-08 AI | Capacidad C1 (transcripción y diarización) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión; observabilidad AI como panel (los datos ya están en `llamada_ai`) | RF-08.2, RF-08.7, RF-08.9 |
+| SPEC-08 AI | Capacidad C1 (transcripción y diarización) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión (la observabilidad por capacidad ya está construida en `/observabilidad-ai`, #52) | RF-08.2, RF-08.7 |
 | SPEC-09 Seguridad | Prueba «AI off» del loop completo como E2E; condiciones de proveedores registradas; backups con prueba de restauración documentada | RF-09.10, RF-09.11 |
 | Diseño técnico | Scheduler in-app (`scheduled_jobs` + tick + claim latch) y servicio cron de Railway; Playwright E2E; búsqueda semántica intra-workspace con pgvector; ADR formal «Stack del MVP» | `docs/06-diseno-tecnico/` |
 
@@ -1960,6 +1998,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | Pricing (cifras) | Abierto; el modelo de momentos está definido |
 | ADR «Stack del MVP» | Resuelto en dirección; ADR formal pendiente |
 | Iconografía | Lucide propuesto, pendiente de confirmación |
+| Quién ve la factura de la AI | Abierto (planteado en #52): hoy la proyección de `/observabilidad-ai` se cierra a quien audita (admin del cliente, lead y diseñador); con BYOAI (RF-09.9) la credencial del workspace significa que paga el cliente, y quien paga probablemente deba ver lo que gasta |
 
 ## Fuera del MVP (ADR-0014 y specs)
 
@@ -2000,6 +2039,7 @@ clustering avanzado; modelos estadísticos de atribución; simulaciones masivas 
 | `/exportacion` | Exportación del workspace | Construido |
 | `/disposicion` | Disposición acordada | Construido |
 | `/auditoria` | Auditoría | Construido |
+| `/observabilidad-ai` | Operación de la capa AI: coste, latencia, error y aceptación por capacidad (RF-08.9) | Construido |
 | `/healthz` (servidor) | Readiness del rollout: verifica rol, privilegios y base de la conexión de aplicación | Construido |
 
 ## Server functions por módulo
@@ -2021,7 +2061,7 @@ clustering avanzado; modelos estadísticos de atribución; simulaciones masivas 
 | `journey` | `journeyDelWorkspace`, `listaDeJourneys` | `crearJourneyDeServicio`, `agregarNodoAlJourney`, `editarNodoDelJourney`, `borrarNodoDelJourney`, `agregarAristaAlJourney`, `editarAristaDelJourney`, `borrarAristaDelJourney`, `enlazarEvidenciaAlNodo`, `desenlazarEvidenciaDelNodo`, `congelarSnapshotDelJourney` |
 | `entrega` | `designVersionDelWorkspace`, `listaDeDesignVersions`, `versionAprobadaDeServicio`, `proyectosYaCertificados`, `cadenaDelRelease` | `crearDesignVersionDelProyecto`, `agregarElementoDeCambio`, `editarElementoDeCambio`, `borrarElementoDeCambio`, `enlazarJourneyDeDesignVersion`, `declararSuperaADeDesignVersion`, `aprobarYCongelarDesignVersion`, `planificarReleaseDeDesignVersion`, `asignarElementoARelease`, `moverElementoDeRelease`, `quitarElementoDeRelease`, `registrarDespliegue`, `constatarReleaseDesplegado` |
 | `medicion` | `seguimientoDelProyecto` | `abrirRegistryDeReto`, `agregarEntradaKpi`, `editarEntradaKpi`, `borrarEntradaKpi`, `firmarMetricRegistry`, `abrirMedicionDelReto`, `cargarSnapshotDeFormulario`, `cargarSnapshotsPegados`, `pausarProyectoDelReto`, `retomarProyectoDelReto`, `abrirReviewDelReto`, `guardarBorradorDelReview`, `guardarResultadoDeCriterio`, `completarReviewDelReto` |
-| `ai` | `propuestasDelWorkspace` | `generarPropuestasAI`, `aceptarPropuestaAI`, `rechazarPropuestaAI`, `registrarConsentimientoAI` |
+| `ai` | `propuestasDelWorkspace`, `observabilidadDelWorkspace` | `generarPropuestasAI`, `aceptarPropuestaAI`, `rechazarPropuestaAI`, `registrarConsentimientoAI` |
 | `portal` | `hilosDelPortal`, `auditoriaDelWorkspace` | `abrirHiloDelPortal`, `comentarEnHilo`, `resolverHiloDelPortal` |
 | `exportacion` | — | `exportarWorkspaceFn` |
 | `disposicion` | `panelDisposicionFn`, `misConstanciasFn` | `registrarAcuerdoFn`, `ejecutarDisposicionFn` |
@@ -2138,7 +2178,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Seis días de construcción (2026-09-01 a 2026-09-06), 48 commits en `agents`, cada uno un
+Seis días de construcción (2026-09-01 a 2026-09-06), 49 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -2191,6 +2231,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-06 | #50 | C7 era la única capacidad que no le decía al modelo que su material se truncó |
 | 09-06 | #51 | El lateral deja de ser una lista: lo pendiente arriba, el árbol entero y el gobierno plegado |
 | 09-06 | #48 | C4: los revisores AI son simulación, y lo siguen siendo después de aceptarlos |
+| 09-06 | #52 | RF-08.9: el libro de costos AI tiene lector, y sus números dicen lo que miden |
 
 ---
 

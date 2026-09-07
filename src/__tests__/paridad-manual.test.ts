@@ -1444,7 +1444,29 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * un `if (A && B) throw` que no salta no se sabe nada de A. Y la comparación tiene que
      * quedar por encima de la consulta en el propio texto, que es lo que la hace anterior.
      */
-    type Guarda = { columna: string; valor: string; niega: boolean; tabla: string; fin: number };
+    type Guarda = {
+      columna: string;
+      valor: string;
+      niega: boolean;
+      tabla: string;
+      fin: number;
+      /**
+       * Y la función DONDE corta el paso. Sin esto, una guarda escrita en un ayudante que
+       * NADIE llama —o en cualquier función hermana declarada más arriba— garantizaba algo
+       * que nunca ocurre: medido, `and estado = 'borrador'` quedaba denunciado en una ruta
+       * intacta sólo por tener un `if (otro.estado === 'borrador') throw` muerto por encima.
+       * Vale la que CONTIENE a la consulta, y sólo ésa.
+       */
+      ambito: ts.Node;
+    };
+    const dentroDe = (a: ts.Node, n: ts.Node): boolean => {
+      let x: ts.Node | undefined = n;
+      while (x !== undefined) {
+        if (x === a) return true;
+        x = x.parent as ts.Node | undefined;
+      }
+      return false;
+    };
     const guardasDe = (decl: ts.Node): Guarda[] => {
       const fuera: Guarda[] = [];
       const texto = decl.getSourceFile().text;
@@ -1476,6 +1498,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           a = a.parent as ts.Node | undefined;
         }
         return null;
+      };
+      const funcionQueContiene = (y: ts.Node): ts.Node => {
+        let a: ts.Node | undefined = y.parent as ts.Node | undefined;
+        while (a !== undefined && !ts.isFunctionLike(a)) a = a.parent as ts.Node | undefined;
+        return a ?? decl;
       };
       const lanza = (st: ts.Statement): boolean =>
         ts.isThrowStatement(st) ||
@@ -1513,6 +1540,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                 niega: b.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken,
                 tabla,
                 fin: n.expression.end,
+                ambito: funcionQueContiene(n),
               });
             }
           });
@@ -1706,8 +1734,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           // venir de una librería—. No es un fallo: simplemente no hay por dónde seguir.
           continue;
         }
-        const guardas: Guarda[] = [];
-        void guardasDe;
+        const guardas = guardasDe(decl);
         for (const consulta of sqlDe(decl)) {
           for (const m of consulta.sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
             const tabla = m[2]!;
@@ -1748,6 +1775,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               const col = c.columna.replace(/_/g, '');
               for (const g of guardas) {
                 if (g.tabla !== tabla || g.columna !== col || g.fin > consulta.tag.pos) continue;
+                if (!dentroDe(g.ambito, consulta.tag)) continue;
                 if (g.niega ? c.valor !== g.valor : c.valor === g.valor) {
                   conjuntosImposibles.add(
                     `${actual.funcion}: ${clave} where ${c.columna} = '${c.valor}', y la ruta ${

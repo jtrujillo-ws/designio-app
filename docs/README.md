@@ -13,6 +13,7 @@ Documentación de diseño derivada del prediseño de producto v0.2. Orden de lec
 | 6 | [`06-diseno-tecnico/`](06-diseno-tecnico/diseno-tecnico.md) | Diseño técnico (arquitectura, stack fijado, datos, AI, seguridad, pruebas, despliegue) | borrador — stack y design system definidos |
 | 7 | [`07-mockups/`](07-mockups/README.md) | Mockup HTML autocontenido: loop del método J1–J7 + 6 superficies del MVP | borrador |
 | 8 | [`../.claude/skills/designio-design/`](../.claude/skills/designio-design/README.md) | Design system «El arco del loop» (handoff v1: tokens, primitivas, guidelines, pantalla Loop hifi); tokens integrados en `src/styles/tokens/` | v1 |
+| 9 | [`DESIGNIO-COMPLETE.md`](DESIGNIO-COMPLETE.md) | **Documento consolidado**: qué es Designio y qué incluye, pantalla por pantalla, con estado (construido / en vuelo / diseñado), referencia técnica, hoja de ruta y apéndices; derivado del código | current |
 
 Reglas de coherencia del paquete:
 

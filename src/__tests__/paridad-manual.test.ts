@@ -883,6 +883,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               }
             }
           }
+          // Y la cabecera de un `for`, que liga sin ser una sentencia de bloque.
+          if (
+            (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
+            a.initializer !== undefined &&
+            ts.isVariableDeclarationList(a.initializer)
+          ) {
+            for (const d of a.initializer.declarations) {
+              if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+            }
+          }
           if (ts.isFunctionLike(a)) {
             for (const par of a.parameters) {
               if (ts.isIdentifier(par.name) && par.name.text === nombre) return par;
@@ -1106,17 +1116,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         };
         const origenDelNombre = (donde: ts.Node, nombre: string, hondo = 0): Fuente => {
           if (hondo > 8) return null;
-          let a: ts.Node | undefined = donde;
-          while (a !== undefined) {
-            if (ts.isBlock(a) || ts.isSourceFile(a)) {
-              for (const st of a.statements) {
-                if (!ts.isVariableStatement(st)) continue;
-                for (const d of st.declarationList.declarations) {
-                  if (!d.initializer) continue;
+          /** Lo que una declaración concreta dice del nombre, o `sigue` si no es la suya. */
+          const desde = (d: ts.VariableDeclaration): Fuente | 'sigue' => {
+            {
+              {
+                {
+                  if (!d.initializer) return 'sigue';
                   const suyo = esPatron(d.name)
                     ? elementoLigado(d.name, nombre) !== null
                     : ts.isIdentifier(d.name) && d.name.text === nombre;
-                  if (!suyo) continue;
+                  if (!suyo) return 'sigue';
                   /*
                    * Y UN NOMBRE QUE SE REASIGNA NO TIENE UN ORIGEN QUE LEER. Con
                    * `let contribucion = entrada.contribucion; contribucion = entrada.aprendizajes`,
@@ -1134,7 +1143,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                     return fuenteLigada(el, d.initializer);
                   }
                   if (!ts.isIdentifier(d.name)) {
-                    continue;
+                    return 'sigue';
                   }
                   /*
                    * Sólo un RENOMBRADO se sigue: `const x = y` o `const x = y.z`, con sus
@@ -1156,6 +1165,41 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                   }
                   return null;
                 }
+              }
+            }
+          };
+          let a: ts.Node | undefined = donde;
+          while (a !== undefined) {
+            if (ts.isBlock(a) || ts.isSourceFile(a)) {
+              for (const st of a.statements) {
+                if (!ts.isVariableStatement(st)) continue;
+                for (const d of st.declarationList.declarations) {
+                  const r = desde(d);
+                  if (r !== 'sigue') return r;
+                }
+              }
+            }
+            /*
+             * Y LA CABECERA DE UN `for` TAMBIÉN LIGA — pero sólo la de un `for` CLÁSICO, donde
+             * la declaración tiene su inicializador y se lee igual que cualquier otra.
+             *
+             * La de un `for … of` NO: el valor no está en la declaración sino un elemento de lo
+             * que se recorre, y probé a nombrarla como ilegible. Puso en ROJO tres rutas
+             * intactas —`orden` de una afirmación, `i` de un hallazgo, `insightId` de una
+             * cita—, que es el modo de fallo caro. Así que la limitación se queda escrita en vez
+             * de disfrazada: un nombre ligado por un `for … of` se cuenta tal cual, y si alguna
+             * vez alguien escribe ahí un alias con forma de destino, este censo no lo verá.
+             * Cerrarlo pide leer los elementos de lo que se recorre, que es otro análisis.
+             */
+            if (
+              (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
+              a.initializer !== undefined &&
+              ts.isVariableDeclarationList(a.initializer)
+            ) {
+              for (const d of a.initializer.declarations) {
+                if (d.initializer === undefined) continue;
+                const r = desde(d);
+                if (r !== 'sigue') return r;
               }
             }
             /*

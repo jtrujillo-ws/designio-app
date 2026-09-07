@@ -495,7 +495,27 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             if (ts.isIdentifier(d.name) && d.name.text === nombre) return { modulo, nombre };
           }
         }
-        if (!ts.isExportDeclaration(st) || !st.moduleSpecifier) continue;
+        if (!ts.isExportDeclaration(st)) continue;
+        /*
+         * Y `export { definirCriterio }` SIN módulo de origen es una declaración LOCAL sacada
+         * por una lista. La sonda de export de arriba la acepta —cuenta el nombre con el que
+         * sale—, así que dar por no resuelto este caso no era diferir a nadie: era saltarse el
+         * paso en silencio, y con la llamada de la pantalla borrada esto seguía en verde.
+         */
+        if (!st.moduleSpecifier) {
+          if (!st.exportClause || !ts.isNamedExports(st.exportClause)) continue;
+          for (const e of st.exportClause.elements) {
+            if (e.name.text !== nombre) continue;
+            const local = (e.propertyName ?? e.name).text;
+            const declarado = leer(modulo).statements.some((d) => {
+              if (ts.isFunctionDeclaration(d)) return d.name?.text === local;
+              if (!ts.isVariableStatement(d)) return false;
+              return d.declarationList.declarations.some((x) => ligaEsteNombre(x.name, local));
+            });
+            if (declarado) return { modulo, nombre: local };
+          }
+          continue;
+        }
         const destino = resolver(modulo, (st.moduleSpecifier as ts.StringLiteral).text);
         if (destino === null) continue;
         if (st.exportClause && ts.isNamedExports(st.exportClause)) {
@@ -513,6 +533,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     const sinPantalla: string[] = [];
+    const sinOrigen: string[] = [];
     for (const cap of CAPACIDADES_ACTIVAS) {
       const paridad = CAPACIDADES[cap].paridadManual;
       if (paridad.clase !== 'escritura') continue;
@@ -527,8 +548,17 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * ponía rojo. Arreglé un lado de la comparación y no el otro; se comparan los DOS
          * orígenes.
          */
+        /*
+         * Y si el paso NO resuelve a un origen, eso se NOMBRA. Aquí había un `continue` puesto
+         * suponiendo que la sonda de export de arriba ya lo denunciaba, y no era verdad: ella
+         * acepta formas que `declaraA` no sabía leer, así que el `continue` convertía un hueco
+         * de lectura en un salto callado. Cuando este censo no puede ver algo, pide una decisión.
+         */
         const origenDelPaso = declaraA(modulo, paso.funcion);
-        if (origenDelPaso === null) continue; // Tampoco se repite: la sonda de export ya lo dice.
+        if (origenDelPaso === null) {
+          sinOrigen.push(`${cap}: ${paso.modulo}#${paso.funcion}`);
+          continue;
+        }
         const laLlama = CAPA.some((pantalla) => {
           const traidos = traidosPor(pantalla);
           const llamados = llamadosEn(pantalla);
@@ -559,6 +589,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
     }
 
+    expect(
+      sinOrigen.sort(),
+      'este censo no sabe de dónde sale el paso declarado, así que no puede comprobar quién lo llama: decide si cuenta',
+    ).toEqual([]);
     expect(
       sinPantalla.sort(),
       'la puerta manual existe y escribe, pero NINGUNA pantalla la llama: con la AI apagada no hay forma de hacerlo (es el caso de C0 antes de #55)',

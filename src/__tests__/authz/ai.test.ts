@@ -32,6 +32,8 @@ import {
   type ContenidoPropuesta,
 } from '@/lib/ai/ai.schemas';
 import { contenidoLegible, parsearContenido } from '@/lib/ai/ai.contenido';
+import { observabilidadAI } from '@/lib/ai/ai.observabilidad';
+import { ROLES_OBSERVABILIDAD_AI } from '@/lib/ai/ai.schemas';
 import {
   arquetiposQueLlegaronEnteros,
   evidenciaQueLlegoAlRevisor,
@@ -12681,6 +12683,354 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * Las DOS columnas, que es la mitad que se olvida: cerrar sólo el fragmento deja la avería
    * idéntica una columna a la derecha, y eso ya está escrito en la tabla desde la ronda 29.
    */
+  /**
+   * RF-08.9 — EL LIBRO DE COSTOS TIENE LECTOR.
+   *
+   * `llamada_ai` guarda una línea por intento desde RF-09.14 y el único sitio que la
+   * consultaba era el tope diario del panel: coste, latencia, desenlace y modelo estaban
+   * escritos y no los leía nadie. Esta sonda mide las tres decisiones del lector, que son tres
+   * formas de no mentir con una cuenta:
+   *
+   * 1. Una línea EN VUELO no es un error. Nace `despachada` y se cierra después; contarla como
+   *    fallo hace que la tasa de error suba mientras el proveedor responde bien.
+   * 2. `costo_usd` nulo es «ese modelo no tenía tarifa registrada», no «salió gratis». Se suma
+   *    lo que se sabe y se cuenta aparte lo que no, porque sin ese segundo número nadie puede
+   *    saber si el total es el total.
+   * 3. Una propuesta PENDIENTE no es un rechazo. En el denominador de la aceptación haría que
+   *    el número empeorase solo por generar más, que es justo al revés.
+   */
+  it('RF-08.9: el lector del libro no cuenta en vuelo como error ni sin tarifa como gratis', async () => {
+    await enWorkspaceLimpio('obs-libro', async ({ ws: wsO, curadorId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      // El `motivo` no es relleno: la base exige que todo desenlace que NO sea
+      // `salida-valida` ni `despachada` traiga uno no vacío, porque una llamada pagada que
+      // falló sin decir por qué no se puede remediar.
+      // Y los TOKENS son parte del fixture, no un adorno: son lo que separa «falta la tarifa»
+      // de «el proveedor no dijo cuánto usó», y sin ellos la sonda no distinguiría las dos.
+      const llamada = (
+        resultado: string,
+        costo: number | null,
+        latencia: number | null,
+        tokens: number | null = null,
+      ) =>
+        admin`insert into llamada_ai
+          (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, motivo,
+           tokens_entrada, tokens_salida, costo_usd, latencia_ms, creado_por)
+          values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', ${resultado},
+                  ${resultado === 'salida-valida' || resultado === 'despachada' ? '' : 'la respuesta no cumplió el esquema'},
+                  ${tokens}, ${tokens}, ${costo}, ${latencia}, ${curadorId})
+          returning id`.then((r) => r[0]!.id as string);
+
+      await llamada('salida-valida', 0.01, 100, 500);
+      await llamada('salida-valida', 0.02, 300, 500);
+      /*
+       * Cerrada y FALLIDA, y además sin coste conocido: las dos mitades a la vez. CON tokens,
+       * que es lo que la hace «sin tarifa» de verdad —hubo uso y no había arancel para ese
+       * modelo—, la única de las dos causas que se arregla registrando una tarifa.
+       */
+      await llamada('fuera-de-contrato', null, 500, 800);
+      /*
+       * Y una que el proveedor NO respondió. Es la que separa las dos palabras: para el
+       * presupuesto no cuenta como atendida —no se cobra lo que no respondió— y para este
+       * cuadro sí cuenta como cerrada, porque quien pidió la generación se quedó sin ella.
+       * Sin esta línea en el fixture, la sonda no distinguía los dos conjuntos.
+       */
+      await llamada('sin-respuesta', null, null);
+      /*
+       * Y las dos clases de `despachada`, que NO son la misma y confundirlas fue el hallazgo
+       * de la primera revisión de este PR:
+       *
+       *  · EN VUELO: su reserva sigue viva, así que alguien la está esperando.
+       *  · HUÉRFANA: sin reserva viva. Es lo que queda cuando el cierre falla DESPUÉS de que
+       *    el proveedor respondiera —la limpieza retira la reserva y deja la fila
+       *    `despachada` a propósito—, y el presupuesto ya la cuenta como pagada. Si el cuadro
+       *    la da por en vuelo, su coste desconocido se queda fuera del aviso de «el total es
+       *    un mínimo», que es justo el caso que ese aviso existe para cubrir.
+       */
+      const [res] = await admin`insert into reserva_ai
+        (workspace_id, capacidad, reto_id, unidades, creado_por)
+        values (${wsO}, 'C0', ${retoO}, 1, ${curadorId})
+        returning id`;
+      await admin`update llamada_ai set reserva_id = ${res!.id as string}
+        where id = ${await llamada('despachada', null, null)}`;
+      // Y la huérfana: despachada, sin reserva que la cubra. SIN tokens, que es el caso real
+      // de un timeout o un 5xx: el proveedor no devolvió uso, así que el coste no se puede
+      // calcular por mucha tarifa que haya.
+      await llamada('despachada', null, null);
+
+      const obs = await observabilidadAI(curadorId, wsO);
+      const c0 = obs.capacidades.find((c) => c.capacidad === 'C0')!;
+      expect(
+        {
+          cerradas: c0.llamadasCerradas,
+          sinRespuesta: c0.llamadasSinRespuesta,
+          enVuelo: c0.llamadasEnVuelo,
+          huerfanas: c0.llamadasHuerfanas,
+          validas: c0.llamadasValidas,
+          sinTarifa: c0.llamadasSinTarifa,
+          sinUso: c0.llamadasSinUso,
+          costo: Number(c0.costoUsd.toFixed(2)),
+          tasaError: c0.tasaError,
+        },
+        'el lector cuenta la línea en vuelo, confunde la huérfana con ella, suma el coste desconocido como cero, o achaca a una tarifa que falta lo que es un uso que el proveedor no devolvió',
+      ).toEqual({
+        // CUATRO cerradas: dos válidas, la fuera-de-contrato y la sin-respuesta.
+        cerradas: 4,
+        // La sin-respuesta va DENTRO de las cerradas: para quien pidió la generación es un
+        // fallo igual, así que sacarla del denominador escondería una caída del proveedor.
+        sinRespuesta: 1,
+        enVuelo: 1,
+        huerfanas: 1,
+        validas: 2,
+        /*
+         * Las dos causas por separado, que fue el hallazgo de la segunda revisión. Las dos
+         * hacen que el total sea un mínimo —la cerrada y la huérfana pueden haberse pagado—,
+         * pero piden cosas distintas: la primera se arregla registrando una tarifa y la
+         * segunda no se arregla. Juntas bajo un solo rótulo, la pantalla mandaba a registrar
+         * una tarifa que no habría cambiado nada.
+         */
+        sinTarifa: 1,
+        // DOS sin uso devuelto: la huérfana y la sin-respuesta. Las dos son el proveedor
+        // callado, que es exactamente la clase que este reparto separa de «falta la tarifa».
+        sinUso: 2,
+        costo: 0.03,
+        // Dos de cuatro cerradas no dieron salida válida: la fuera-de-contrato y la que
+        // el proveedor no contestó. Una caída del proveedor SUBE la tasa de error, que es lo
+        // que un cuadro de operación tiene que enseñar.
+        tasaError: 0.5,
+      });
+      /*
+       * Las latencias, que ignoran los nulos por construcción de `percentile_cont` — medido
+       * antes de apoyarse en ello, porque tratarlos como cero hundiría el p50 justo cuando hay
+       * llamadas sin medir. Con 100, 300 y 500 el p50 es 300.
+       */
+      expect({ p50: c0.latenciaP50Ms, p95: c0.latenciaP95Ms }).toEqual({ p50: 300, p95: 480 });
+
+      /*
+       * Y una capacidad ACTIVA sin una sola llamada sale en cero, no ausente: «nadie la ha
+       * usado» es una respuesta, y su ausencia se leería como que la capacidad no existe.
+       */
+      expect(obs.capacidades.map((c) => c.capacidad)).toEqual(
+        expect.arrayContaining([...CAPACIDADES_ACTIVAS]),
+      );
+      const c7 = obs.capacidades.find((c) => c.capacidad === 'C7')!;
+      expect({ llamadas: c7.llamadasCerradas, error: c7.tasaError }).toEqual({
+        llamadas: 0,
+        // `null` y no cero: un 0 % de error sobre cero llamadas es un verde que nadie se ganó.
+        error: null,
+      });
+    });
+  });
+
+  /**
+   * Y la otra mitad del lector: los DENOMINADORES, que es donde una tasa miente sin que se note.
+   *
+   * Una propuesta pendiente no es un rechazo. Metida en el denominador de la aceptación, el
+   * número baja solo por generar más — o sea, empeora cuando el producto se usa, que es la
+   * peor forma de fallar para una métrica de salud. Y una capacidad que el registro NO cubre
+   * no se descarta: el CHECK de la base admite las diez de SPEC-08 y esta versión conoce
+   * nueve, así que una fila escrita por un servidor más nuevo se llevaría su GASTO fuera de
+   * la vista, que es exactamente lo que este lector existe para impedir.
+   */
+  it('RF-08.9: una propuesta pendiente no cuenta como rechazo, y una capacidad desconocida no se pierde', async () => {
+    await enWorkspaceLimpio('obs-denom', async ({ ws: wsO, curadorId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      const [ll] = await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, creado_por)
+        values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                ${curadorId})
+        returning id`;
+      const propuesta = (estado: string, orden: number) =>
+        admin`insert into propuesta_ai
+          (workspace_id, capacidad, destino, reto_id, contenido, contenido_original,
+           modelo, prompt_version, alcance_resumen, alcance_evidencia, origen_key,
+           llamada_id, orden, estado, revisada_por, revisada_en, creado_por)
+          values (${wsO}, 'C0', 'criterio-exito', ${retoO},
+                  ${admin.json(CONTENIDO_C0)}, ${admin.json(CONTENIDO_C0)},
+                  ${MODELO_PRIMARIO}, 'v-prueba', 'la formulación', '{}', 'entorno',
+                  ${ll!.id as string}, ${orden}, ${estado},
+                  ${estado === 'propuesta' ? null : curadorId},
+                  ${estado === 'propuesta' ? null : new Date()},
+                  ${curadorId})`;
+      // Una decidida y DOS sin mirar: con el denominador equivocado la tasa saldría 0/3.
+      await propuesta('rechazada', 0);
+      await propuesta('propuesta', 1);
+      await propuesta('propuesta', 2);
+
+      const obs = await observabilidadAI(curadorId, wsO);
+      const c0 = obs.capacidades.find((c) => c.capacidad === 'C0')!;
+      expect(
+        {
+          propuestas: c0.propuestas,
+          pendientes: c0.pendientes,
+          rechazadas: c0.rechazadas,
+          tasaAceptacion: c0.tasaAceptacion,
+          // `null` mientras no se haya materializado ninguna: no hay sobre qué dividir, y un
+          // 0 % de corrección sin nada aceptado diría que nadie corrige nada.
+          tasaCorreccion: c0.tasaCorreccion,
+        },
+        'las pendientes entraron en el denominador de la aceptación',
+      ).toEqual({
+        propuestas: 3,
+        pendientes: 2,
+        rechazadas: 1,
+        tasaAceptacion: 0,
+        tasaCorreccion: null,
+      });
+
+      /*
+       * Y la capacidad que el registro no conoce. `C1` está en el CHECK de la base —es C1-D,
+       * que no tiene implementación— así que es exactamente la fila que un servidor más nuevo
+       * escribiría: aparece, con su código por etiqueta y su gasto contado.
+       */
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, modelo, origen_key, resultado, costo_usd, creado_por)
+        values (${wsO}, 'C1', ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 0.05,
+                ${curadorId})`;
+      const conDesconocida = await observabilidadAI(curadorId, wsO);
+      const c1 = conDesconocida.capacidades.find((c) => c.capacidad === 'C1');
+      expect(c1, 'una fila de una capacidad que esta versión no conoce se perdió del libro')
+        .toBeTruthy();
+      expect({ etiqueta: c1!.etiqueta, costo: Number(c1!.costoUsd) }).toEqual({
+        etiqueta: 'C1',
+        costo: 0.05,
+      });
+      // Y el total del workspace la incluye: si no, el gasto declarado sería menor que el real.
+      expect(Number(conDesconocida.total.costoUsd.toFixed(2))).toBe(0.05);
+    });
+  });
+
+  /**
+   * UNA CAPACIDAD QUE NO SE PUEDE ACEPTAR NO TIENE TASA DE ACEPTACIÓN.
+   *
+   * CT y C5 son informativas: declaran `destino: null`, así que la base y la pantalla de
+   * revisión sólo admiten `propuesta → rechazada`. Con la fórmula a secas, en cuanto alguien
+   * lee un aviso de gate y lo descarta —que es el uso NORMAL de esas dos— su tasa caía a cero
+   * y el cuadro presentaba el funcionamiento correcto como un rechazo universal.
+   *
+   * Se mide junto a una que SÍ tiene destino y con el mismo movimiento, porque lo que hay que
+   * distinguir no es «cero» de «null» en abstracto: es que la misma acción —rechazar— significa
+   * cosas distintas según lo que la capacidad pueda hacer.
+   */
+  it('RF-08.9: una capacidad informativa no reporta 0 % de aceptación al descartarla', async () => {
+    await enWorkspaceLimpio('obs-informativa', async ({ ws: wsO, curadorId, servicioId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      /*
+       * La informativa que se usa aquí es C5 y no CT, y la razón es del ANCLA, no del destino:
+       * las dos declaran `destino: null`, pero CT cuelga de un `gate_id` —lo exige
+       * `llamada_ai_ancla_gate`— y montar una instancia de gate para medir una división sería
+       * el fixture midiendo otra cosa. C5 cuelga de un journey, que este arnés ya sabe crear.
+       * (Lo cazó la propia sonda al fallar por el CHECK: el fallo estaba en la MEDICIÓN.)
+       */
+      const j = await nuevoJourney({ ws: wsO, servicioId, retoId: retoO, actorId: curadorId });
+      const anclaDe = (capacidad: string) =>
+        capacidad === 'C5'
+          ? { columna: 'journey_id' as const, id: j.journeyId }
+          : { columna: 'reto_id' as const, id: retoO };
+      // Una rechazada de C5 (informativa, sin destino) y otra de C0 (con destino).
+      for (const capacidad of ['C5', 'C0'] as const) {
+        const a = anclaDe(capacidad);
+        const [ll] = await admin`insert into llamada_ai
+          (workspace_id, capacidad, ${admin(a.columna)}, modelo, origen_key, resultado, creado_por)
+          values (${wsO}, ${capacidad}, ${a.id}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida',
+                  ${curadorId})
+          returning id`;
+        await admin`insert into propuesta_ai
+          (workspace_id, capacidad, destino, ${admin(a.columna)}, contenido, contenido_original,
+           modelo, prompt_version, origen_key, huella_material, llamada_id, estado, revisada_por,
+           revisada_en, creado_por)
+          values (${wsO}, ${capacidad}, ${capacidad === 'C5' ? null : 'criterio-exito'}, ${a.id},
+                  '{}'::jsonb, '{}'::jsonb, ${MODELO_PRIMARIO}, ${PROMPT_VERSION}, 'entorno',
+                  -- La huella que la base exige a las capacidades que la declaran (C5 entre
+                  -- ellas). No es la del material de verdad, y da igual: esta sonda mide una
+                  -- división, no la obsolescencia.
+                  ${capacidad === 'C5' ? 'huella-del-material' : null},
+                  ${ll!.id as string}, 'rechazada', ${curadorId}, now(), ${curadorId})`;
+      }
+
+      const obs = await observabilidadAI(curadorId, wsO);
+      const informativa = obs.capacidades.find((c) => c.capacidad === 'C5')!;
+      const c0 = obs.capacidades.find((c) => c.capacidad === 'C0')!;
+      expect(informativa.rechazadas, 'el fixture no escribió la rechazada de C5').toBe(1);
+      expect(
+        informativa.tasaAceptacion,
+        'C5 no puede aceptarse: un 0 % ahí presenta su uso normal como un rechazo universal',
+      ).toBeNull();
+      // Y la que SÍ tiene destino sigue diciendo cero, que ahí es la verdad: se rechazó lo que
+      // se podía haber aceptado. Sin esta mitad, el arreglo podría haber apagado la métrica
+      // entera y la sonda pasaría igual.
+      expect(c0.tasaAceptacion).toBe(0);
+    });
+  });
+
+  /**
+   * Y LA FRONTERA de la puerta de rol, medida en vez de afirmada — CORREGIDA.
+   *
+   * Esta sonda decía antes lo contrario de lo que dice ahora, y el cambio es un arreglo, no un
+   * ajuste. Yo había escrito que la puerta era «de PANTALLA» y que el suelo, más ancho, se
+   * quedaba como estaba: cerrarlo repetiría la avería de la ronda 42 de #48, cerrar una fila
+   * por rol y romper una lectura ya declarada. Ese razonamiento es correcto sobre la RLS y NO
+   * se aplica a la capa 2, y yo las confundí: dejé la server function sin puerta ninguna, así
+   * que cualquier miembro podía pedirle a mano el cuadro con la factura de la boutique y los
+   * nombres de los modelos. Lo cazó una revisión, y la sonda que yo había escrito lo fijaba
+   * como si fuera la conducta deseada.
+   *
+   * Ahora se miden las TRES capas por separado, que es lo que hace la frontera legible:
+   *
+   *  1. La RLS sigue igual de ancha —el tope diario y el estado de la capacidad los lee todo
+   *     miembro desde el panel de propuestas—, y eso se comprueba leyendo la tabla directamente.
+   *  2. La PROYECCIÓN se cierra por rol, con motivo.
+   *  3. Y sin MEMBRESÍA no hay informe en cero: la pérdida de acceso no puede disfrazarse de
+   *     «aquí no se ha gastado nada», que es la única de las tres que además engaña.
+   */
+  it('RF-08.9: la RLS sigue ancha, la proyección se cierra por rol, y sin membresía no hay ceros', async () => {
+    await enWorkspaceLimpio('obs-frontera', async ({ ws: wsO, curadorId, retoId: retoO }) => {
+      const admin = sqlAdmin();
+      await admin`insert into llamada_ai
+        (workspace_id, capacidad, reto_id, modelo, origen_key, resultado, costo_usd, creado_por)
+        values (${wsO}, 'C0', ${retoO}, ${MODELO_PRIMARIO}, 'entorno', 'salida-valida', 0.07,
+                ${curadorId})`;
+      const alta = async (rol: string, sufijo: string) => {
+        const email = `${marca}-obs-${sufijo}@test.demo`;
+        const [u] = await admin`insert into usuario (email, nombre, estado)
+          values (${email}, ${rol}, 'activo') returning id`;
+        const id = u!.id as string;
+        if (rol !== '') {
+          await admin`insert into miembro (workspace_id, usuario_id, nombre, email, rol)
+            values (${wsO}, ${id}, ${rol}, ${email}, ${rol})`;
+        }
+        return id;
+      };
+      const stakeId = await alta('stakeholder', 'stake');
+      const ajenoId = await alta('', 'ajeno');
+
+      // 1. El SUELO no se ha movido: con membresía viva, el stakeholder sigue leyendo la tabla.
+      //    Es la lectura que el panel de propuestas necesita, y cerrarla por rol sería la
+      //    avería de la ronda 42 de #48.
+      const [suelo] = await conUsuario(
+        stakeId,
+        (tx) => tx`select count(*)::int as n from llamada_ai where workspace_id = ${wsO}`,
+      );
+      expect(
+        suelo!.n,
+        'la política de llamada_ai dejó de admitir a un miembro: mira qué lectura declarada se rompió',
+      ).toBe(1);
+
+      // 2. Y la PROYECCIÓN sí se cierra, con motivo. La puerta ya no es sólo de pantalla: la
+      //    server function es la superficie de verdad.
+      expect((ROLES_OBSERVABILIDAD_AI as readonly string[]).includes('stakeholder')).toBe(false);
+      await expect(observabilidadAI(stakeId, wsO)).rejects.toThrow(ErrorAutorizacion);
+
+      // 3. Y sin membresía tampoco sale un informe en cero, que es el caso que engaña: la RLS
+      //    filtra a cero filas y el recorrido por el registro las rellena, así que la pérdida de
+      //    acceso tenía exactamente la misma cara que un workspace sin gasto.
+      await expect(
+        observabilidadAI(ajenoId, wsO),
+        'sin membresía el informe salía todo en cero, indistinguible de «aquí no se gastó nada»',
+      ).rejects.toThrow(ErrorAutorizacion);
+    });
+  });
+
   it('C4: el pasaje del enlace materializado es uno de los que la propuesta dice', async () => {
     await enWorkspaceLimpio('c4-pasaje-sello', async ({ ws: wsC, curadorId, retoId: retoC }) => {
       const { conceptoId, lenteA, lenteB, evA, evB } = await conceptoConDosLentes(

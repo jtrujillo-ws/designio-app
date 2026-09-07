@@ -148,17 +148,25 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
    */
   const CONSTRUCTOR_DE_SERVER_FN = 'createServerFn';
   const MODULO_DE_SERVER_FN = '@tanstack/react-start';
-  const traeElConstructor = (arbol: ts.SourceFile): boolean =>
-    arbol.statements.some((st) => {
-      if (!ts.isImportDeclaration(st)) return false;
-      if ((st.moduleSpecifier as ts.StringLiteral).text !== MODULO_DE_SERVER_FN) return false;
+  /**
+   * Con qué NOMBRE LOCAL llega el constructor a este módulo, o nada si no llega.
+   *
+   * `import { createServerFn as makeServerFn }` es una reescritura que no cambia nada, y
+   * comparando la raíz de la cadena contra el nombre literal dejaba a todas las server
+   * functions de ese módulo por no invocables: un rechazo falso.
+   */
+  const nombreDelConstructor = (arbol: ts.SourceFile): string | null => {
+    for (const st of arbol.statements) {
+      if (!ts.isImportDeclaration(st)) continue;
+      if ((st.moduleSpecifier as ts.StringLiteral).text !== MODULO_DE_SERVER_FN) continue;
       const b = st.importClause?.namedBindings;
-      return (
-        b !== undefined &&
-        ts.isNamedImports(b) &&
-        b.elements.some((e) => e.name.text === CONSTRUCTOR_DE_SERVER_FN)
-      );
-    });
+      if (b === undefined || !ts.isNamedImports(b)) continue;
+      for (const e of b.elements) {
+        if ((e.propertyName ?? e.name).text === CONSTRUCTOR_DE_SERVER_FN) return e.name.text;
+      }
+    }
+    return null;
+  };
   const raizDeLaCadena = (x: ts.Expression): ts.Expression => {
     let a: ts.Expression = x;
     for (;;) {
@@ -208,10 +216,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return true;
     }
     if (ts.isCallExpression(x)) {
+      const suyo = nombreDelConstructor(arbol);
       const r = raizDeLaCadena(x);
-      return (
-        ts.isIdentifier(r) && r.text === CONSTRUCTOR_DE_SERVER_FN && traeElConstructor(arbol)
-      );
+      return suyo !== null && ts.isIdentifier(r) && r.text === suyo;
     }
     if (!ts.isIdentifier(x)) return false;
     // Un alias: local primero, y si no, por donde lo importen.
@@ -587,7 +594,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           ? q.text
           : null;
       const posiciones = quien === null ? undefined : EJECUTAN_SU_CALLBACK.get(quien);
-      if (posiciones === undefined) return [];
+      if (posiciones === undefined || quien === null || !receptorValido(x, quien)) return [];
       // El nombre a secas y el acceso a propiedad: `map(persistir)` y
       // `map(proveedor.generar)` ejecutan lo mismo, y quedarse con el primero dejaba
       // al espacio de nombres —la forma normal de llamar a otro módulo— fuera del grafo.
@@ -605,6 +612,43 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * una función que se llame— daba por vivo al ayudante y contaba su SQL. Cada API dice
      * dónde recibe lo que ejecuta, y lo que llegue en otra posición no cuenta.
      */
+    /*
+     * Y NO BASTA EL ÚLTIMO NOMBRE TRAS EL PUNTO. Un objeto cualquiera con un método `handler`
+     * —`collector.handler(persistir)`, que a lo mejor sólo lo REGISTRA— daba por vivo al
+     * ayudante y contaba su SQL. Cada API dice también CÓMO se la llama:
+     *   · `suelto`: sólo como nombre a secas, que es como se llama a un import (`conUsuario`);
+     *   · `cadena`: sólo sobre la cadena que declara una server function (`….handler(fn)`);
+     *   · `cualquiera`: los métodos de valor corriente —los de array, `then`, `replace`—, donde
+     *     exigir el receptor pondría en rojo código intacto por todas partes.
+     */
+    type ComoSeLlama = 'suelto' | 'cadena' | 'cualquiera';
+    const RECEPTOR_EXIGIDO = new Map<string, ComoSeLlama>([
+      ['conUsuario', 'suelto'],
+      ['handler', 'cadena'],
+    ]);
+    /** Si la llamada encaja con la forma que esa API exige de su receptor. */
+    const receptorValido = (x: ts.CallExpression, quien: string): boolean => {
+      const como = RECEPTOR_EXIGIDO.get(quien) ?? 'cualquiera';
+      if (como === 'cualquiera') return true;
+      if (como === 'suelto') return ts.isIdentifier(x.expression);
+      if (!ts.isPropertyAccessExpression(x.expression)) return false;
+      let a: ts.Expression = x.expression.expression;
+      for (let i = 0; i < 12; i += 1) {
+        if (ts.isCallExpression(a) || ts.isPropertyAccessExpression(a)) {
+          a = a.expression;
+          continue;
+        }
+        break;
+      }
+      /*
+       * Y la raíz se compara contra el nombre LOCAL con el que ese módulo trae el constructor,
+       * no contra el literal: `import { createServerFn as makeServerFn }` es una reescritura
+       * que no cambia nada, y medirla contra el literal dejaba sin recorrer el manejador de
+       * todas las server functions de ese fichero.
+       */
+      const suyo = nombreDelConstructor(x.getSourceFile());
+      return suyo !== null && ts.isIdentifier(a) && a.text === suyo;
+    };
     const EJECUTAN_SU_CALLBACK = new Map<string, number[]>([
       // El único camino de este repositorio a la base, y el cuerpo de cada función de servidor.
       ['conUsuario', [1]],
@@ -692,6 +736,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return posiciones !== undefined && posiciones.includes(indice);
       });
 
+    /** Los métodos de una consulta de postgres.js que la MANDAN a la base al llamarlos. */
+    const DESPACHAN_LA_CONSULTA = ['then', 'catch', 'finally', 'execute', 'forEach', 'cursor'];
+
     /** Si quien recibe una función anónima la ejecuta. Lo que no, se nombra si lleva SQL. */
     const laEjecutaQuienLaRecibe = (x: ts.Node): boolean => {
       // Un nodo función-like sin cuerpo es un TIPO: no ejecuta nada y no hay nada que decir.
@@ -722,7 +769,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           ? q.text
           : null;
       const posiciones = quien === null ? undefined : EJECUTAN_SU_CALLBACK.get(quien);
-      if (posiciones !== undefined && posiciones.includes(recibe.arguments.indexOf(x as unknown as ts.Expression))) {
+      if (
+        posiciones !== undefined &&
+        quien !== null &&
+        receptorValido(recibe, quien) &&
+        posiciones.includes(recibe.arguments.indexOf(x as unknown as ts.Expression))
+      ) {
         return true;
       }
       nombrarSiLleva(x, `${quien ?? q.getText().slice(0, 40)}(…)`);
@@ -1023,6 +1075,27 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
           if (padre === undefined) return false;
           if (ts.isAwaitExpression(padre) && padre.expression === hijo) return true;
+          /*
+           * Y LLAMAR A `.then(…)` SOBRE LA CONSULTA LA DISPARA, igual que esperarla: la de
+           * postgres.js es perezosa hasta que alguien la consume, y consumirla por su API de
+           * thenable es exactamente eso. Sin esto, `return tx\`insert …\`.then(…)` —que hace lo
+           * mismo que un `await`— salía como escritura que falta: otro rechazo falso.
+           *
+           * Sólo las que DESPACHAN. `.raw()` y `.values()` devuelven la consulta sin ejecutarla,
+           * así que no cuentan, y contarlas sería el agujero de siempre por el otro lado.
+           */
+          if (
+            ts.isPropertyAccessExpression(padre) &&
+            padre.expression === hijo &&
+            DESPACHAN_LA_CONSULTA.includes(padre.name.text)
+          ) {
+            const llamada = padre.parent as ts.Node | undefined;
+            return (
+              llamada !== undefined &&
+              ts.isCallExpression(llamada) &&
+              llamada.expression === padre
+            );
+          }
           /*
            * Un `return` dispara la consulta sólo si la función es ASÍNCRONA: ahí la máquina de
            * promesas la ASIMILA —la espera antes de resolver—. En una función síncrona el
@@ -1389,10 +1462,22 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * `await generarConProveedor.call(undefined, entrada)` dejaba fuera al proveedor y
          * SYS-21 seguía en verde con la ruta manual llamando al modelo.
          */
+        /*
+         * Y `obj['nombre'](…)` es la misma llamada que `obj.nombre(…)`: con la clave escrita
+         * como literal no hay nada que adivinar, y sin leerla un
+         * `await proveedor['generarConProveedor'](…)` dejaba fuera al proveedor.
+         */
+        const comoPropiedad = (e: ts.Expression): { objeto: ts.Expression; nombre: string } | null => {
+          if (ts.isPropertyAccessExpression(e)) return { objeto: e.expression, nombre: e.name.text };
+          if (ts.isElementAccessExpression(e) && ts.isStringLiteral(e.argumentExpression)) {
+            return { objeto: e.expression, nombre: e.argumentExpression.text };
+          }
+          return null;
+        };
+        const acceso = comoPropiedad(x.expression);
         const porElReceptor =
-          ts.isPropertyAccessExpression(x.expression) &&
-          ['call', 'apply', 'bind'].includes(x.expression.name.text)
-            ? x.expression.expression
+          acceso !== null && ['call', 'apply', 'bind'].includes(acceso.nombre)
+            ? acceso.objeto
             : null;
         if (porElReceptor !== null && ts.isIdentifier(porElReceptor)) {
           llamadas.push({ objeto: null, nombre: porElReceptor.text, donde: x });
@@ -1406,10 +1491,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           });
         } else if (ts.isIdentifier(x.expression)) {
           llamadas.push({ objeto: null, nombre: x.expression.text, donde: x });
-        } else if (ts.isPropertyAccessExpression(x.expression)) {
+        } else if (acceso !== null) {
           llamadas.push({
-            objeto: ts.isIdentifier(x.expression.expression) ? x.expression.expression.text : null,
-            nombre: x.expression.name.text,
+            objeto: ts.isIdentifier(acceso.objeto) ? acceso.objeto.text : null,
+            nombre: acceso.nombre,
             donde: x,
           });
         }

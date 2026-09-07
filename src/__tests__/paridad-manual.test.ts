@@ -310,8 +310,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const v = varsDe(a).get(nombre);
         if (v !== undefined) return v;
       }
-      if (ts.isBlock(a) || ts.isSourceFile(a)) {
-        for (const st of a.statements) {
+      /*
+       * Y UNA CLÁUSULA DE `switch` TAMBIÉN LIGA. El bloque de un `switch` es un ámbito léxico
+       * —un `const` declarado en un `case` vale para TODAS las cláusulas—, pero esta lectura
+       * sólo miraba `Block` y `SourceFile`, así que un `case 'a': const definirCriterio = local;`
+       * no tapaba al import y su llamada se le acreditaba. Se aplanan las cláusulas porque el
+       * ámbito es el bloque entero del `switch`, no cada cláusula por separado.
+       */
+      const sentencias: readonly ts.Statement[] | null =
+        ts.isBlock(a) || ts.isSourceFile(a)
+          ? a.statements
+          : ts.isCaseBlock(a)
+            ? a.clauses.flatMap((c) => [...c.statements])
+            : null;
+      if (sentencias !== null) {
+        for (const st of sentencias) {
           /*
            * Y UNA `function` DECLARADA LIGA IGUAL QUE UN `const`. Esta búsqueda sólo miraba
            * sentencias de variable, así que un `function conUsuario(_actor, _callback) {}`
@@ -598,11 +611,28 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            */
           if (ts.isIdentifier(q)) {
             if (ligaduraDe(q, q.text) === null) fuera.add(q.text);
-          } else if (ts.isPropertyAccessExpression(q)) {
+          } else if (ts.isPropertyAccessExpression(q) || ts.isElementAccessExpression(q)) {
+            /*
+             * Y LOS CORCHETES CON LITERAL SON EL MISMO ACCESO QUE EL PUNTO:
+             * `manual['definirCriterio'](…)` llama exactamente a lo mismo que
+             * `manual.definirCriterio(…)`. Esta sonda sólo leía el punto, así que una pantalla
+             * que llamara por corchetes se daba por no-llamadora: ROJO SOBRE CÓDIGO QUE
+             * FUNCIONA. Y lo que lo hace peor es que `nombreDeQuienLlama` —el lector del censo
+             * de escrituras— YA leía los corchetes desde #54: eran dos sondas del mismo
+             * fichero reconociendo formas de llamada distintas. Se leen igual las dos.
+             *
+             * Sólo literal de cadena, igual que la otra: un `manual[k]` con `k` variable no se
+             * resuelve sin ejecutar, y adivinarlo es por donde este censo empezaría a mentir.
+             */
+            const miembro = ts.isPropertyAccessExpression(q)
+              ? q.name.text
+              : ts.isStringLiteral(q.argumentExpression)
+                ? q.argumentExpression.text
+                : null;
             // El receptor se lee igual que el callee: el `as` puede envolver sólo al espacio.
             const r = desenvuelto(q.expression);
-            if (ts.isIdentifier(r) && ligaduraDe(r, r.text) === null) {
-              fuera.add(`${r.text}.${q.name.text}`);
+            if (miembro !== null && ts.isIdentifier(r) && ligaduraDe(r, r.text) === null) {
+              fuera.add(`${r.text}.${miembro}`);
             }
           }
         }
@@ -1378,8 +1408,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * un ámbito más adentro.
        */
       const declaradaEn = (ambito: ts.Node, nombre: string): ts.Node | null => {
-        if (!ts.isBlock(ambito) && !ts.isSourceFile(ambito)) return null;
-        for (const st of ambito.statements) {
+        /*
+         * Y LA CLÁUSULA DE `switch` TAMBIÉN DECLARA, igual que en `ligaduraDe`. Esto NO estaba
+         * reportado: salió de ir a buscar en esta sonda la misma forma que el hallazgo señalaba
+         * en la otra. Aquí el fallo es al revés y peor: un ayudante declarado en un `case` y
+         * llamado ahí mismo no se encontraba, su cuerpo no se recorría, y su escritura
+         * desaparecía del censo — ROJO SOBRE CÓDIGO QUE FUNCIONA.
+         */
+        const sentencias: readonly ts.Statement[] | null =
+          ts.isBlock(ambito) || ts.isSourceFile(ambito)
+            ? ambito.statements
+            : ts.isCaseBlock(ambito)
+              ? ambito.clauses.flatMap((c) => [...c.statements])
+              : null;
+        if (sentencias === null) return null;
+        for (const st of sentencias) {
           if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {

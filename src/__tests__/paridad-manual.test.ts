@@ -217,6 +217,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             m.set(e.name.text, { modulo: destino, original: (e.propertyName ?? e.name).text });
           }
         }
+        /*
+         * `import * as servicio from './servicio'` guarda el espacio con `'*'` por original.
+         * Sin esto, `servicio.crear(…)` dejaba el recorrido a medias: `llamadasEn` saca el
+         * nombre de la propiedad —`crear`— y el mapa no tenía nada que decir sobre `servicio`,
+         * así que el barrido se paraba y daba por incumplida una ruta manual intacta. Es el
+         * mismo fallo que el alias de import, con la otra forma de importar.
+         */
+        if (b && ts.isNamespaceImport(b)) m.set(b.name.text, { modulo: destino, original: '*' });
         if (st.importClause?.name) {
           m.set(st.importClause.name.text, { modulo: destino, original: 'default' });
         }
@@ -288,8 +296,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      *
      * Las plantillas anidadas dentro de un `${…}` se visitan por su cuenta al recorrer el árbol,
      * así que no se pierden.
+     */
+    const TESTIGO = ' :interpolado ';
+
+    /**
+     * EL RECORRIDO DE LO QUE SIGUE VIVO DENTRO DE UNA FUNCIÓN.
      *
-     * Y NO SE BAJA a un ayudante anidado con NOMBRE al que ya no llama nadie. El descenso era
+     * No se baja a un ayudante anidado con NOMBRE al que ya no llama nadie. El descenso era
      * incondicional, así que dejar `const persistir = () => tx\`…\`` declarado y quitar su
      * llamada mantenía la escritura contada — la operación desaparecida y el censo en verde.
      * Se mira si el nombre aparece en algún otro sitio del cuerpo: sólo se baja si sí.
@@ -298,9 +311,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * conveniencia: son las que van como argumento —`conUsuario(actorId, async (tx) => …)`,
      * que es como escribe casi todo este repositorio—, y ésas las llama quien las recibe.
      * Excluirlas dejaría ciego el censo entero, que es lo contrario de lo que se busca.
+     *
+     * Y ES UN SOLO RECORRIDO porque la primera versión de esta regla vivía únicamente en la
+     * lectura del SQL, y la de las llamadas seguía bajando a todas partes: un ayudante muerto
+     * que en vez de traer el SQL DELEGARA en otro módulo seguía arrastrando su escritura. Una
+     * regla en dos sitios se aplica en uno.
      */
-    const TESTIGO = ' :interpolado ';
-    const sqlDe = (n: ts.Node): string[] => {
+    const recorrerVivo = (n: ts.Node, visitar: (x: ts.Node) => void): void => {
       const usos = new Map<string, number>();
       const contar = (x: ts.Node): void => {
         if (ts.isIdentifier(x)) usos.set(x.text, (usos.get(x.text) ?? 0) + 1);
@@ -321,23 +338,28 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return null;
       };
-      const trozos: string[] = [];
       const ver = (x: ts.Node): void => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);
           // Su propia declaración ya cuenta una vez: hace falta OTRA aparición para estar viva.
           if (nombre !== null && (usos.get(nombre) ?? 0) < 2) return;
         }
-        if (ts.isTaggedTemplateExpression(x)) {
-          const t = x.template;
-          const literales = ts.isNoSubstitutionTemplateLiteral(t)
-            ? [t.text]
-            : [t.head.text, ...t.templateSpans.map((sp) => sp.literal.text)];
-          trozos.push(soloSql(literales.join(TESTIGO)));
-        }
+        visitar(x);
         ts.forEachChild(x, ver);
       };
       ver(n);
+    };
+
+    const sqlDe = (n: ts.Node): string[] => {
+      const trozos: string[] = [];
+      recorrerVivo(n, (x) => {
+        if (!ts.isTaggedTemplateExpression(x)) return;
+        const t = x.template;
+        const literales = ts.isNoSubstitutionTemplateLiteral(t)
+          ? [t.text]
+          : [t.head.text, ...t.templateSpans.map((sp) => sp.literal.text)];
+        trozos.push(soloSql(literales.join(TESTIGO)));
+      });
       return trozos;
     };
 
@@ -400,17 +422,20 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return null;
     };
 
-    const llamadasEn = (n: ts.Node): string[] => {
-      const nombres: string[] = [];
-      const ver = (x: ts.Node): void => {
-        if (ts.isCallExpression(x)) {
-          if (ts.isIdentifier(x.expression)) nombres.push(x.expression.text);
-          else if (ts.isPropertyAccessExpression(x.expression)) nombres.push(x.expression.name.text);
+    /** Las llamadas VIVAS de una función, con el objeto sobre el que se hacen si lo hay. */
+    const llamadasEn = (n: ts.Node): { objeto: string | null; nombre: string }[] => {
+      const llamadas: { objeto: string | null; nombre: string }[] = [];
+      recorrerVivo(n, (x) => {
+        if (!ts.isCallExpression(x)) return;
+        if (ts.isIdentifier(x.expression)) llamadas.push({ objeto: null, nombre: x.expression.text });
+        else if (ts.isPropertyAccessExpression(x.expression)) {
+          llamadas.push({
+            objeto: ts.isIdentifier(x.expression.expression) ? x.expression.expression.text : null,
+            nombre: x.expression.name.text,
+          });
         }
-        ts.forEachChild(x, ver);
-      };
-      ts.forEachChild(n, ver);
-      return nombres;
+      });
+      return llamadas;
     };
 
     /*
@@ -550,7 +575,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         const imports = importesDe(arbol, actual.modulo);
         const locales = funcionesDe(arbol);
-        for (const nombre of llamadasEn(decl)) {
+        for (const { objeto, nombre } of llamadasEn(decl)) {
+          // `servicio.crear(…)` con `import * as servicio`: el módulo lo dice el espacio.
+          const espacio = objeto === null ? undefined : imports.get(objeto);
+          if (espacio?.original === '*') {
+            cola.push({ modulo: espacio.modulo, funcion: nombre });
+            continue;
+          }
           const importado = imports.get(nombre);
           if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
           else if (locales.has(nombre)) cola.push({ modulo: actual.modulo, funcion: nombre });

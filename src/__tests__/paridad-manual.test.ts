@@ -651,12 +651,73 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         .filter((x) => x !== '');
     };
 
+    /**
+     * POR QUÉ FILA se escribe, que no es lo mismo que qué se escribe en ella.
+     *
+     * Coincidir en verbo, tabla y columnas no basta: un `update outcome_review` a mano que
+     * pierda su `where id = …` escribiría TODOS los borradores del workspace al guardar uno, y
+     * el censo seguiría diciendo que la paridad está completa. Se recogen las columnas que el
+     * `where` compara —a profundidad cero, para no confundir las de una subconsulta con las de
+     * la sentencia— y se exige que la ruta manual acote AL MENOS por las mismas.
+     *
+     * Al menos, y no exactamente: acotar de más es asunto suyo; acotar de menos es escribir
+     * donde la materialización no escribiría.
+     */
+    const filtroTrasLaTabla = (sql: string, desde: number, verbo: string): string[] => {
+      if (verbo !== 'update') return [];
+      const resto = sql.slice(desde);
+      const set = /\bset\b/i.exec(resto);
+      if (!set) return [];
+      const cuerpo = resto.slice(set.index + set[0].length);
+      let hondo = 0;
+      let enTexto = false;
+      let donde = -1;
+      for (let i = 0; i < cuerpo.length; i++) {
+        const c = cuerpo[i]!;
+        if (enTexto) {
+          if (c === "'") enTexto = false;
+          continue;
+        }
+        if (c === "'") enTexto = true;
+        else if (c === '(') hondo += 1;
+        else if (c === ')') hondo -= 1;
+        else if (hondo === 0 && (i === 0 || /\W/.test(cuerpo[i - 1]!))) {
+          if (/^where\b/i.test(cuerpo.slice(i))) {
+            donde = i + 'where'.length;
+            break;
+          }
+        }
+      }
+      if (donde < 0) return [];
+      const cola = cuerpo.slice(donde);
+      const columnas: string[] = [];
+      let hondo2 = 0;
+      let enTexto2 = false;
+      for (let i = 0; i < cola.length; i++) {
+        const c = cola[i]!;
+        if (enTexto2) {
+          if (c === "'") enTexto2 = false;
+          continue;
+        }
+        if (c === "'") enTexto2 = true;
+        else if (c === '(') hondo2 += 1;
+        else if (c === ')') hondo2 -= 1;
+        else if (hondo2 === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
+          if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
+          const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b|\bis\b)/i.exec(cola.slice(i));
+          if (m) columnas.push(m[1]!.toLowerCase());
+        }
+      }
+      return columnas;
+    };
+
     /** Las escrituras «verbo tabla» alcanzables desde una función, con las columnas de cada una. */
-    const cacheDeEscrituras = new Map<string, Map<string, Set<string>>>();
-    const escriturasDesde = (modulo: string, funcion: string): Map<string, Set<string>> => {
+    type Escritura = { columnas: Set<string>; filtro: Set<string> };
+    const cacheDeEscrituras = new Map<string, Map<string, Escritura>>();
+    const escriturasDesde = (modulo: string, funcion: string): Map<string, Escritura> => {
       const memo = cacheDeEscrituras.get(`${modulo}#${funcion}`);
       if (memo) return memo;
-      const escrituras = new Map<string, Set<string>>();
+      const escrituras = new Map<string, Escritura>();
       const visto = new Set<string>();
       const cola = [{ modulo, funcion }];
       while (cola.length > 0) {
@@ -680,9 +741,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             if (CONTABILIDAD_AI.includes(tabla)) continue;
             const verbo = m[1]!.toLowerCase().replace(/\s+/g, ' ');
             const clave = `${verbo} ${tabla}`;
-            const columnas = escrituras.get(clave) ?? new Set<string>();
-            for (const c of columnasTrasLaTabla(sql, m.index + m[0].length, verbo)) columnas.add(c);
-            escrituras.set(clave, columnas);
+            const y = escrituras.get(clave) ?? { columnas: new Set<string>(), filtro: new Set<string>() };
+            const tras = m.index + m[0].length;
+            for (const c of columnasTrasLaTabla(sql, tras, verbo)) y.columnas.add(c);
+            for (const c of filtroTrasLaTabla(sql, tras, verbo)) y.filtro.add(c);
+            escrituras.set(clave, y);
           }
         }
         const imports = importesDe(arbol, actual.modulo);
@@ -735,13 +798,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       expect(exigido.size, `${cap}: el materializador no escribe nada, no hay qué exigir`).toBeGreaterThan(0);
 
       if (def.paridadManual.clase !== 'escritura') continue;
-      const cubierto = new Map<string, Set<string>>();
+      const cubierto = new Map<string, Escritura>();
       for (const paso of def.paridadManual.pasos) {
         const m = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
         expect(m, `${cap}: el módulo ${paso.modulo} no existe`).not.toBeNull();
-        for (const [e, cols] of escriturasDesde(m!, paso.funcion)) {
-          const acumulado = cubierto.get(e) ?? new Set<string>();
-          for (const c of cols) acumulado.add(c);
+        for (const [e, y] of escriturasDesde(m!, paso.funcion)) {
+          const acumulado = cubierto.get(e) ?? { columnas: new Set<string>(), filtro: new Set<string>() };
+          for (const c of y.columnas) acumulado.columnas.add(c);
+          for (const c of y.filtro) acumulado.filtro.add(c);
           cubierto.set(e, acumulado);
         }
       }
@@ -753,15 +817,23 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       ).toEqual([]);
 
       const columnasQueFaltan = [...exigido]
-        .flatMap(([e, cols]) =>
-          [...cols]
-            .filter((c) => !cubierto.get(e)!.has(c))
-            .map((c) => `${e}.${c}`),
+        .flatMap(([e, y]) =>
+          [...y.columnas].filter((c) => !cubierto.get(e)!.columnas.has(c)).map((c) => `${e}.${c}`),
         )
         .sort();
       expect(
         columnasQueFaltan,
         `${cap}: la secuencia manual (${secuencia}) toca las mismas tablas que ${suyos[0]} pero no escribe todo lo que él escribe`,
+      ).toEqual([]);
+
+      const filtrosQueFaltan = [...exigido]
+        .flatMap(([e, y]) =>
+          [...y.filtro].filter((c) => !cubierto.get(e)!.filtro.has(c)).map((c) => `${e} where ${c}`),
+        )
+        .sort();
+      expect(
+        filtrosQueFaltan,
+        `${cap}: la secuencia manual (${secuencia}) escribe lo mismo que ${suyos[0]} pero no acota la fila igual`,
       ).toEqual([]);
     }
   });

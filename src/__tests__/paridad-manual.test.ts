@@ -225,6 +225,46 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /**
+     * FUERA LOS COMENTARIOS DE SQL, que son el mismo agujero un nivel más adentro.
+     *
+     * Limitar el barrido a las plantillas etiquetadas dejó fuera los comentarios de TypeScript,
+     * pero no los de SQL: un `-- update outcome_review` DENTRO de la plantilla seguía contando
+     * como escritura. Reproducido cambiando el `insert into oportunidad_insight` de
+     * `enlazarInsight` por otra tabla y dejando encima un comentario que lo nombra: el censo
+     * seguía en VERDE con la operación ya desaparecida, que es exactamente lo que existe para
+     * impedir.
+     *
+     * Se respetan las cadenas: un `--` dentro de `'…'` es texto y no un comentario.
+     */
+    const sinComentariosSql = (t: string): string => {
+      let fuera = '';
+      let enCadena = false;
+      let i = 0;
+      while (i < t.length) {
+        const c = t[i]!;
+        if (enCadena) {
+          fuera += c;
+          if (c === "'") enCadena = false;
+          i += 1;
+        } else if (c === "'") {
+          fuera += c;
+          enCadena = true;
+          i += 1;
+        } else if (c === '-' && t[i + 1] === '-') {
+          while (i < t.length && t[i] !== '\n') i += 1;
+        } else if (c === '/' && t[i + 1] === '*') {
+          i += 2;
+          while (i < t.length && !(t[i] === '*' && t[i + 1] === '/')) i += 1;
+          i += 2;
+        } else {
+          fuera += c;
+          i += 1;
+        }
+      }
+      return fuera;
+    };
+
+    /**
      * EL SQL DE UNA FUNCIÓN, leído de sus PLANTILLAS ETIQUETADAS y no de su texto.
      *
      * `decl.getText()` incluye comentarios y literales corrientes, así que un comentario que
@@ -232,13 +272,27 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * fallo que describe es el peor de todos: borrar el SQL de verdad y dejar el comentario que
      * lo explicaba mantiene la invariante en verde justo cuando la operación ha desaparecido.
      *
-     * Se recogen los `tx\`…\`` y equivalentes. Las plantillas anidadas dentro de un `${…}` se
-     * visitan por su cuenta al recorrer el árbol, así que no se pierden.
+     * Se recogen los `tx\`…\`` y equivalentes, y de cada uno se recompone su SQL a partir de los
+     * TROZOS LITERALES —la cabeza y lo que hay entre substituciones— con cada `${…}` sustituido
+     * por un testigo. Es lo que hace fiable mirar las comillas: una interpolación puede llevar
+     * un apóstrofo de JavaScript y ese apóstrofo no abre una cadena de SQL. Y se recompone en
+     * vez de leer los trozos por separado porque una sentencia puede tener un `${…}` en medio
+     * —la lista de columnas, sin ir más lejos— y partirla la dejaría a medias.
+     *
+     * Las plantillas anidadas dentro de un `${…}` se visitan por su cuenta al recorrer el árbol,
+     * así que no se pierden.
      */
+    const TESTIGO = ' :interpolado ';
     const sqlDe = (n: ts.Node): string[] => {
       const trozos: string[] = [];
       const ver = (x: ts.Node): void => {
-        if (ts.isTaggedTemplateExpression(x)) trozos.push(x.template.getText());
+        if (ts.isTaggedTemplateExpression(x)) {
+          const t = x.template;
+          const literales = ts.isNoSubstitutionTemplateLiteral(t)
+            ? [t.text]
+            : [t.head.text, ...t.templateSpans.map((sp) => sp.literal.text)];
+          trozos.push(sinComentariosSql(literales.join(TESTIGO)));
+        }
         ts.forEachChild(x, ver);
       };
       ver(n);
@@ -314,12 +368,100 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      */
     const CONTABILIDAD_AI = ['llamada_ai', 'propuesta_ai', 'evento_dominio'];
 
-    /** El conjunto «verbo tabla» alcanzable desde una función, siguiendo sus llamadas. */
-    const cacheDeEscrituras = new Map<string, Set<string>>();
-    const escriturasDesde = (modulo: string, funcion: string): Set<string> => {
+    /**
+     * LAS COLUMNAS que una sentencia escribe, para que la comparación no se quede en la tabla.
+     *
+     * Coincidir en «update outcome_review» no es hacer lo mismo: el escritor a mano podía
+     * quedarse con el veredicto y dejar de guardar las cuatro columnas de relato que la
+     * materialización escribe, y el censo seguiría en verde con la paridad ya rota. Lo señaló
+     * una revisión y se reprodujo antes de aceptarlo.
+     *
+     * De un `insert into t (…)` se toma su lista de columnas; de un `update t set a = …, b = …`,
+     * los destinos de las asignaciones, cortando en el primer `where`/`returning` de nivel cero.
+     * Las comas se parten sólo a profundidad cero de paréntesis y fuera de cadenas, que es lo que
+     * distingue `coalesce(a, b)` de dos columnas.
+     *
+     * Y sólo cuentan las columnas cuyo valor VIENE DE FUERA —un `${…}`, que aquí llega como
+     * testigo—, no las que la materialización fija con una constante. La distinción no es de
+     * comodidad: es la que hace la pregunta correcta. `materializarInsight` escribe
+     * `estado` con el literal `'propuesto'` y `crearInsight` lo deja a la base; medido, la
+     * columna es la ÚNICA diferencia de las siete capacidades, y no rompe ninguna paridad porque
+     * lo que el usuario no podría reproducir a mano es el CONTENIDO del modelo, no un valor fijo
+     * que el esquema puede poner igual. Exigirla habría obligado a escribir a mano una constante
+     * para poner verde un censo, que es la clase de arreglo que este PR existe para no hacer.
+     */
+    const columnasTrasLaTabla = (sql: string, desde: number, verbo: string): string[] => {
+      const resto = sql.slice(desde);
+      const partesDeNivelCero = (t: string): string[] => {
+        const partes: string[] = [];
+        let actual = '';
+        let hondo = 0;
+        let enCadena = false;
+        for (const c of t) {
+          if (enCadena) {
+            actual += c;
+            if (c === "'") enCadena = false;
+            continue;
+          }
+          if (c === "'") enCadena = true;
+          else if (c === '(') hondo += 1;
+          else if (c === ')') hondo -= 1;
+          else if (c === ',' && hondo === 0) {
+            partes.push(actual);
+            actual = '';
+            continue;
+          }
+          actual += c;
+        }
+        partes.push(actual);
+        return partes;
+      };
+      /** El grupo entre paréntesis que empieza en `abre`, sin los paréntesis. */
+      const grupo = (t: string, abre: number): string | null => {
+        let hondo = 0;
+        for (let i = abre; i < t.length; i++) {
+          if (t[i] === '(') hondo += 1;
+          else if (t[i] === ')') {
+            hondo -= 1;
+            if (hondo === 0) return t.slice(abre + 1, i);
+          }
+        }
+        return null;
+      };
+      if (verbo === 'insert into') {
+        const abre = resto.indexOf('(');
+        if (abre < 0) return [];
+        // Sólo cuenta si el paréntesis viene ANTES del values/select: si no, no hay lista.
+        if (/\b(values|select|default)\b/i.test(resto.slice(0, abre))) return [];
+        const lista = grupo(resto, abre);
+        if (lista === null) return [];
+        const columnas = partesDeNivelCero(lista)
+          .map((x) => x.trim().toLowerCase())
+          .filter((x) => /^[a-z_][a-z0-9_]*$/.test(x));
+        const values = /\bvalues\s*\(/i.exec(resto);
+        if (!values) return columnas; // `insert … select …`: sin pareja, se exigen todas.
+        const valores = grupo(resto, values.index + values[0].length - 1);
+        if (valores === null) return columnas;
+        const partes = partesDeNivelCero(valores);
+        if (partes.length !== columnas.length) return columnas;
+        return columnas.filter((_, i) => partes[i]!.includes(TESTIGO.trim()));
+      }
+      const set = /\bset\b/i.exec(resto);
+      if (!set) return [];
+      const cuerpo = resto.slice(set.index + set[0].length);
+      const fin = /\b(where|returning|from)\b/i.exec(cuerpo);
+      return partesDeNivelCero(fin ? cuerpo.slice(0, fin.index) : cuerpo)
+        .filter((x) => x.includes(TESTIGO.trim()))
+        .map((x) => /^\s*([a-z_][a-z0-9_]*)\s*=/i.exec(x)?.[1]?.toLowerCase() ?? '')
+        .filter((x) => x !== '');
+    };
+
+    /** Las escrituras «verbo tabla» alcanzables desde una función, con las columnas de cada una. */
+    const cacheDeEscrituras = new Map<string, Map<string, Set<string>>>();
+    const escriturasDesde = (modulo: string, funcion: string): Map<string, Set<string>> => {
       const memo = cacheDeEscrituras.get(`${modulo}#${funcion}`);
       if (memo) return memo;
-      const escrituras = new Set<string>();
+      const escrituras = new Map<string, Set<string>>();
       const visto = new Set<string>();
       const cola = [{ modulo, funcion }];
       while (cola.length > 0) {
@@ -338,9 +480,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           continue;
         }
         for (const sql of sqlDe(decl)) {
-          for (const [, verbo, tabla] of sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
-            if (CONTABILIDAD_AI.includes(tabla!)) continue;
-            escrituras.add(`${verbo!.toLowerCase().replace(/\s+/g, ' ')} ${tabla!}`);
+          for (const m of sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
+            const tabla = m[2]!;
+            if (CONTABILIDAD_AI.includes(tabla)) continue;
+            const verbo = m[1]!.toLowerCase().replace(/\s+/g, ' ');
+            const clave = `${verbo} ${tabla}`;
+            const columnas = escrituras.get(clave) ?? new Set<string>();
+            for (const c of columnasTrasLaTabla(sql, m.index + m[0].length, verbo)) columnas.add(c);
+            escrituras.set(clave, columnas);
           }
         }
         const imports = importesDe(arbol, actual.modulo);
@@ -372,7 +519,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
 
       // QUIÉN materializa esta capacidad: el que alcanza la tabla de su destino. No una lista.
       const suyos = materializadores.filter((m) =>
-        [...escriturasDesde(servicioAI, m)].some((e) => e.endsWith(` ${tabla}`)),
+        [...escriturasDesde(servicioAI, m).keys()].some((e) => e.endsWith(` ${tabla}`)),
       );
       expect(suyos, `no hay UN materializador que escriba «${tabla}»`).toHaveLength(1);
 
@@ -380,16 +527,33 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       expect(exigido.size, `${cap}: el materializador no escribe nada, no hay qué exigir`).toBeGreaterThan(0);
 
       if (def.paridadManual.clase !== 'escritura') continue;
-      const cubierto = new Set<string>();
+      const cubierto = new Map<string, Set<string>>();
       for (const paso of def.paridadManual.pasos) {
         const m = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
         expect(m, `${cap}: el módulo ${paso.modulo} no existe`).not.toBeNull();
-        for (const e of escriturasDesde(m!, paso.funcion)) cubierto.add(e);
+        for (const [e, cols] of escriturasDesde(m!, paso.funcion)) {
+          const acumulado = cubierto.get(e) ?? new Set<string>();
+          for (const c of cols) acumulado.add(c);
+          cubierto.set(e, acumulado);
+        }
       }
-      const faltan = [...exigido].filter((e) => !cubierto.has(e)).sort();
+      const secuencia = def.paridadManual.pasos.map((x) => x.funcion).join(' → ');
+      const faltan = [...exigido.keys()].filter((e) => !cubierto.has(e)).sort();
       expect(
         faltan,
-        `${cap}: la secuencia manual (${def.paridadManual.pasos.map((x) => x.funcion).join(' → ')}) no cubre lo que ${suyos[0]} escribe`,
+        `${cap}: la secuencia manual (${secuencia}) no cubre lo que ${suyos[0]} escribe`,
+      ).toEqual([]);
+
+      const columnasQueFaltan = [...exigido]
+        .flatMap(([e, cols]) =>
+          [...cols]
+            .filter((c) => !cubierto.get(e)!.has(c))
+            .map((c) => `${e}.${c}`),
+        )
+        .sort();
+      expect(
+        columnasQueFaltan,
+        `${cap}: la secuencia manual (${secuencia}) toca las mismas tablas que ${suyos[0]} pero no escribe todo lo que él escribe`,
       ).toEqual([]);
     }
   });

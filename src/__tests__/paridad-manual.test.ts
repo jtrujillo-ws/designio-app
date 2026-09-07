@@ -66,6 +66,45 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     return arbol;
   };
 
+  /**
+   * LOS NOMBRES QUE UN MÓDULO EXPORTA, en las cuatro formas en que este repositorio los escribe.
+   *
+   * La primera versión sólo reconocía `export function`, y una revisión señaló el efecto: una
+   * puerta manual escrita como `export const` o re-exportada habría puesto el censo rojo siendo
+   * válida. No hay hoy ninguna así entre las siete —lo comprobé—, así que era preventivo; pero un
+   * censo que impone un estilo de export mide otra cosa que la que dice medir, y encima este
+   * fichero se contradecía solo: el grafo de llamadas de abajo SÍ acepta `const f = …`.
+   *
+   * `export * from` se sigue hasta el módulo de origen: sin eso, un re-export completo se leería
+   * como «no exporta nada» y volvería el mismo falso negativo por otra puerta.
+   */
+  const exportadasDe = (f: string, vistos = new Set<string>()): Set<string> => {
+    const nombres = new Set<string>();
+    if (vistos.has(f)) return nombres; // Ciclo de re-exports: no se cuelga, se corta.
+    vistos.add(f);
+    for (const st of leer(f).statements) {
+      const exportado = (n: ts.Node): boolean =>
+        (n as { modifiers?: ts.NodeArray<ts.ModifierLike> }).modifiers?.some(
+          (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+        ) ?? false;
+      if (ts.isFunctionDeclaration(st) && st.name && exportado(st)) nombres.add(st.name.text);
+      else if (ts.isVariableStatement(st) && exportado(st)) {
+        for (const d of st.declarationList.declarations) {
+          if (ts.isIdentifier(d.name)) nombres.add(d.name.text);
+        }
+      } else if (ts.isExportDeclaration(st)) {
+        if (st.exportClause && ts.isNamedExports(st.exportClause)) {
+          // `export { x }` y `export { x as y }`: cuenta el nombre con el que SALE.
+          for (const e of st.exportClause.elements) nombres.add(e.name.text);
+        } else if (!st.exportClause && st.moduleSpecifier) {
+          const origen = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+          if (origen) for (const n of exportadasDe(origen, vistos)) nombres.add(n);
+        }
+      }
+    }
+    return nombres;
+  };
+
   it('cada capacidad declara su paridad, y la clase concuerda con el destino', () => {
     // Que el censo mire las nueve y no una lista suya: derivado del registro.
     expect(CAPACIDADES_ACTIVAS.length, 'el registro salió vacío').toBeGreaterThan(5);
@@ -95,14 +134,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       const modulo = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paridad.modulo);
       expect(modulo, `${cap}: el módulo ${paridad.modulo} no existe`).not.toBeNull();
 
-      const exportadas = new Set<string>();
-      for (const st of leer(modulo!).statements) {
-        if (!ts.isFunctionDeclaration(st) || !st.name) continue;
-        const exportada = st.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
-        if (exportada) exportadas.add(st.name.text);
-      }
       expect(
-        [...exportadas].includes(paridad.funcion),
+        [...exportadasDe(modulo!)].includes(paridad.funcion),
         `${cap}: ${paridad.modulo} no exporta ${paridad.funcion}`,
       ).toBe(true);
     }

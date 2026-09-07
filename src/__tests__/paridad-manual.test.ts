@@ -295,12 +295,23 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
     const mirar = (n: ts.Node): void => {
       /*
-       * LAS DOS FRONTERAS que un `var` no cruza hacia fuera: una función y un bloque estático
-       * de clase. Un bloque estático NO es function-like, así que este barrido se metía dentro
-       * y apuntaba sus `var` como ligaduras de la función o del fichero de alrededor: una
-       * llamada legítima al import con ese nombre se descartaba. ROJO SOBRE CÓDIGO QUE FUNCIONA.
+       * LAS TRES FRONTERAS que un `var` no cruza hacia fuera: una función, un bloque estático de
+       * clase y el cuerpo de un `namespace` —que al compilar es una IIFE—. Ninguna de las dos
+       * últimas es function-like, así que este barrido se metía dentro y apuntaba sus `var` como
+       * ligaduras de la función o del fichero de alrededor: una llamada legítima al import con
+       * ese nombre se descartaba. ROJO SOBRE CÓDIGO QUE FUNCIONA.
+       *
+       * La del `namespace` la encontré yo repasando esta lista después de haberla declarado
+       * completa en la ronda anterior. No lo estaba. Que la encontrara el repaso y no la ronda
+       * siguiente es la única diferencia que tengo a favor.
        */
-      if (ts.isFunctionLike(n) || ts.isClassStaticBlockDeclaration(n)) return;
+      if (
+        ts.isFunctionLike(n) ||
+        ts.isClassStaticBlockDeclaration(n) ||
+        ts.isModuleBlock(n)
+      ) {
+        return;
+      }
       /*
        * Y LAS DOS FORMAS de declarar a ámbito de función: la sentencia de variable y la cabecera
        * de un `for`/`for…of`/`for…in`. Sólo se leía la primera, así que tras un
@@ -357,9 +368,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * invocación manual de verdad: ROJO SOBRE CÓDIGO QUE FUNCIONA, y regresión de mi propio
        * arreglo de la ronda anterior. Por eso se mira POR QUÉ HIJO se ha subido.
        */
-      // Y dentro de un bloque estático, sus propios `var` SÍ ligan: es su ámbito.
+      // Y dentro de un bloque estático o de un `namespace`, sus propios `var` SÍ ligan.
       if (ts.isClassStaticBlockDeclaration(a)) {
         const v = varsDe(a.body).get(nombre);
+        if (v !== undefined) return v;
+      }
+      if (ts.isModuleBlock(a)) {
+        const v = varsDe(a).get(nombre);
         if (v !== undefined) return v;
       }
       const cuerpo = cuerpoDeLaFuncion(a);

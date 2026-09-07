@@ -330,8 +330,16 @@ export type LoteCapacidad = {
  * censo que mirase un solo fichero la habría dado por incumplida.
  */
 export type ParidadManual =
-  /** La capacidad materializa un objeto, y esta es la puerta por la que se crea sin AI. */
-  | { clase: 'escritura'; modulo: string; funcion: string }
+  /**
+   * La capacidad materializa algo, y estos son los pasos por los que se hace sin AI.
+   *
+   * Es una SECUENCIA y no una puerta, y eso lo corrigió una revisión: materializar C2 escribe el
+   * insight y además sus afirmaciones, sus citas y sus contradicciones, y a mano eso son cuatro
+   * acciones. Declarando sólo la primera, borrar `agregarCita` habría dejado la invariante verde
+   * con la paridad ya rota. El censo deriva del materializador QUÉ hay que cubrir y comprueba que
+   * los pasos, juntos, lo cubren.
+   */
+  | { clase: 'escritura'; pasos: readonly { modulo: string; funcion: string }[] }
   /**
    * O la capacidad es INFORMATIVA y no materializa nada, así que no hay escritura que replicar.
    * Se declara con su porqué en vez de omitirse: la diferencia entre «no hace falta» y «se nos
@@ -489,7 +497,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * ítem de la bandeja inserta `item_importacion`, no evidencia. Lo que CI propone es la
      * EXTRACCIÓN, y a mano eso es curar el ítem y aprobarlo — ahí nace la evidencia.
      */
-    paridadManual: { clase: 'escritura', modulo: '@/lib/evidencia/evidencia.servicio', funcion: 'aprobarItem' },
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/evidencia/evidencia.servicio', funcion: 'aprobarItem' }] },
     ancla: {
       columna: 'item_id',
       etiqueta: 'Item de la bandeja',
@@ -511,7 +519,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C0: {
     etiqueta: 'Borrador de reto → criterio de éxito',
     destino: 'criterio-exito',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/metodo/metodo.servicio', funcion: 'agregarCriterio' },
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/metodo/metodo.servicio', funcion: 'agregarCriterio' }] },
     ancla: {
       columna: 'reto_id',
       etiqueta: 'Reto con criterios abiertos',
@@ -584,7 +592,15 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C2: {
     etiqueta: 'Insights del reto → insight con afirmaciones citadas',
     destino: 'insight',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/insight/insight.servicio', funcion: 'crearInsight' },
+    paridadManual: {
+      clase: 'escritura',
+      pasos: [
+        { modulo: '@/lib/insight/insight.servicio', funcion: 'crearInsight' },
+        { modulo: '@/lib/insight/insight.servicio', funcion: 'agregarAfirmacion' },
+        { modulo: '@/lib/insight/insight.servicio', funcion: 'agregarCita' },
+        { modulo: '@/lib/insight/insight.servicio', funcion: 'registrarContradiccion' },
+      ],
+    },
     /*
      * El RETO, la misma columna que C0. C2 es la primera capacidad que COMPARTE ancla, y eso
      * es lo que el registro anticipaba: dos capacidades pueden colgar del mismo objeto y no
@@ -684,7 +700,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C6: {
     etiqueta: 'Borrador del Metric Registry → entrada KPI',
     destino: 'entrada-kpi',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/medicion/medicion.servicio', funcion: 'agregarEntrada' },
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/medicion/medicion.servicio', funcion: 'agregarEntrada' }] },
     /*
      * El REGISTRY, y no el reto, aunque el material salga del reto. `entrada_kpi.registry_id`
      * es NOT NULL, así que una propuesta anclada en el reto no sabría en qué registry
@@ -734,7 +750,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
      * —`update outcome_review`, igual que esta función—. La paridad se empareja con lo que la
      * capacidad PRODUCE, no con lo que abre el expediente donde se guarda.
      */
-    paridadManual: { clase: 'escritura', modulo: '@/lib/medicion/medicion.servicio', funcion: 'guardarBorradorReview' },
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/medicion/medicion.servicio', funcion: 'guardarBorradorReview' }] },
     /*
      * EL POST MORTEM EN BORRADOR, y no el reto, por lo mismo que C6 se ancla en el registry: la
      * fila tiene que existir para que haya dónde materializar, y la política que la crea es la
@@ -789,7 +805,13 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C3: {
     etiqueta: 'Oportunidades del reto → pregunta HMW trazada a insights',
     destino: 'oportunidad',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/servicio/oportunidad.servicio', funcion: 'crearOportunidad' },
+    paridadManual: {
+      clase: 'escritura',
+      pasos: [
+        { modulo: '@/lib/servicio/oportunidad.servicio', funcion: 'crearOportunidad' },
+        { modulo: '@/lib/servicio/oportunidad.servicio', funcion: 'enlazarInsight' },
+      ],
+    },
     /*
      * El RETO, la TERCERA capacidad que comparte esta columna —con C0 y C2—. Que sean tres y
      * no dos importa poco por sí mismo; lo que importa es que ninguna de las tres comparte
@@ -848,7 +870,7 @@ export const CAPACIDADES: Record<CapacidadActiva, DefinicionCapacidad> = {
   C4: {
     etiqueta: 'Concepto × arquetipos → revisión simulada y preguntas de test',
     destino: 'revision-simulada',
-    paridadManual: { clase: 'escritura', modulo: '@/lib/metodo/gobernanza.servicio', funcion: 'escribirRevisionAMano' },
+    paridadManual: { clase: 'escritura', pasos: [{ modulo: '@/lib/metodo/gobernanza.servicio', funcion: 'escribirRevisionAMano' }] },
     /*
      * EL CONCEPTO, y no el reto aunque los arquetipos sean del reto.
      *

@@ -51,7 +51,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     return existsSync(base) ? base : null;
   };
 
+  /*
+   * El parseo se memoiza porque este censo lee los mismos ficheros muchas veces: siete
+   * capacidades por siete materializadores son cuarenta y nueve recorridos, y sin memoria la
+   * suite se pasaba de tiempo. Es caché de lectura, no de resultado: lo que se guarda es el
+   * árbol de un fichero que no cambia durante la corrida.
+   */
+  const arboles = new Map<string, ts.SourceFile>();
   const leer = (f: string): ts.SourceFile => {
+    const guardado = arboles.get(f);
+    if (guardado) return guardado;
     const arbol = ts.createSourceFile(
       f,
       readFileSync(f, 'utf8'),
@@ -63,6 +72,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     // mirado el fichero donde estuviera la escritura.
     const diagnosticos = (arbol as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
     expect(diagnosticos ?? [], `${f} no parsea limpio`).toHaveLength(0);
+    arboles.set(f, arbol);
     return arbol;
   };
 
@@ -131,42 +141,44 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     for (const cap of conEscritura) {
       const paridad = CAPACIDADES[cap].paridadManual;
       if (paridad.clase !== 'escritura') continue;
-      const modulo = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paridad.modulo);
-      expect(modulo, `${cap}: el módulo ${paridad.modulo} no existe`).not.toBeNull();
-
-      expect(
-        [...exportadasDe(modulo!)].includes(paridad.funcion),
-        `${cap}: ${paridad.modulo} no exporta ${paridad.funcion}`,
-      ).toBe(true);
+      // Una secuencia vacía sería «no hay puerta» disfrazado de declaración cumplida.
+      expect(paridad.pasos.length, `${cap} declara escritura sin un solo paso`).toBeGreaterThan(0);
+      for (const paso of paridad.pasos) {
+        const modulo = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
+        expect(modulo, `${cap}: el módulo ${paso.modulo} no existe`).not.toBeNull();
+        expect(
+          [...exportadasDe(modulo!)].includes(paso.funcion),
+          `${cap}: ${paso.modulo} no exporta ${paso.funcion}`,
+        ).toBe(true);
+      }
     }
   });
 
   /**
-   * Y LA MITAD QUE DE VERDAD CUESTA: que ESA FUNCIÓN escriba el destino.
+   * Y LA MITAD QUE DE VERDAD CUESTA: que la SECUENCIA manual cubra lo que la materialización hace.
    *
-   * La primera versión de esta sonda sembraba el recorrido en el MÓDULO y no en la función
-   * declarada, y una revisión la tumbó con dos falsos positivos de este mismo PR:
+   * Esta sonda ha fallado tres veces contra sí misma, y cada corrección la acercó a lo que RF-08.6
+   * pide de verdad. Vale la pena dejar las tres escritas, porque son la misma clase de error:
    *
-   *  · CI declaraba `crearItem`, que inserta `item_importacion`. El `insert into evidencia` está
-   *    en `aprobarItem`, otra función del mismo fichero. El censo lo daba por bueno.
-   *  · C7 declaraba `abrirOutcomeReview`, que abre la fila vacía. Lo que C7 materializa es el
-   *    BORRADOR, con un `update outcome_review` — y eso lo hace `guardarBorradorReview`.
+   *  1. Sembraba en el MÓDULO, no en la función declarada. CI declaraba `crearItem` —que inserta
+   *     `item_importacion`— y pasaba porque `aprobarItem`, en el mismo fichero, escribe evidencia.
+   *  2. Admitía «insert **o** update» sobre la tabla. C7 declaraba `abrirOutcomeReview`, que abre
+   *     la fila vacía, y pasaba porque INSERTA — mientras la materialización hace un `update`.
+   *  3. Y se daba por satisfecha con la escritura RAÍZ. C2 declaraba sólo `crearInsight`, cuando
+   *     materializar un insight escribe además sus afirmaciones, sus citas y sus contradicciones:
+   *     borrar `agregarCita` dejaba esto verde con la paridad ya rota.
    *
-   * O sea que el censo comprobaba que en algún punto del grafo alguien escribía la tabla, que es
-   * casi siempre cierto y no dice nada: borrar la acción manual de verdad lo habría dejado verde.
-   * Un censo que no puede fallar es peor que no tenerlo, porque además tranquiliza.
+   * Las tres veces el censo comprobaba algo casi siempre cierto, que es la forma que tiene un
+   * censo de no servir. Lo que se exige ahora se DERIVA del materializador: qué tablas escribe y
+   * con qué verbo, siguiendo sus llamadas. La secuencia declarada tiene que cubrir ese conjunto.
    *
-   * Ahora se recorre el grafo de LLAMADAS desde la función declarada: su cuerpo, y de ahí a lo
-   * que llama —local o importado— hasta encontrar la escritura. Sigue haciendo falta seguir el
-   * grafo, y por el motivo de siempre: `escribirRevisionAMano` no escribe, delega en el escritor
-   * que comparte con la materialización, que es como debe ser.
-   *
-   * Y la escritura es INSERT **o** UPDATE, porque materializar no siempre es crear una fila:
-   * C7 rellena una que ya existe, exactamente igual que su ruta manual. Exigir un insert habría
-   * declarado incumplida la paridad mejor emparejada de las siete.
+   * Nada de esto se escribe a mano. Ni qué materializa cada capacidad —se busca el materializador
+   * que alcanza la tabla del destino—, ni qué escribe, ni con qué verbo.
    */
-  it('desde esa puerta se alcanza la escritura del destino, siguiendo el grafo', () => {
-    /** Las funciones declaradas en un fichero, por nombre: `function f()` y `const f = () => {}`. */
+  it('la secuencia manual cubre todo lo que la materialización escribe', () => {
+    const servicioAI = `${raiz}/src/lib/ai/ai.servicio.ts`;
+
+    /** Las funciones de un fichero por nombre: `function f()` y `const f = …`. */
     const funcionesDe = (arbol: ts.SourceFile): Map<string, ts.Node> => {
       const m = new Map<string, ts.Node>();
       for (const st of arbol.statements) {
@@ -180,7 +192,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return m;
     };
 
-    /** Qué nombre viene de qué módulo, para saltar de un fichero a otro por la llamada. */
+    /** Qué nombre viene de qué módulo, para saltar de fichero por la llamada. */
     const importesDe = (arbol: ts.SourceFile, f: string): Map<string, string> => {
       const m = new Map<string, string>();
       for (const st of arbol.statements) {
@@ -188,15 +200,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
         if (!destino) continue;
         const b = st.importClause?.namedBindings;
-        if (b && ts.isNamedImports(b)) {
-          for (const e of b.elements) if (!e.isTypeOnly) m.set(e.name.text, destino);
-        }
+        if (b && ts.isNamedImports(b)) for (const e of b.elements) if (!e.isTypeOnly) m.set(e.name.text, destino);
         if (st.importClause?.name) m.set(st.importClause.name.text, destino);
       }
       return m;
     };
 
-    /** Los nombres que un cuerpo LLAMA, que es por donde sigue el grafo. */
     const llamadasEn = (n: ts.Node): string[] => {
       const nombres: string[] = [];
       const ver = (x: ts.Node): void => {
@@ -210,94 +219,89 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       return nombres;
     };
 
-    /**
-     * EL VERBO NO SE ELIGE: se deriva de cómo materializa la propia capa AI.
+    /*
+     * LAS TABLAS DE LA PROPIA CAPA AI, que no tienen equivalente manual por definición.
      *
-     * Primero puse «insert **o** update», y la revisión que trajo este arreglo tenía razón en más
-     * de lo que dijo: con esa laxitud, `abrirOutcomeReview` —que abre la fila vacía— seguía
-     * pasando como paridad de C7, porque INSERTA la tabla. Lo comprobé neutralizando: verde.
-     * Arreglé la declaración y la sonda seguía sin poder cazarla.
+     * `llamada_ai` y `propuesta_ai` son la contabilidad del pipeline: sin AI no hay llamada que
+     * anotar ni propuesta que decidir. `evento_dominio` es la traza, y la escribe quien actúe —
+     * exigir que las dos rutas escriban los mismos eventos no es lo que RF-08.6 pide.
      *
-     * La paridad que RF-08.6 pide es de FLUJO EQUIVALENTE, así que lo que hay que exigir es que
-     * la puerta manual haga la misma clase de escritura que hace la materialización. Y eso no se
-     * escribe a mano: se lee de `ai.servicio.ts`. Seis destinos se materializan con `insert into`
-     * y `outcome_review` con `update`, que es justo la asimetría que se me escapó.
-     *
-     * Si algún día hubiera dos verbos distintos sobre la misma tabla, la derivación deja de ser
-     * unívoca y esta sonda lo dice en vez de elegir uno.
+     * Es la única lista escrita a mano de esta sonda, así que se comprueba abajo que ninguna de
+     * ellas sea la tabla de un destino: una exclusión que tapara un destino haría verde justo lo
+     * que este censo existe para ver.
      */
-    const verboDeMaterializacion = (tabla: string): string => {
-      const servicio = readFileSync(`${raiz}/src/lib/ai/ai.servicio.ts`, 'utf8');
-      const hallados = [
-        ...new Set(
-          [...servicio.matchAll(new RegExp(`(insert\\s+into|update)\\s+${tabla}\\b`, 'gi'))].map((m) =>
-            m[1]!.toLowerCase().replace(/\\s+/g, ' '),
-          ),
-        ),
-      ];
-      expect(
-        hallados,
-        `la materialización de «${tabla}» no se pudo derivar sin ambigüedad de ai.servicio.ts`,
-      ).toHaveLength(1);
-      return hallados[0]!;
-    };
+    const CONTABILIDAD_AI = ['llamada_ai', 'propuesta_ai', 'evento_dominio'];
 
-    const escribe = (texto: string, tabla: string, verbo: string): boolean =>
-      new RegExp(`${verbo.replace(' ', '\\s+')}\\s+${tabla}\\b`, 'i').test(texto);
-
-    let masLargo = 0;
-    for (const cap of CAPACIDADES_ACTIVAS) {
-      const def = CAPACIDADES[cap];
-      if (def.paridadManual.clase !== 'escritura' || def.destino === null) continue;
-      const tabla = tablaDelDestino(def.destino);
-      const verbo = verboDeMaterializacion(tabla);
-      const entrada = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, def.paridadManual.modulo);
-      expect(entrada, `${cap}: módulo irresoluble`).not.toBeNull();
-
+    /** El conjunto «verbo tabla» alcanzable desde una función, siguiendo sus llamadas. */
+    const cacheDeEscrituras = new Map<string, Set<string>>();
+    const escriturasDesde = (modulo: string, funcion: string): Set<string> => {
+      const memo = cacheDeEscrituras.get(`${modulo}#${funcion}`);
+      if (memo) return memo;
+      const escrituras = new Set<string>();
       const visto = new Set<string>();
-      const cola: { modulo: string; funcion: string }[] = [
-        { modulo: entrada!, funcion: def.paridadManual.funcion },
-      ];
-      let alcanza = false;
-      let pasos = 0;
-      while (cola.length > 0 && !alcanza) {
-        const { modulo, funcion } = cola.shift()!;
-        const clave = `${modulo}#${funcion}`;
+      const cola = [{ modulo, funcion }];
+      while (cola.length > 0) {
+        const actual = cola.shift()!;
+        const clave = `${actual.modulo}#${actual.funcion}`;
         if (visto.has(clave)) continue;
         visto.add(clave);
-        const arbol = leer(modulo);
-        const decl = funcionesDe(arbol).get(funcion);
-        // Un nombre que no resuelve a una función de este repositorio no es un fallo: puede ser
-        // un helper de una librería. Simplemente no hay por dónde seguir por ahí.
+        const arbol = leer(actual.modulo);
+        const decl = funcionesDe(arbol).get(actual.funcion);
+        // Un nombre que no resuelve a una función de este repositorio no es un fallo: puede venir
+        // de una librería. Simplemente no hay por dónde seguir por ahí.
         if (!decl) continue;
-        pasos += 1;
-        if (escribe(decl.getText(), tabla, verbo)) {
-          alcanza = true;
-          break;
+        const texto = decl.getText();
+        for (const [, verbo, tabla] of texto.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
+          if (CONTABILIDAD_AI.includes(tabla!)) continue;
+          escrituras.add(`${verbo!.toLowerCase().replace(/\s+/g, ' ')} ${tabla!}`);
         }
-        const imports = importesDe(arbol, modulo);
+        const imports = importesDe(arbol, actual.modulo);
         const locales = funcionesDe(arbol);
         for (const nombre of llamadasEn(decl)) {
           if (imports.has(nombre)) cola.push({ modulo: imports.get(nombre)!, funcion: nombre });
-          else if (locales.has(nombre)) cola.push({ modulo, funcion: nombre });
+          else if (locales.has(nombre)) cola.push({ modulo: actual.modulo, funcion: nombre });
         }
       }
-      masLargo = Math.max(masLargo, pasos);
-      expect(
-        alcanza,
-        `${cap}: desde ${def.paridadManual.modulo}#${def.paridadManual.funcion} no se alcanza «${verbo} ${tabla}» —el mismo verbo con el que la capa AI lo materializa— por ninguna llamada`,
-      ).toBe(true);
-    }
+      cacheDeEscrituras.set(`${modulo}#${funcion}`, escrituras);
+      return escrituras;
+    };
 
-    /*
-     * Que el recorrido haya SALTADO de una función a otra en algún caso, o esto no estaría
-     * probando que sepa seguir llamadas y un resolutor roto pasaría con todo verde. C4 es la que
-     * lo obliga: `escribirRevisionAMano` delega en el escritor que comparte con la
-     * materialización, y es el caso por el que este grafo existe en vez de leer un cuerpo.
-     */
-    expect(
-      masLargo,
-      'ninguna paridad necesitó saltar de una función a otra: el grafo de llamadas no se ejercita',
-    ).toBeGreaterThan(1);
+    // Los materializadores, derivados del fichero y no de una lista: `materializarAlgo`.
+    const materializadores = [...funcionesDe(leer(servicioAI)).keys()].filter((n) =>
+      /^materializar[A-Z]/.test(n),
+    );
+    expect(materializadores.length, 'no se encontró ningún materializador').toBeGreaterThan(3);
+
+    const conDestino = CAPACIDADES_ACTIVAS.filter((c) => CAPACIDADES[c].destino !== null);
+    for (const cap of conDestino) {
+      const def = CAPACIDADES[cap];
+      const tabla = tablaDelDestino(def.destino!);
+      expect(
+        CONTABILIDAD_AI.includes(tabla),
+        `la exclusión de contabilidad AI tapa «${tabla}», que es el destino de ${cap}`,
+      ).toBe(false);
+
+      // QUIÉN materializa esta capacidad: el que alcanza la tabla de su destino. No una lista.
+      const suyos = materializadores.filter((m) =>
+        [...escriturasDesde(servicioAI, m)].some((e) => e.endsWith(` ${tabla}`)),
+      );
+      expect(suyos, `no hay UN materializador que escriba «${tabla}»`).toHaveLength(1);
+
+      const exigido = escriturasDesde(servicioAI, suyos[0]!);
+      expect(exigido.size, `${cap}: el materializador no escribe nada, no hay qué exigir`).toBeGreaterThan(0);
+
+      if (def.paridadManual.clase !== 'escritura') continue;
+      const cubierto = new Set<string>();
+      for (const paso of def.paridadManual.pasos) {
+        const m = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
+        expect(m, `${cap}: el módulo ${paso.modulo} no existe`).not.toBeNull();
+        for (const e of escriturasDesde(m!, paso.funcion)) cubierto.add(e);
+      }
+      const faltan = [...exigido].filter((e) => !cubierto.has(e)).sort();
+      expect(
+        faltan,
+        `${cap}: la secuencia manual (${def.paridadManual.pasos.map((x) => x.funcion).join(' → ')}) no cubre lo que ${suyos[0]} escribe`,
+      ).toEqual([]);
+    }
   });
 });

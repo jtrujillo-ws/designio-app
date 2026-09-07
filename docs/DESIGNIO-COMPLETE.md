@@ -1812,7 +1812,7 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
 | `ai.degradacion.ts` | Módulo puro: política de modelos, tope de respaldo, intentos por generación, tarifas, vocabulario de desenlaces, clasificación de fallos por forma (status/name), `evaluarCapacidadAI` (nunca lanza), `formatearCosteUsd` y `formatearTasa` (un valor distinto de cero nunca se presenta como cero) |
 | `proveedor.server.ts` | Adaptador del SDK: **no lanza nunca**, timeout duro, `maxRetries: 0`, una degradación por operación, uso medido (tokens y costo) por intento, `credencialesAI` (BYOAI: hoy solo entorno) |
 | `ai.servicio.ts` | Orquestación: rol curador, presupuesto sobre `llamada_ai`, reserva, libro anticipado, materiales por capacidad, validación de ids contra el material, revisión y materialización |
-| `ai.functions.ts` | Server functions: panel, generar, aceptar, rechazar, registrar consentimiento, observabilidad del workspace |
+| `ai.functions.ts` | Server functions: panel, generar, aceptar, rechazar, registrar consentimiento, observabilidad del workspace, informe de grounding (GET) y correr una eval (POST) |
 | `ai.observabilidad.ts` | Lector de RF-08.9: coste, latencia p50/p95, tasas de error y aceptación por capacidad, sobre `llamada_ai` y `propuesta_ai`, con `reservaSigueViva` compartido con el presupuesto; cerrado a `ROLES_OBSERVABILIDAD_AI` |
 | `ai.roles.ts` | Puertas de rol de la capa AI sin Zod (`ROLES_OBSERVABILIDAD_AI`, `ROLES_INFORME_GROUNDING`), para que el lateral no arrastre el contrato AI (censo del grafo de módulos en la suite) |
 | `ai.evals.ts` | Corrida y lectura de las evals de grounding (RF-08.7): cuatro métricas calculadas desde la base sobre el payload de lo aceptado, filtradas por `PROMPT_VERSION`, con `sin_veredicto` guardado; informe con la corrida anterior y la última de otra versión; `CAPACIDADES_CON_AFIRMACIONES` derivada del registro |
@@ -1846,9 +1846,12 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
 
 Lo que hoy se mide y muestra es la **presencia literal** de cada cita en el material que el modelo
 vio (por documento en C2, por insight en C3). No es un juicio de que la cita **sostenga** la afirmación: ese juicio es
-el acto humano de aceptar y firmar (SYS-19), y así se llama en el panel. Las evaluaciones periódicas
-de grounding con línea base y regresión (RF-08.7, RF-09.10) están diseñadas y no construidas; la
-tasa de corrección humana ya se puede derivar de `contenido` vs `contenido_original`.
+el acto humano de aceptar y firmar (SYS-19), y así se llama en el panel. Las evaluaciones de
+grounding (RF-08.7, RF-09.10) se corren **a demanda** y se guardan por versión de prompt desde #53
+(cuatro métricas deterministas, entre ellas la tasa de corrección humana derivada de `contenido` vs
+`contenido_original`, comparadas contra la corrida anterior y contra otra versión; ver `10`); lo que
+falta es la corrida **periódica** (sin planificador) y la fidelidad semántica de citas, declarada y
+no medida.
 
 ---
 
@@ -1987,7 +1990,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-07. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -2207,7 +2210,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I3 / SYS-14 | Cinco dimensiones; derechos restringen aguas abajo | `dimensiones` jsonb validado; `evidencia_citable` en toda superficie; `derecho_uso` | Construido |
 | I3 / SYS-15 | Insight validado con ≥1 cita; arquetipo con evidencia en G2; oportunidad con ≥1 insight en G3 | `insight_validar_guard` exige cita por cada afirmación **no hipótesis**, así que un insight solo de hipótesis se valida sin citas; `arquetipo_evidencia` + G2; G3 sobre `oportunidad_insight`; en C3 la traza se deriva de las citas (≥1 cita ⇒ ≥1 insight) | **Parcial** (insight): la regla es por afirmación, no por insight |
 | I3 / SYS-16 | Nada entra al grafo sin curaduría | `item_update_curaduria`; la extracción CI produce propuestas, no evidencia | Construido |
-| I3 / SYS-17 | Grounding medido; propuesta original conservada | `contenido_original`; presencia literal; evals periódicas pendientes | **Parcial** |
+| I3 / SYS-17 | Grounding medido; propuesta original conservada | `contenido_original`; presencia literal; corridas de evals guardadas y comparadas (`corrida_eval`, `medicion_eval`, #53); falta la corrida periódica y la fidelidad semántica de citas | **Parcial** |
 | I4 / SYS-18 | `agente-ai` sin aprobar ni publicar | Rol no invitable, ausente de todo predicado de escritura; CT sin destino | Construido |
 | I4 / SYS-19 | Toda escritura AI pasa por PropuestaAI con lineage | `propuesta_ai` + guard de materialización diferido; `propuesta_ai_id` en destinos | Construido |
 | I4 / SYS-20 | Revisores AI etiquetados, no evidencia, no cuentan en G4/G5 | `es_simulacion` con CHECK y sin UPDATE en las cuatro tablas de C4; `checklist_item` sin columna donde citar una revisión (censo en la suite); `unique (concepto_id, arquetipo_id)`; `sin_agregado_sintetico()` en base y contrato | Construido (#48) |

@@ -133,14 +133,50 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     return false;
   };
 
+  /*
+   * Y NO SÓLO UN `if`: LO QUE CORTOCIRCUITA TAMPOCO SE EJECUTA. Esta lectura sólo miraba
+   * sentencias de control, así que `onEnviar={() => false && definirCriterio(…)}` —o un
+   * `true ? viejo() : nuevo()`— contaba como invocación viva: quitar la llamada de verdad
+   * dejaba la invariante de pantallas en verde. Las cuatro formas que cortocircuitan en este
+   * lenguaje son `&&`, `||`, `??` y `?:`, y se leen aquí las cuatro; dejar una fuera es
+   * exactamente el hallazgo que ha vuelto ronda tras ronda.
+   *
+   * Sigue SIN plegar constantes —nada de seguir un `const MUERTO = false`—: se lee la palabra
+   * clave y como mucho se le quitan los paréntesis. Decidir qué es constante es por donde este
+   * censo empezaría a poner en rojo código intacto, y ése es el modo de fallo caro.
+   */
   const ramaMuerta = (x: ts.Node): ts.Node | null => {
+    const literal = (e: ts.Expression): boolean | null => {
+      let c: ts.Expression = e;
+      while (ts.isParenthesizedExpression(c)) c = c.expression;
+      if (c.kind === ts.SyntaxKind.TrueKeyword) return true;
+      if (c.kind === ts.SyntaxKind.FalseKeyword) return false;
+      return null;
+    };
     if (ts.isIfStatement(x)) {
-      if (x.expression.kind === ts.SyntaxKind.FalseKeyword) return x.thenStatement;
-      if (x.expression.kind === ts.SyntaxKind.TrueKeyword) return x.elseStatement ?? null;
+      const v = literal(x.expression);
+      if (v === false) return x.thenStatement;
+      if (v === true) return x.elseStatement ?? null;
       return null;
     }
-    if (ts.isWhileStatement(x) && x.expression.kind === ts.SyntaxKind.FalseKeyword) {
-      return x.statement;
+    if (ts.isWhileStatement(x)) {
+      return literal(x.expression) === false ? x.statement : null;
+    }
+    if (ts.isConditionalExpression(x)) {
+      const v = literal(x.condition);
+      if (v === false) return x.whenTrue;
+      if (v === true) return x.whenFalse;
+      return null;
+    }
+    if (ts.isBinaryExpression(x)) {
+      const v = literal(x.left);
+      if (v === null) return null;
+      const op = x.operatorToken.kind;
+      if (op === ts.SyntaxKind.AmpersandAmpersandToken) return v === false ? x.right : null;
+      if (op === ts.SyntaxKind.BarBarToken) return v === true ? x.right : null;
+      // `true ?? f()` y `false ?? f()`: un literal nunca es nullish, así que la derecha no corre.
+      if (op === ts.SyntaxKind.QuestionQuestionToken) return x.right;
+      return null;
     }
     return null;
   };
@@ -168,6 +204,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           if (ligaEsteNombre(p.name, nombre)) return p;
         }
       }
+      // Y una clase-expresión con nombre se liga a sí misma, igual que la función de arriba.
+      if (ts.isClassExpression(a) && a.name?.text === nombre) return a;
       if (ts.isBlock(a) || ts.isSourceFile(a)) {
         for (const st of a.statements) {
           /*
@@ -179,6 +217,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * dos lecturas del mismo concepto que no decían lo mismo.
            */
           if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
+          /*
+           * Y UNA `class` LIGA IGUAL QUE UNA `function`. Faltaba el tercer modo de declarar un
+           * nombre: una pantalla que importe `* as metodo` y declare dentro una
+           * `class metodo { static definirCriterio() {} }` llama a la clase, y la llamada se le
+           * acreditaba al import; borrar la invocación manual de verdad dejaba la invariante en
+           * verde. La misma copia sin actualizar de siempre, un tipo de sentencia más allá.
+           */
+          if (ts.isClassDeclaration(st) && st.name?.text === nombre) return st;
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
             if (ligaEsteNombre(d.name, nombre)) return d;

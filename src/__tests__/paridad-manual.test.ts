@@ -193,15 +193,33 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /** Qué nombre viene de qué módulo, para saltar de fichero por la llamada. */
-    const importesDe = (arbol: ts.SourceFile, f: string): Map<string, string> => {
-      const m = new Map<string, string>();
+    const importesDe = (
+      arbol: ts.SourceFile,
+      f: string,
+    ): Map<string, { modulo: string; original: string }> => {
+      const m = new Map<string, { modulo: string; original: string }>();
       for (const st of arbol.statements) {
         if (!ts.isImportDeclaration(st) || st.importClause?.isTypeOnly) continue;
         const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
         if (!destino) continue;
         const b = st.importClause?.namedBindings;
-        if (b && ts.isNamedImports(b)) for (const e of b.elements) if (!e.isTypeOnly) m.set(e.name.text, destino);
-        if (st.importClause?.name) m.set(st.importClause.name.text, destino);
+        /*
+         * Se guarda el nombre LOCAL como clave y el ORIGINAL como destino, que es la corrección
+         * de una revisión: con `import { escribirRevisionSimulada as persistirRevision }`, quien
+         * llama escribe `persistirRevision` pero el módulo de destino indexa por el nombre con
+         * el que la función se declaró. Guardando sólo el local, el recorrido llegaba al fichero
+         * correcto, no encontraba nada con ese nombre y se paraba — declarando incumplida una
+         * paridad que un renombrado inocuo no había tocado.
+         */
+        if (b && ts.isNamedImports(b)) {
+          for (const e of b.elements) {
+            if (e.isTypeOnly) continue;
+            m.set(e.name.text, { modulo: destino, original: (e.propertyName ?? e.name).text });
+          }
+        }
+        if (st.importClause?.name) {
+          m.set(st.importClause.name.text, { modulo: destino, original: 'default' });
+        }
       }
       return m;
     };
@@ -258,7 +276,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const imports = importesDe(arbol, actual.modulo);
         const locales = funcionesDe(arbol);
         for (const nombre of llamadasEn(decl)) {
-          if (imports.has(nombre)) cola.push({ modulo: imports.get(nombre)!, funcion: nombre });
+          const importado = imports.get(nombre);
+          if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
           else if (locales.has(nombre)) cola.push({ modulo: actual.modulo, funcion: nombre });
         }
       }

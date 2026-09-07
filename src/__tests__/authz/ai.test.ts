@@ -20066,6 +20066,36 @@ describeAuthz('AI: PropuestaAI, materialización humana y degradación segura', 
    * lee del catálogo vivo y no de una copia: un censo que compara una lista escrita a mano
    * contra otra escrita a mano no comprueba nada.
    */
+  /**
+   * RF-08.6 — LA OTRA MITAD DEL CENSO DE PARIDAD, la que sólo la base puede contestar.
+   *
+   * `paridad-manual.test.ts` comprueba, con el parser, que desde la puerta manual declarada se
+   * alcanza un `insert into <tabla>`. Para saber cuál es esa tabla deriva el nombre del DESTINO
+   * —guiones a guiones bajos—, y esa regla es una suposición sobre el esquema que aquel fichero,
+   * sin base, no puede verificar. Aquí sí: si un destino se renombrara sin renombrar su tabla, o
+   * al revés, el barrido de allá seguiría buscando una cadena que ya no nombra nada y daría por
+   * incumplida una paridad que existe — o peor, la daría por cumplida contra una tabla ajena.
+   *
+   * Mi primer intento derivaba la tabla de `COLUMNA_DE_DESTINO` menos el `_id`, y era falso:
+   * la columna de C0 es `criterio_id` y su tabla `criterio_exito`. De ahí que esto se compruebe
+   * en vez de asumirse.
+   */
+  it('RF-08.6: la tabla de cada destino existe con el nombre que el censo de paridad deriva', async () => {
+    const admin = sqlAdmin();
+    const destinos = CAPACIDADES_ACTIVAS.map((c) => CAPACIDADES[c].destino).filter(
+      (d): d is NonNullable<typeof d> => d !== null,
+    );
+    expect(destinos.length, 'ninguna capacidad materializa: no hay nada que comprobar').toBeGreaterThan(0);
+    const derivadas = [...new Set(destinos.map((d) => d.replace(/-/g, '_')))].sort();
+    const filas = await admin`
+      select table_name from information_schema.tables
+      where table_schema = 'public' and table_name = any(${derivadas})`;
+    expect(
+      filas.map((f) => f.table_name as string).sort(),
+      'algún destino no tiene tabla con el nombre que el censo de paridad busca',
+    ).toEqual(derivadas);
+  });
+
   it('RF-08.7: el catálogo de métricas del código es el mismo que el de la base', async () => {
     const admin = sqlAdmin();
     const [fila] = await admin`select pg_get_constraintdef(c.oid) as def

@@ -351,6 +351,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      */
     const etiquetasDesconocidas = new Set<string>();
     const callbacksSinInvocar = new Set<string>();
+    const predicadosSinColumna = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -751,21 +752,71 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * Pero si la base de la cadena no es un nombre a secas —una llamada, un índice— ahí
          * dentro puede haber otra fuente y se sigue mirando.
          */
+        /*
+         * Y UN NOMBRE LOCAL SE RESUELVE HASTA SU ORIGEN antes de contarlo. Con
+         * `const contribucion = entrada.aprendizajes` y luego `contribucion = ${'${contribucion}'}`,
+         * el campo salía `contribucion`, coincidía con el nombre de la columna y la salvedad lo
+         * aceptaba: C7 guardaba los aprendizajes dentro de la contribución con el censo en
+         * verde. Un alias con forma de destino no es un origen.
+         */
+        const origenDelNombre = (donde: ts.Node, nombre: string, hondo = 0): ts.Node | null => {
+          if (hondo > 8) return null;
+          let a: ts.Node | undefined = donde;
+          while (a !== undefined) {
+            if (ts.isBlock(a) || ts.isSourceFile(a)) {
+              for (const st of a.statements) {
+                if (!ts.isVariableStatement(st)) continue;
+                for (const d of st.declarationList.declarations) {
+                  if (!ts.isIdentifier(d.name) || d.name.text !== nombre || !d.initializer) {
+                    continue;
+                  }
+                  /*
+                   * Sólo un RENOMBRADO se sigue: `const x = y` o `const x = y.z`, con sus
+                   * envolturas. Un valor CONSTRUIDO —`const dimensiones = { … }`— no es un
+                   * alias, y seguirlo traía dentro los nombres de todo el objeto: medido, así
+                   * el censo declaraba rota CI, que en este eje está bien. Lo que este hallazgo
+                   * persigue es un alias con forma de destino, no una composición.
+                   */
+                  let init: ts.Expression = d.initializer;
+                  while (
+                    ts.isParenthesizedExpression(init) ||
+                    ts.isAsExpression(init) ||
+                    ts.isNonNullExpression(init)
+                  ) {
+                    init = init.expression;
+                  }
+                  if (ts.isIdentifier(init) || ts.isPropertyAccessExpression(init)) return init;
+                  return null;
+                }
+              }
+            }
+            // Un PARÁMETRO no tiene origen que seguir: es el dato tal como entra.
+            if (ts.isFunctionLike(a)) {
+              for (const par of a.parameters) {
+                if (ts.isIdentifier(par.name) && par.name.text === nombre) return null;
+              }
+            }
+            a = a.parent as ts.Node | undefined;
+          }
+          return null;
+        };
         const campos = t.templateSpans.map((sp) => {
           const dentro: string[] = [];
-          const ver = (y: ts.Node): void => {
+          const ver = (y: ts.Node, hondo = 0): void => {
             if (ts.isPropertyAccessExpression(y)) {
               dentro.push(y.name.text);
               let base: ts.Node = y.expression;
               while (ts.isPropertyAccessExpression(base)) base = base.expression;
-              if (!ts.isIdentifier(base)) ver(base);
+              if (!ts.isIdentifier(base)) ver(base, hondo);
               return;
             }
             if (ts.isIdentifier(y)) {
-              dentro.push(y.text);
+              const origen = hondo > 4 ? null : origenDelNombre(sp.expression, y.text, hondo);
+              if (origen !== null) ver(origen, hondo + 1);
+              else dentro.push(y.text);
               return;
             }
-            ts.forEachChild(y, ver);
+            ts.forEachChild(y, (z) => ver(z, hondo));
           };
           ver(sp.expression);
           return [...new Set(dentro)];
@@ -1116,28 +1167,85 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
         }
       }
+      /*
+       * CADA CONJUNTO DE LA CADENA TIENE QUE NOMBRAR UNA COLUMNA, Y UNA SOLA VEZ.
+       *
+       * Mirando únicamente los predicados que la materialización exige, un `and false` —o un
+       * `and id is null` junto al `id = ${'${…}'}` correcto— dejaba el mapa de filtros
+       * idéntico y la sentencia sin tocar ninguna fila: la ruta manual declarada no existe y
+       * la invariante en verde. Lo que sobra no es inocuo, así que no se ignora.
+       *
+       * Un conjunto que no empiece nombrando una columna no se entiende y se NOMBRA al final;
+       * y una columna repetida en la misma cadena es una contradicción o una redundancia que
+       * este censo no sabe leer. Lo que sí pasa —y es lo que hay en las dos capacidades que
+       * filtran— es un `and estado = 'borrador'`: una columna distinta contra un literal, que
+       * acota de más sin anular nada.
+       */
       const columnas: { columna: string; operador: string; indice: number }[] = [];
-      let hondo2 = 0;
-      let enTexto2 = false;
-      for (let i = 0; i < cola.length; i++) {
-        const c = cola[i]!;
-        if (enTexto2) {
-          if (c === "'") enTexto2 = false;
+
+      /*
+       * La cadena se parte en sus CONJUNTOS a profundidad cero, en vez de mirar cada posición
+       * del texto: mirando posiciones, el índice 0 llegaba con el espacio inicial delante y
+       * ningún patrón casaba, así que el primer predicado se denunciaba solo. Partir es además
+       * lo que la pregunta pide: cada conjunto se examina UNA vez y entero.
+       */
+      const conjuntos: string[] = [];
+      {
+        let actual = '';
+        let h = 0;
+        let enT = false;
+        for (let i = 0; i < cola.length; i++) {
+          const c = cola[i]!;
+          if (enT) {
+            actual += c;
+            if (c === "'") enT = false;
+            continue;
+          }
+          if (c === "'") enT = true;
+          else if (c === '(') h += 1;
+          else if (c === ')') h -= 1;
+          else if (h === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
+            if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
+            if (/^and\b/i.test(cola.slice(i))) {
+              conjuntos.push(actual);
+              actual = '';
+              i += 'and'.length - 1;
+              continue;
+            }
+          }
+          actual += c;
+        }
+        conjuntos.push(actual);
+      }
+
+      const nombradas: string[] = [];
+      for (const bruto of conjuntos) {
+        const trozo = bruto.trim();
+        if (trozo === '') continue;
+        const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i(\d+)\b/i.exec(trozo);
+        if (m) {
+          columnas.push({
+            columna: m[1]!.toLowerCase(),
+            operador: m[2]!.toLowerCase().trim(),
+            indice: Number(m[3]),
+          });
+          nombradas.push(m[1]!.toLowerCase());
           continue;
         }
-        if (c === "'") enTexto2 = true;
-        else if (c === '(') hondo2 += 1;
-        else if (c === ')') hondo2 -= 1;
-        else if (hondo2 === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
-          if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
-          const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i(\d+)\b/i.exec(cola.slice(i));
-          if (m) {
-            columnas.push({
-              columna: m[1]!.toLowerCase(),
-              operador: m[2]!.toLowerCase().trim(),
-              indice: Number(m[3]),
-            });
-          }
+        // Lo que no se registra SÍ se mira: tiene que nombrar una columna. Un `and false` no
+        // la nombra, y anula la sentencia entera sin tocar el mapa de filtros.
+        const col = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|<=|>=|<|>|\bis\b|\bin\b|\blike\b|\bilike\b|@>)/i.exec(trozo);
+        if (col === null) {
+          predicadosSinColumna.add(trozo.slice(0, 60));
+          continue;
+        }
+        nombradas.push(col[1]!.toLowerCase());
+      }
+      // Y una columna repetida en la misma cadena es una contradicción —`id = ${'${…}'} and id
+      // is null`— o una redundancia que este censo no sabe leer. Las dos piden una decisión.
+      for (const n of new Set(nombradas)) {
+        if (nombradas.filter((x) => x === n).length > 1) {
+          predicadosSinColumna.add(`${n} (repetida en el mismo where)`);
         }
       }
       return columnas;
@@ -1790,6 +1898,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     expect(
       [...callbacksSinInvocar].sort(),
       'una función anónima con SQL dentro llega a alguien que este censo no sabe si la ejecuta: decide si cuenta',
+    ).toEqual([]);
+    expect(
+      [...predicadosSinColumna].sort(),
+      'un UPDATE lleva un predicado que este censo no sabe leer, o repite una columna: puede anular la sentencia entera',
     ).toEqual([]);
   });
 });

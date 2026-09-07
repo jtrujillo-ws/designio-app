@@ -797,7 +797,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       sql: string,
       desde: number,
       verbo: string,
-    ): { columna: string; indices: number[] }[] => {
+    ): { columna: string; indices: number[]; valor: string }[] => {
       const resto = sql.slice(desde);
       const partesDeNivelCero = (t: string): string[] => {
         const partes: string[] = [];
@@ -835,35 +835,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return null;
       };
-      if (verbo === 'insert into') {
-        const abre = resto.indexOf('(');
-        if (abre < 0) return [];
-        // Sólo cuenta si el paréntesis viene ANTES del values/select: si no, no hay lista.
-        if (/\b(values|select|default)\b/i.test(resto.slice(0, abre))) return [];
-        const lista = grupo(resto, abre);
-        if (lista === null) return [];
-        const columnas = partesDeNivelCero(lista)
-          .map((x) => x.trim().toLowerCase())
-          .filter((x) => /^[a-z_][a-z0-9_]*$/.test(x));
-        const values = /\bvalues\s*\(/i.exec(resto);
-        // `insert … select …`: sin pareja, se exigen todas y sin campo con el que comparar.
-        if (!values) return columnas.map((c) => ({ columna: c, indices: [] }));
-        const valores = grupo(resto, values.index + values[0].length - 1);
-        if (valores === null) return columnas.map((c) => ({ columna: c, indices: [] }));
-        const partes = partesDeNivelCero(valores);
-        if (partes.length !== columnas.length) return columnas.map((c) => ({ columna: c, indices: [] }));
-        return columnas
-          .map((c, i) => ({ columna: c, indices: indicesEn(partes[i]!) }))
-          .filter((x) => x.indices.length > 0);
-      }
-      const set = /\bset\b/i.exec(resto);
-      if (!set) return [];
-      const cuerpo = resto.slice(set.index + set[0].length);
       /*
        * El terminador se busca a PROFUNDIDAD CERO, como ya se hacía con las comas.
-       * Buscándolo con una regex a secas, un `set a = (select … from …), b = ${…}` se cortaba en
-       * el `from` de la subconsulta: las columnas posteriores desaparecían de lo exigido y el
-       * escritor a mano podía dejar de guardarlas con el censo en verde.
+       * Buscándolo con una regex a secas, un `set a = (select … from …), b = ${'${…}'}` se
+       * cortaba en el `from` de la subconsulta: las columnas posteriores desaparecían de lo
+       * exigido y el escritor a mano podía dejar de guardarlas con el censo en verde.
        */
       const finDeNivelCero = (t: string): number => {
         let hondo = 0;
@@ -883,12 +859,54 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         return -1;
       };
+      if (verbo === 'insert into') {
+        const abre = resto.indexOf('(');
+        if (abre < 0) return [];
+        // Sólo cuenta si el paréntesis viene ANTES del values/select: si no, no hay lista.
+        if (/\b(values|select|default)\b/i.test(resto.slice(0, abre))) return [];
+        const lista = grupo(resto, abre);
+        if (lista === null) return [];
+        const columnas = partesDeNivelCero(lista)
+          .map((x) => x.trim().toLowerCase())
+          .filter((x) => /^[a-z_][a-z0-9_]*$/.test(x));
+        const sinPareja = columnas.map((c) => ({ columna: c, indices: [], valor: '' }));
+        const values = /\bvalues\s*\(/i.exec(resto);
+        /*
+         * `insert … (a, b, c) select v1, v2, v3 from …` empareja igual que un `values`: la lista
+         * del SELECT, cortada a profundidad cero por su `from`/`where`. Sin esto, las cinco
+         * columnas de la afirmación a mano —que es un `insert … select`— llegaban SIN campo, y
+         * una comprobación que no puede distinguir un `${'${entrada.texto}'}` de un `${"${'n/a'}"}`
+         * no puede acusar al segundo.
+         */
+        const partes = ((): string[] | null => {
+          if (values) {
+            const valores = grupo(resto, values.index + values[0].length - 1);
+            return valores === null ? null : partesDeNivelCero(valores);
+          }
+          const sel = /\bselect\b/i.exec(resto.slice(abre));
+          if (!sel) return null;
+          const cuerpoSel = resto.slice(abre + sel.index + sel[0].length);
+          const finSel = finDeNivelCero(cuerpoSel);
+          return partesDeNivelCero(finSel >= 0 ? cuerpoSel.slice(0, finSel) : cuerpoSel);
+        })();
+        if (partes === null || partes.length !== columnas.length) return sinPareja;
+        return columnas
+          .map((c, i) => ({ columna: c, indices: indicesEn(partes[i]!), valor: partes[i]! }))
+          .filter((x) => x.indices.length > 0);
+      }
+      const set = /\bset\b/i.exec(resto);
+      if (!set) return [];
+      const cuerpo = resto.slice(set.index + set[0].length);
       const fin = finDeNivelCero(cuerpo);
       return partesDeNivelCero(fin >= 0 ? cuerpo.slice(0, fin) : cuerpo)
-        .map((x) => ({
-          columna: /^\s*([a-z_][a-z0-9_]*)\s*=/i.exec(x)?.[1]?.toLowerCase() ?? '',
-          indices: indicesEn(x),
-        }))
+        .map((x) => {
+          const m = /^\s*([a-z_][a-z0-9_]*)\s*=/i.exec(x);
+          return {
+            columna: m?.[1]?.toLowerCase() ?? '',
+            indices: indicesEn(x),
+            valor: m === null ? '' : x.slice(m[0].length),
+          };
+        })
         .filter((x) => x.columna !== '' && x.indices.length > 0);
     };
 
@@ -1144,7 +1162,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * la materialización, y el segundo actualizaba TODAS las reviews del workspace con el censo
      * en verde. Cada sentencia se guarda entera y se compara entera.
      */
-    type Sentencia = { columnas: Map<string, Set<string>>; filtro: Map<string, Set<string>> };
+    type Sentencia = {
+      columnas: Map<string, Set<string>>;
+      /** Y el SQL del valor de cada una: un valor puede nombrar a su columna sin interpolarla. */
+      valores: Map<string, string>;
+      filtro: Map<string, Set<string>>;
+    };
     type Alcance = { escrituras: Map<string, Sentencia[]>; modulos: Set<string> };
     const cacheDeEscrituras = new Map<string, Alcance>();
     const alcanceDesde = (modulo: string, funcion: string): Alcance => {
@@ -1182,6 +1205,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             const clave = `${verbo} ${tabla}`;
             const y: Sentencia = {
               columnas: new Map<string, Set<string>>(),
+              valores: new Map<string, string>(),
               filtro: new Map<string, Set<string>>(),
             };
             const tras = m.index + m[0].length;
@@ -1189,6 +1213,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               const campos = y.columnas.get(c.columna) ?? new Set<string>();
               for (const i of c.indices) for (const n of consulta.campos[i] ?? []) campos.add(n);
               y.columnas.set(c.columna, campos);
+              y.valores.set(c.columna, `${y.valores.get(c.columna) ?? ''} ${c.valor}`);
             }
             /*
              * El filtro se guarda con su OPERADOR y con el campo del que sale, por lo mismo que
@@ -1429,12 +1454,67 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * versión sólo acusaba si el campo aparecía en OTRA columna —o sea, sólo los
            * intercambios—, y eso dejaba pasar una sustitución cualquiera.
            */
-          if (suyos.size === 0 || mios.size === 0) continue;
-          if ([...suyos].some((n) => mios.has(n))) continue;
+          if (suyos.size === 0) continue;
+          if (mios.size > 0 && [...suyos].some((n) => mios.has(n))) continue;
+          /*
+           * Y si no comparten campo, vale que el valor de la ruta manual NOMBRE A SU COLUMNA
+           * —por el identificador de su interpolación o en el propio SQL—:
+           *
+           *   · `reto_id` desde `entrada.retoId` es correcto aunque la materialización lo
+           *     escriba desde `p.anclaId`, porque las dos capas nombran distinto el mismo dato.
+           *     Medido: sin esta salvedad el censo declaraba rota C0, que en este eje está bien.
+           *   · y el `orden` de una afirmación a mano sale de un `coalesce((select max(orden) +
+           *     1 …), 0)`: lo calcula la base A PARTIR DE LA PROPIA COLUMNA, y no hay campo
+           *     interpolado con el que comparar. Exigirlo pondría en rojo una ruta intacta.
+           *
+           * Lo que ya NO pasa es un valor que no dice de dónde sale: `contribucion = ${"${'n/a'}"}`
+           * deja la columna escrita y el conjunto de campos VACÍO, y aceptarlo sin más mantenía
+           * la invariante en verde con C7 guardando el contenido equivocado. Tampoco pasa una
+           * sustitución cualquiera —`contribucion = ${'${entrada.reviewId}'}`—, que no comparte
+           * identificador con nada y tampoco nombra a su columna.
+           */
           if ([...mios].some((n) => pelar(n) === pelar(c))) continue;
-          campos.push(`${e}.${c} ← ${[...suyos].sort().join('|')}`);
+          const suyoSql = x.valores.get(c) ?? '';
+          if (new RegExp(`\\b${c}\\b`, 'i').test(suyoSql)) continue;
+          campos.push(
+            `${e}.${c} ← ${[...suyos].sort().join('|')}${mios.size === 0 ? ' (a mano, sin origen)' : ''}`,
+          );
         }
-        for (const c of r.filtro.keys()) if (!x.filtro.has(c)) filtros.push(`${e} where ${c}`);
+        /*
+         * Y EL OPERANDO DEL PREDICADO TIENE QUE NOMBRAR LA FILA. Con la misma clave `id =`,
+         * cambiar `${'${entrada.reviewId}'}` por `${'${entrada.actorId}'}` acota otra fila —o
+         * ninguna— y el censo lo daba por bueno: la clave coincidía y el cruce no salta porque
+         * `actorId` no se parece a ninguna otra columna del filtro.
+         *
+         * Vale que comparta identificador con el operando de la materialización, que nombre la
+         * COLUMNA, o que nombre la TABLA que se acota —quitándole un `Id` final y comparando
+         * contra el nombre entero o contra una de sus palabras—. Es lo que hace legítimos
+         * `entrada.itemId` sobre `item_importacion` y `entrada.reviewId` sobre `outcome_review`,
+         * que a mano nombran la fila con el sustantivo de su tabla mientras la materialización
+         * la nombra con el suyo (`p.anclaId`, el ancla de la propuesta) — el mismo dato con dos
+         * nombres, que es justo lo que aquí no se podía distinguir de una sustitución.
+         */
+        const tabla = e.split(' ').pop() ?? '';
+        const nombraLaFila = (n: string, col: string): boolean => {
+          if (pelar(n) === pelar(col)) return true;
+          const sinId = pelar(n).replace(/id$/, '');
+          if (sinId === '') return false;
+          return sinId === pelar(tabla) || tabla.split('_').includes(sinId);
+        };
+        for (const k of r.filtro.keys()) {
+          const mios = x.filtro.get(k);
+          if (mios === undefined) {
+            filtros.push(`${e} where ${k}`);
+            continue;
+          }
+          const suyos = r.filtro.get(k)!;
+          if ([...mios].some((n) => suyos.has(n))) continue;
+          const col = k.split(' ')[0]!;
+          if ([...mios].some((n) => nombraLaFila(n, col))) continue;
+          filtros.push(
+            `${e} where ${k} ← ${mios.size === 0 ? '(sin origen)' : [...mios].sort().join('|')}`,
+          );
+        }
         return { columnas, campos, filtros };
       };
 

@@ -457,14 +457,18 @@ viajan entre módulos como comportamiento, no solo como tipo: `ROLES_CURADORES` 
 ve cada rol y con qué rótulo, y `ROLES_OBSERVABILIDAD_AI` y `ROLES_INFORME_GROUNDING` (definidas en
 `ai.roles.ts`, un módulo sin Zod, como alias de `ROLES_AUDITORIA`) deciden en `loop` quién ve la
 operación de la capa AI y el informe de grounding: desde #52 un censo del grafo de módulos impide que
-el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`. Y los **contratos de salida de la AI**
-dependen de contratos de otros módulos: `ai.contenido` valida las respuestas del proveedor con
-`FechaCalendarioSchema` de `evidencia` (la fecha de una evidencia propuesta por CI), `CODIGOS_SENAL`
-de `journey` (las señales que C5 puede nombrar), `TOPE_NARRATIVA` de `medicion` (los textos de C7) y
-`MAX_PREGUNTA` y `MAX_RAZON` de `servicio` (las HMW de C3), así que cambiar uno de esos límites
-cambia qué respuestas acepta la capa AI. Y desde #55 `metodo` valida las fechas de un criterio de
-éxito (línea base y post mortem) con `FechaCalendarioSchema` de `evidencia`, tanto en las server
-functions como en el formulario: cambiar ese contrato cambia qué criterios acepta el método.
+el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`. Y los **contratos y ayudantes compartidos** que otro módulo **ejecuta** (un barrido de los imports
+con valor entre módulos de `src/lib`, sin contar los `import type`): `FechaCalendarioSchema` de
+`evidencia` valida fechas en `ai.contenido` (la evidencia propuesta por CI), `metodo` (línea base y
+post mortem de un criterio, desde #55), `disposicion` (la fecha efectiva del acuerdo), `entrega`
+(fechas de releases y constataciones) y `medicion` (snapshots y outcome review, en esquemas y
+servicio); `DimensionesEvidenciaSchema` de `evidencia` lo ejecuta `ai.servicio`; `VeredictoSchema`
+de `metodo` lo ejecuta `medicion`; `CODIGOS_SENAL` de `journey` lo ejecutan `ai.contenido` y
+`ai.prompts` (las señales que C5 puede nombrar); `TOPE_NARRATIVA` y los topes `MAX_*_KPI` de
+`medicion` y `MAX_PREGUNTA` y `MAX_RAZON` de `servicio` acotan en `ai.contenido` lo que C7, C6 y C3
+pueden devolver; y `etiquetaDePendientes`, `clasesDelRol` y `comoAprobacionPendiente` de
+`aprobaciones` dan forma al lateral y al resumen del loop. Cambiar uno de esos contratos cambia qué
+acepta o qué pinta el módulo que lo ejecuta.
 Cambiar una de esas listas cambia esos módulos. El resto de esquemas
 Zod y tipos se importan libremente entre módulos como contratos compartidos. El detalle de tablas por
 contexto está en `21` y el de la capa AI en `22`.

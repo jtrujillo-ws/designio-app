@@ -261,6 +261,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * De las cadenas se conservan las comillas y se tira el contenido, para no descolocar lo que
      * viene después: una lista de valores sigue teniendo el mismo número de elementos.
      *
+     * CON UNA EXCEPCIÓN, y muy estrecha: una cadena que sea UNA SOLA PALABRA en minúsculas
+     * —`'borrador'`, `'completado'`— se conserva entera. Es el valor de un estado, y sin él no
+     * se puede decir si un `and estado = ${'${…}'}` de más acota o ANULA la sentencia. Lo que la
+     * excepción no deja pasar es justo lo que hacía peligroso el contenido: ni espacios —así
+     * `'update outcome_review'` no puede fingir una escritura, que hace falta el `\s+`—, ni
+     * paréntesis, ni `--`, ni `$`, ni `:`, ni comas. Y las palabras clave que sí caben —`'and'`—
+     * las lee cada rastreador dentro de sus comillas, porque todos llevan la cuenta de si van
+     * por dentro de una cadena.
+     *
      * Y las de DÓLAR cuentan igual: `select $$insert into cita$$` es la misma avería con la otra
      * forma de citar de Postgres. La apertura se reconoce como `$tag$` con etiqueta opcional, lo
      * que deja fuera los `$1` de los parámetros — una etiqueta no empieza por dígito—, aunque
@@ -269,6 +278,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const soloSql = (t: string): string => {
       let fuera = '';
       let enCadena = false;
+      let dentro = '';
       let cierreDolar: string | null = null;
       let i = 0;
       while (i < t.length) {
@@ -290,13 +300,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         }
         if (enCadena) {
           if (c === "'") {
+            if (/^[a-z0-9_-]+$/.test(dentro)) fuera += dentro;
             fuera += c;
             enCadena = false;
-          }
+            dentro = '';
+          } else dentro += c;
           i += 1;
         } else if (c === "'") {
           fuera += c;
           enCadena = true;
+          dentro = '';
           i += 1;
         } else if (c === '-' && t[i + 1] === '-') {
           while (i < t.length && t[i] !== '\n') i += 1;
@@ -352,6 +365,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     const etiquetasDesconocidas = new Set<string>();
     const callbacksSinInvocar = new Set<string>();
     const predicadosSinColumna = new Set<string>();
+    const conjuntosImposibles = new Set<string>();
     const testigo = (k: number): string => ` :i${k} `;
 
     /**
@@ -409,36 +423,46 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         : ts.isIdentifier(q)
           ? q.text
           : null;
-      if (quien === null || !EJECUTAN_SU_CALLBACK.includes(quien)) return [];
+      const posiciones = quien === null ? undefined : EJECUTAN_SU_CALLBACK.get(quien);
+      if (posiciones === undefined) return [];
       // El nombre a secas y el acceso a propiedad: `map(persistir)` y
       // `map(proveedor.generar)` ejecutan lo mismo, y quedarse con el primero dejaba
       // al espacio de nombres —la forma normal de llamar a otro módulo— fuera del grafo.
-      return x.arguments.filter(
-        (a) => ts.isIdentifier(a) || ts.isPropertyAccessExpression(a),
-      ) as ts.Expression[];
+      return posiciones
+        .map((k) => x.arguments[k])
+        .filter(
+          (a): a is ts.Expression =>
+            a !== undefined && (ts.isIdentifier(a) || ts.isPropertyAccessExpression(a)),
+        );
     };
 
-    const EJECUTAN_SU_CALLBACK = [
+    /*
+     * Y en QUÉ POSICIÓN va el callback de cada uno. Aceptando cualquier argumento, un
+     * `items.reduce((acc) => acc, persistir)` —donde `persistir` es el acumulador inicial, no
+     * una función que se llame— daba por vivo al ayudante y contaba su SQL. Cada API dice
+     * dónde recibe lo que ejecuta, y lo que llegue en otra posición no cuenta.
+     */
+    const EJECUTAN_SU_CALLBACK = new Map<string, number[]>([
       // El único camino de este repositorio a la base, y el cuerpo de cada función de servidor.
-      'conUsuario',
-      'handler',
-      // Y los métodos que llaman a lo que reciben.
-      'map',
-      'flatMap',
-      'filter',
-      'forEach',
-      'find',
-      'findLast',
-      'findIndex',
-      'some',
-      'every',
-      'reduce',
-      'sort',
-      'replace',
-      'then',
-      'catch',
-      'finally',
-    ];
+      ['conUsuario', [1]],
+      ['handler', [0]],
+      // Y los métodos que llaman a lo que reciben, cada uno donde lo recibe.
+      ['map', [0]],
+      ['flatMap', [0]],
+      ['filter', [0]],
+      ['forEach', [0]],
+      ['find', [0]],
+      ['findLast', [0]],
+      ['findIndex', [0]],
+      ['some', [0]],
+      ['every', [0]],
+      ['reduce', [0]],
+      ['sort', [0]],
+      ['replace', [1]],
+      ['then', [0, 1]],
+      ['catch', [0]],
+      ['finally', [0]],
+    ]);
     /** Si quien recibe una función anónima la ejecuta. Lo que no, se nombra si lleva SQL. */
     const laEjecutaQuienLaRecibe = (x: ts.Node): boolean => {
       // Un nodo función-like sin cuerpo es un TIPO: no ejecuta nada y no hay nada que decir.
@@ -468,7 +492,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         : ts.isIdentifier(q)
           ? q.text
           : null;
-      if (quien !== null && EJECUTAN_SU_CALLBACK.includes(quien)) return true;
+      const posiciones = quien === null ? undefined : EJECUTAN_SU_CALLBACK.get(quien);
+      if (posiciones !== undefined && posiciones.includes(recibe.arguments.indexOf(x as unknown as ts.Expression))) {
+        return true;
+      }
       nombrarSiLleva(x, `${quien ?? q.getText().slice(0, 40)}(…)`);
       return false;
     };
@@ -644,13 +671,42 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           for (const el of x.elements) valorConsumido(el, set, true);
         }
       };
-      const consumidosEn = new Map<ts.Node, Set<string>>();
+      /*
+       * Y el consumo se apunta contra la DECLARACIÓN, no contra el texto del nombre. Un
+       * conjunto de cadenas por función confunde dos ámbitos hermanos: con un
+       * `const pendiente = tx\`…\`` en un bloque y un `const pendiente = Promise.resolve();
+       * await pendiente` en otro, el segundo daba por ejecutada la consulta del primero.
+       * Dos variables con el mismo nombre en ámbitos distintos son dos variables.
+       */
+      const declaracionDe = (donde: ts.Node, nombre: string): ts.Node | null => {
+        let a: ts.Node | undefined = donde;
+        while (a !== undefined) {
+          if (ts.isBlock(a) || ts.isSourceFile(a)) {
+            for (const st of a.statements) {
+              if (!ts.isVariableStatement(st)) continue;
+              for (const d of st.declarationList.declarations) {
+                if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
+              }
+            }
+          }
+          if (ts.isFunctionLike(a)) {
+            for (const par of a.parameters) {
+              if (ts.isIdentifier(par.name) && par.name.text === nombre) return par;
+            }
+          }
+          a = a.parent as ts.Node | undefined;
+        }
+        return null;
+      };
+      const consumidas = new Set<ts.Node>();
       const juntarConsumidos = (y: ts.Node): void => {
         if (ts.isAwaitExpression(y) || ts.isReturnStatement(y)) {
-          const suya = funcionDe(y);
-          const set = consumidosEn.get(suya) ?? new Set<string>();
-          valorConsumido(y.expression, set);
-          consumidosEn.set(suya, set);
+          const nombres = new Set<string>();
+          valorConsumido(y.expression, nombres);
+          for (const nombre of nombres) {
+            const decl = declaracionDe(y, nombre);
+            if (decl !== null) consumidas.add(decl);
+          }
         }
         ts.forEachChild(y, juntarConsumidos);
       };
@@ -727,7 +783,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             return seEjecuta(padre, saltos + 1);
           }
           if (ts.isVariableDeclaration(padre) && padre.initializer === hijo && ts.isIdentifier(padre.name)) {
-            return consumidosEn.get(funcionDe(padre))?.has(padre.name.text) ?? false;
+            return consumidas.has(padre);
           }
           return false;
         };
@@ -759,7 +815,53 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * aceptaba: C7 guardaba los aprendizajes dentro de la contribución con el censo en
          * verde. Un alias con forma de destino no es un origen.
          */
-        const origenDelNombre = (donde: ts.Node, nombre: string, hondo = 0): ts.Node | null => {
+        /*
+         * Y UN DESESTRUCTURADO TAMBIÉN RENOMBRA. `const { aprendizajes: contribucion } = entrada`
+         * deja un nombre con forma de destino sin que haya ningún `const x = y` que seguir: el
+         * campo salía `contribucion`, coincidía con el nombre de la columna y la salvedad lo
+         * aceptaba otra vez —el mismo agujero de antes por la otra puerta—.
+         *
+         * La fuente de `{ p: q }` es `p`; la de `{ p }` es el propio `p`, que ya es el campo; y
+         * en `[q]` no hay nombre de campo que valga, así que se sigue mirando lo que se
+         * desestructura. De un anidado `{ r: { p: q } }` sale `p`, porque `r` es el CAMINO —lo
+         * mismo que en `a.b.c`—.
+         */
+        type Fuente = { campo: string } | { nodo: ts.Node } | null;
+        const esPatron = (b: ts.BindingName): b is ts.BindingPattern =>
+          ts.isObjectBindingPattern(b) || ts.isArrayBindingPattern(b);
+        const elementoLigado = (
+          patron: ts.BindingPattern,
+          nombre: string,
+        ): ts.BindingElement | null => {
+          for (const el of patron.elements) {
+            if (ts.isOmittedExpression(el)) continue;
+            if (!esPatron(el.name)) {
+              if (ts.isIdentifier(el.name) && el.name.text === nombre) return el;
+              continue;
+            }
+            const dentro = elementoLigado(el.name, nombre);
+            if (dentro !== null) return dentro;
+          }
+          return null;
+        };
+        const fuenteLigada = (el: ts.BindingElement, raiz: ts.Expression | null): Fuente => {
+          if (el.propertyName !== undefined) {
+            if (ts.isComputedPropertyName(el.propertyName)) {
+              return { nodo: el.propertyName.expression };
+            }
+            return { campo: el.propertyName.text };
+          }
+          const patron = el.parent;
+          // En un objeto sin `p:`, el nombre local YA es el campo.
+          if (ts.isObjectBindingPattern(patron) && ts.isIdentifier(el.name)) {
+            return { campo: el.name.text };
+          }
+          // En una lista no hay nombre de campo: la fuente es la de quien la contiene.
+          const arriba = patron.parent;
+          if (ts.isBindingElement(arriba)) return fuenteLigada(arriba, raiz);
+          return raiz === null ? null : { nodo: raiz };
+        };
+        const origenDelNombre = (donde: ts.Node, nombre: string, hondo = 0): Fuente => {
           if (hondo > 8) return null;
           let a: ts.Node | undefined = donde;
           while (a !== undefined) {
@@ -767,7 +869,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               for (const st of a.statements) {
                 if (!ts.isVariableStatement(st)) continue;
                 for (const d of st.declarationList.declarations) {
-                  if (!ts.isIdentifier(d.name) || d.name.text !== nombre || !d.initializer) {
+                  if (!d.initializer) continue;
+                  if (esPatron(d.name)) {
+                    const el = elementoLigado(d.name, nombre);
+                    if (el === null) continue;
+                    return fuenteLigada(el, d.initializer);
+                  }
+                  if (!ts.isIdentifier(d.name) || d.name.text !== nombre) {
                     continue;
                   }
                   /*
@@ -785,15 +893,26 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                   ) {
                     init = init.expression;
                   }
-                  if (ts.isIdentifier(init) || ts.isPropertyAccessExpression(init)) return init;
+                  if (ts.isIdentifier(init) || ts.isPropertyAccessExpression(init)) {
+                    return { nodo: init };
+                  }
                   return null;
                 }
               }
             }
-            // Un PARÁMETRO no tiene origen que seguir: es el dato tal como entra.
+            /*
+             * Un PARÁMETRO no tiene origen que seguir: es el dato tal como entra. Pero uno
+             * DESESTRUCTURADO sí renombra —`({ aprendizajes: contribucion }) => …`—, y ahí el
+             * campo se lee igual que en una declaración, sin nada detrás a lo que seguir.
+             */
             if (ts.isFunctionLike(a)) {
               for (const par of a.parameters) {
-                if (ts.isIdentifier(par.name) && par.name.text === nombre) return null;
+                if (!esPatron(par.name)) {
+                  if (ts.isIdentifier(par.name) && par.name.text === nombre) return null;
+                  continue;
+                }
+                const el = elementoLigado(par.name, nombre);
+                if (el !== null) return fuenteLigada(el, null);
               }
             }
             a = a.parent as ts.Node | undefined;
@@ -812,8 +931,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             }
             if (ts.isIdentifier(y)) {
               const origen = hondo > 4 ? null : origenDelNombre(sp.expression, y.text, hondo);
-              if (origen !== null) ver(origen, hondo + 1);
-              else dentro.push(y.text);
+              if (origen === null) dentro.push(y.text);
+              else if ('campo' in origen) dentro.push(origen.campo);
+              else ver(origen.nodo, hondo + 1);
               return;
             }
             ts.forEachChild(y, (z) => ver(z, hondo));
@@ -1115,11 +1235,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       sql: string,
       desde: number,
       verbo: string,
-    ): { columna: string; operador: string; indice: number }[] => {
-      if (verbo !== 'update') return [];
+    ): {
+      columnas: { columna: string; operador: string; indice: number }[];
+      literales: { columna: string; operador: string; valor: string }[];
+    } => {
+      const nada = (): {
+        columnas: { columna: string; operador: string; indice: number }[];
+        literales: { columna: string; operador: string; valor: string }[];
+      } => ({ columnas: [], literales: [] });
+      if (verbo !== 'update') return nada();
       const resto = sql.slice(desde);
       const set = /\bset\b/i.exec(resto);
-      if (!set) return [];
+      if (!set) return nada();
       const cuerpo = resto.slice(set.index + set[0].length);
       let hondo = 0;
       let enTexto = false;
@@ -1140,7 +1267,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
         }
       }
-      if (donde < 0) return [];
+      if (donde < 0) return nada();
       const cola = cuerpo.slice(donde);
       /*
        * Y tiene que ser una cadena de «and». Guardando sólo las columnas, un
@@ -1163,7 +1290,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           else if (c === ')') hondoO -= 1;
           else if (hondoO === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
             if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
-            if (/^or\b/i.test(cola.slice(i))) return [];
+            if (/^or\b/i.test(cola.slice(i))) return nada();
           }
         }
       }
@@ -1182,6 +1309,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * acota de más sin anular nada.
        */
       const columnas: { columna: string; operador: string; indice: number }[] = [];
+      const literales: { columna: string; operador: string; valor: string }[] = [];
 
       /*
        * La cadena se parte en sus CONJUNTOS a profundidad cero, en vez de mirar cada posición
@@ -1240,6 +1368,20 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           continue;
         }
         nombradas.push(col[1]!.toLowerCase());
+        /*
+         * Y si acota contra un LITERAL se guarda con su valor. Que nombre una columna distinta
+         * lo hacía inocuo a ojos del censo, y no lo es: cambiar `and estado = 'borrador'` por
+         * `and estado = 'completado'` en el guardado del borrador deja una sentencia que no
+         * toca NINGUNA fila —el borrador nunca está completado— con la paridad en verde.
+         */
+        const lit = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=)\s*'([^']*)'\s*$/i.exec(trozo);
+        if (lit) {
+          literales.push({
+            columna: lit[1]!.toLowerCase(),
+            operador: lit[2]!.toLowerCase(),
+            valor: lit[3]!,
+          });
+        }
       }
       // Y una columna repetida en la misma cadena es una contradicción —`id = ${'${…}'} and id
       // is null`— o una redundancia que este censo no sabe leer. Las dos piden una decisión.
@@ -1248,7 +1390,105 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           predicadosSinColumna.add(`${n} (repetida en el mismo where)`);
         }
       }
-      return columnas;
+      return { columnas, literales };
+    };
+
+    /*
+     * LO QUE LA PROPIA RUTA YA DESCARTÓ NO ACOTA: ANULA.
+     *
+     * Un conjunto de más contra un literal —`and estado = 'borrador'`— nombra una columna
+     * distinta, no repite ninguna y no anula nada a la vista: el censo lo daba por bueno. Pero
+     * si el literal es uno que la propia función acaba de RECHAZAR unas líneas antes, la
+     * sentencia no puede tocar ninguna fila: `guardarBorradorReview` tira si la review está
+     * completada, así que un `and estado = 'completado'` en su WHERE deja el guardado sin
+     * efecto —y la ruta manual que SYS-21 declara, sin existir— con la paridad en verde.
+     *
+     * De qué valor se puede fiar uno: sólo del que la función misma niega ANTES de escribir,
+     * y sólo si el dato viene de la MISMA tabla que se actualiza. Si `if (x.estado ===
+     * 'completado') throw` corta el paso, abajo `estado` no vale 'completado'; y si el corte es
+     * `if (x.estado !== 'borrador') throw`, abajo `estado` vale 'borrador' Y NADA MÁS.
+     *
+     * Sólo se baja por `||`: de un `if (A || B) throw` que no salta se sabe que NI A NI B; de
+     * un `if (A && B) throw` que no salta no se sabe nada de A. Y la comparación tiene que
+     * quedar por encima de la consulta en el propio texto, que es lo que la hace anterior.
+     */
+    type Guarda = { columna: string; valor: string; niega: boolean; tabla: string; fin: number };
+    const guardasDe = (decl: ts.Node): Guarda[] => {
+      const fuera: Guarda[] = [];
+      const texto = decl.getSourceFile().text;
+      /** La tabla de la que sale un nombre local, leída de la consulta que lo declara. */
+      const tablaDelNombre = (donde: ts.Node, nombre: string): string | null => {
+        let a: ts.Node | undefined = donde;
+        while (a !== undefined) {
+          if (ts.isBlock(a) || ts.isSourceFile(a)) {
+            for (const st of a.statements) {
+              if (!ts.isVariableStatement(st)) continue;
+              for (const d of st.declarationList.declarations) {
+                const suyo =
+                  (ts.isIdentifier(d.name) && d.name.text === nombre) ||
+                  (ts.isArrayBindingPattern(d.name) &&
+                    d.name.elements.some(
+                      (el) =>
+                        !ts.isOmittedExpression(el) &&
+                        ts.isIdentifier(el.name) &&
+                        el.name.text === nombre,
+                    ));
+                if (!suyo || d.initializer === undefined) continue;
+                const m = /\bfrom\s+([a-z_][a-z0-9_]*)/i.exec(
+                  texto.slice(d.initializer.pos, d.initializer.end),
+                );
+                return m === null ? null : m[1]!.toLowerCase();
+              }
+            }
+          }
+          a = a.parent as ts.Node | undefined;
+        }
+        return null;
+      };
+      const lanza = (st: ts.Statement): boolean =>
+        ts.isThrowStatement(st) ||
+        (ts.isBlock(st) && st.statements.some((y) => ts.isThrowStatement(y)));
+      const comparaciones = (e: ts.Expression, poner: (b: ts.BinaryExpression) => void): void => {
+        if (ts.isParenthesizedExpression(e)) return comparaciones(e.expression, poner);
+        if (!ts.isBinaryExpression(e)) return;
+        if (e.operatorToken.kind === ts.SyntaxKind.BarBarToken) {
+          comparaciones(e.left, poner);
+          comparaciones(e.right, poner);
+          return;
+        }
+        if (
+          e.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+          e.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken
+        ) {
+          poner(e);
+        }
+      };
+      const ver = (n: ts.Node): void => {
+        if (ts.isIfStatement(n) && lanza(n.thenStatement)) {
+          comparaciones(n.expression, (b) => {
+            const lados: [ts.Expression, ts.Expression][] = [
+              [b.left, b.right],
+              [b.right, b.left],
+            ];
+            for (const [campo, valor] of lados) {
+              if (!ts.isPropertyAccessExpression(campo) || !ts.isStringLiteral(valor)) continue;
+              if (!ts.isIdentifier(campo.expression)) continue;
+              const tabla = tablaDelNombre(n, campo.expression.text);
+              if (tabla === null) continue;
+              fuera.push({
+                columna: campo.name.text.toLowerCase().replace(/_/g, ''),
+                valor: valor.text,
+                niega: b.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken,
+                tabla,
+                fin: n.expression.end,
+              });
+            }
+          });
+        }
+        ts.forEachChild(n, ver);
+      };
+      ts.forEachChild(decl, ver);
+      return fuera;
     };
 
     /*
@@ -1434,6 +1674,8 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           // venir de una librería—. No es un fallo: simplemente no hay por dónde seguir.
           continue;
         }
+        const guardas: Guarda[] = [];
+        void guardasDe;
         for (const consulta of sqlDe(decl)) {
           for (const m of consulta.sql.matchAll(/(insert\s+into|update)\s+([a-z_]+)/gi)) {
             const tabla = m[2]!;
@@ -1461,11 +1703,27 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
              * las columnas: `id <> ${…}` acota la fila al revés y daba el mismo conjunto que
              * `id = ${…}`.
              */
-            for (const c of filtroTrasLaTabla(consulta.sql, tras, verbo)) {
+            const acota = filtroTrasLaTabla(consulta.sql, tras, verbo);
+            for (const c of acota.columnas) {
               const clv = `${c.columna} ${c.operador}`;
               const campos = y.filtro.get(clv) ?? new Set<string>();
               for (const n of consulta.campos[c.indice] ?? []) campos.add(n);
               y.filtro.set(clv, campos);
+            }
+            // Y un conjunto contra un literal que esta misma ruta ya descartó no acota: anula.
+            for (const c of acota.literales) {
+              if (c.operador !== '=') continue;
+              const col = c.columna.replace(/_/g, '');
+              for (const g of guardas) {
+                if (g.tabla !== tabla || g.columna !== col || g.fin > consulta.tag.pos) continue;
+                if (g.niega ? c.valor !== g.valor : c.valor === g.valor) {
+                  conjuntosImposibles.add(
+                    `${actual.funcion}: ${clave} where ${c.columna} = '${c.valor}', y la ruta ${
+                      g.niega ? `ya exige que sea '${g.valor}'` : 'ya rechazó ese valor'
+                    }`,
+                  );
+                }
+              }
             }
             escrituras.set(clave, [...(escrituras.get(clave) ?? []), y]);
           }
@@ -1902,6 +2160,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     expect(
       [...predicadosSinColumna].sort(),
       'un UPDATE lleva un predicado que este censo no sabe leer, o repite una columna: puede anular la sentencia entera',
+    ).toEqual([]);
+    expect(
+      [...conjuntosImposibles].sort(),
+      'un UPDATE acota por un valor que su propia ruta ya descartó: no toca ninguna fila',
     ).toEqual([]);
   });
 });

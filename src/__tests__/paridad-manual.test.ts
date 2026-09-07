@@ -594,40 +594,64 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         if (!ts.isTaggedTemplateExpression(x)) return;
         /*
          * Una consulta de postgres.js es PEREZOSA: no sale hacia la base hasta que alguien la
-         * espera. Así que una plantilla cuyo valor se TIRA —la sentencia entera, o envuelta en
-         * un `void`, unos paréntesis o un `as`— no se ejecuta, y ni TypeScript ni las reglas de
-         * lint la rechazan. Contarla dejaría la invariante en verde justo cuando la operación
-         * manual ha dejado de ocurrir, que es lo mismo que pasaba con el comentario y con la
-         * cadena.
+         * espera. Así que la pregunta no es «¿se tira este valor?» sino «¿SE EJECUTA?», y ésa
+         * es la vuelta que faltaba: enumerar las formas de tirarlo —la sentencia suelta, el
+         * `void`, la variable que nadie consume— deja fuera todas las que no se enumeraron.
+         * Guardar la plantilla en un objeto (`const h = { pendiente: tx\`…\` }`) no la ejecuta,
+         * y el censo la contaba porque su padre no era ninguno de los casos previstos.
          *
-         * Se sube por las envolturas que no consumen el valor antes de mirar dónde acaba: la
-         * primera versión miraba sólo el padre inmediato, y `void tx\`…\`` se colaba por ahí.
+         * Así que se sube desde la plantilla hasta encontrar QUIÉN la dispara, y lo que no
+         * llegue a uno de esos sitios no cuenta:
+         *   · el `await` o el `return` que la espera, a través de lo que no consume el valor
+         *     —paréntesis, `as`, `!`—;
+         *   · el `Promise.all([…])` que espera varias, si a su vez se espera;
+         *   · o una variable cuyo NOMBRE se consume después en la misma función.
+         * Un `void`, un argumento de otra llamada, o quedarse dentro de un objeto o una lista,
+         * no la ejecutan.
          */
-        let arriba: ts.Node | undefined = x.parent;
-        while (
-          arriba !== undefined &&
-          (ts.isVoidExpression(arriba) ||
-            ts.isParenthesizedExpression(arriba) ||
-            ts.isAsExpression(arriba) ||
-            ts.isNonNullExpression(arriba))
-        ) {
-          arriba = arriba.parent as ts.Node | undefined;
-        }
-        if (arriba !== undefined && ts.isExpressionStatement(arriba)) return;
-        /*
-         * Y si se GUARDA en una variable, esa variable tiene que consumirse. `const pendiente =
-         * tx\`…\`` seguido de un `console.debug(pendiente)` pasa el lint y no envía nada: la
-         * consulta sigue siendo perezosa. Se pide que el nombre aparezca dentro de un `await` o
-         * de un `return` en algún punto de la función — que es lo que de verdad la dispara—.
-         */
-        if (
-          arriba !== undefined &&
-          ts.isVariableDeclaration(arriba) &&
-          ts.isIdentifier(arriba.name) &&
-          !(consumidosEn.get(funcionDe(arriba))?.has(arriba.name.text) ?? false)
-        ) {
-          return;
-        }
+        const seEjecuta = (desde: ts.Node, saltos = 0): boolean => {
+          if (saltos > 12) return false;
+          let hijo: ts.Node = desde;
+          let padre = hijo.parent as ts.Node | undefined;
+          while (
+            padre !== undefined &&
+            (ts.isParenthesizedExpression(padre) ||
+              ts.isAsExpression(padre) ||
+              ts.isNonNullExpression(padre)) &&
+            padre.expression === hijo
+          ) {
+            hijo = padre;
+            padre = padre.parent as ts.Node | undefined;
+          }
+          if (padre === undefined) return false;
+          if (ts.isAwaitExpression(padre) && padre.expression === hijo) return true;
+          if (ts.isReturnStatement(padre) && padre.expression === hijo) return true;
+          // `Promise.all([q1, q2])`: la lista y la llamada sólo cuentan si LA LLAMADA se espera.
+          if (ts.isArrayLiteralExpression(padre) && padre.elements.includes(hijo as ts.Expression)) {
+            const llamada = padre.parent as ts.Node | undefined;
+            if (
+              llamada !== undefined &&
+              ts.isCallExpression(llamada) &&
+              esperaConjunta(llamada) &&
+              llamada.arguments.includes(padre)
+            ) {
+              return seEjecuta(llamada, saltos + 1);
+            }
+            return false;
+          }
+          if (
+            ts.isCallExpression(padre) &&
+            esperaConjunta(padre) &&
+            padre.arguments.includes(hijo as ts.Expression)
+          ) {
+            return seEjecuta(padre, saltos + 1);
+          }
+          if (ts.isVariableDeclaration(padre) && padre.initializer === hijo && ts.isIdentifier(padre.name)) {
+            return consumidosEn.get(funcionDe(padre))?.has(padre.name.text) ?? false;
+          }
+          return false;
+        };
+        if (!seEjecuta(x)) return;
         const t = x.template;
         const etiqueta = x.tag.getText();
         if (ts.isNoSubstitutionTemplateLiteral(t)) {
@@ -1474,8 +1498,43 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * identificador con nada y tampoco nombra a su columna.
            */
           if ([...mios].some((n) => pelar(n) === pelar(c))) continue;
+          /*
+           * Y la salvedad del SQL vale sólo si NINGUNA interpolación llega al valor fuera de una
+           * subconsulta. Con la mención a secas, `contribucion = coalesce(${'${entrada.reviewId}'}
+           * ::text, contribucion)` pasaba nombrando la columna en el respaldo mientras guardaba
+           * el dato equivocado: la mención textual no es derivación. Lo que la hace legítima en
+           * el `orden` de una afirmación es que el valor lo calcula ENTERO la base —los `${'${…}'}`
+           * viven dentro del `where` de su subconsulta, no en el valor—; en cuanto una
+           * interpolación es operando del valor, ésa es la fuente y tiene que justificarse.
+           */
           const suyoSql = x.valores.get(c) ?? '';
-          if (new RegExp(`\\b${c}\\b`, 'i').test(suyoSql)) continue;
+          const sinSubconsultas = (t: string): string => {
+            let y = t;
+            for (;;) {
+              const m = /\(\s*select\b/i.exec(y);
+              if (!m) return y;
+              let hondo = 0;
+              let fin = -1;
+              for (let i = m.index; i < y.length; i += 1) {
+                if (y[i] === '(') hondo += 1;
+                else if (y[i] === ')') {
+                  hondo -= 1;
+                  if (hondo === 0) {
+                    fin = i;
+                    break;
+                  }
+                }
+              }
+              if (fin < 0) return y;
+              y = y.slice(0, m.index) + y.slice(fin + 1);
+            }
+          };
+          if (
+            !/:i\d/.test(sinSubconsultas(suyoSql)) &&
+            new RegExp(`\\b${c}\\b`, 'i').test(suyoSql)
+          ) {
+            continue;
+          }
           campos.push(
             `${e}.${c} ← ${[...suyos].sort().join('|')}${mios.size === 0 ? ' (a mano, sin origen)' : ''}`,
           );
@@ -1497,6 +1556,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         const tabla = e.split(' ').pop() ?? '';
         const nombraLaFila = (n: string, col: string): boolean => {
           if (pelar(n) === pelar(col)) return true;
+          /*
+           * Y el sustantivo de la tabla nombra la fila por su IDENTIDAD, así que vale para `id`
+           * y para nada más. Sin acotarlo, `where id = ${'${entrada.reviewId}'} and workspace_id =
+           * ${'${entrada.reviewId}'}` pasaba entero —`review` es palabra de `outcome_review`, y el
+           * cruce no salta porque `reviewId` no nombra a ninguna de las dos columnas— y ese
+           * guardado no toca ninguna fila.
+           */
+          if (col !== 'id') return false;
           const sinId = pelar(n).replace(/id$/, '');
           if (sinId === '') return false;
           return sinId === pelar(tabla) || tabla.split('_').includes(sinId);

@@ -1,12 +1,12 @@
 ---
 status: current
-last_verified: 2026-09-06
+last_verified: 2026-09-07
 audience: mixed (producto, boutique, ingeniería, comercial, revisores de seguridad)
 language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 80a976a, 2026-09-06). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta c1e8a6b, 2026-09-07). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,7 +17,7 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-06, punta `80a976a`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-07, punta `c1e8a6b`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
 > [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
@@ -26,8 +26,9 @@ language: es
 > [#49](https://github.com/jtrujillo-ws/designio-app/pull/49),
 > [#50](https://github.com/jtrujillo-ws/designio-app/pull/50),
 > [#51](https://github.com/jtrujillo-ws/designio-app/pull/51),
-> [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) y
-> [#52](https://github.com/jtrujillo-ws/designio-app/pull/52)). Donde el paquete de diseño y el código
+> [#48](https://github.com/jtrujillo-ws/designio-app/pull/48),
+> [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) y
+> [#53](https://github.com/jtrujillo-ws/designio-app/pull/53)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -40,7 +41,8 @@ El documento sigue los **destinos del lateral del workspace 1:1**: cada destino 
 (Loop, Bandeja de importación, Aprobaciones, Evidencia, Insights, Biblioteca, Journeys, Versions y
 releases, Propuestas AI, Personas, Segmentos, Exportación, Disposición, Auditoría) tiene su capítulo,
 y las pantallas de detalle (proyecto, journey, design version) cuelgan del capítulo que las abre; el
-destino «Operación de la capa AI» (#52) cuelga del capítulo 10, porque lee el mismo libro. Los
+destino «Operación de la capa AI» (#52) y el destino «Grounding medido» (#53) cuelgan del capítulo
+10, porque leen el mismo libro. Los
 capítulos van en el orden del loop; el lateral, desde #51, agrupa esos mismos destinos por clase
 (lo que espera, material y razonamiento, diseño y entrega, gobierno), sin quitar ni añadir ninguno.
 Tiene cuatro partes:
@@ -64,7 +66,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49, #50, #51, #48 y #52 se fusionaron entre el 2026-09-05 y el 2026-09-06) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy: ninguno; #39, #43, #45, #46, #47, #49, #50, #51, #48, #52 y #53 se fusionaron entre el 2026-09-05 y el 2026-09-07) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -224,7 +226,7 @@ flowchart TD
     AI["Pipeline PropuestaAI<br/>src/lib/ai"]
   end
   subgraph Datos["PostgreSQL 15 (Railway)"]
-    PG[("56 migraciones forward-only<br/>RLS activo en toda tabla<br/>guards SECURITY DEFINER<br/>evento_dominio append-only")]
+    PG[("57 migraciones forward-only<br/>RLS activo en toda tabla<br/>guards SECURITY DEFINER<br/>evento_dominio append-only")]
   end
   subgraph Ext["Externos"]
     LLM["SDK Anthropic<br/>claude-sonnet-5 → claude-sonnet-4-6"]
@@ -360,7 +362,7 @@ cruzados y la guía de abajo los enumera.
 flowchart LR
   subgraph CLI["Navegador"]
     direction TB
-    R["React 19 · TanStack Router<br/>19 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
+    R["React 19 · TanStack Router<br/>20 rutas autenticadas<br/>+ login e invitación<br/>src/routes"]
     UI["Design system y componentes<br/>src/components"]
   end
   subgraph SRV["Servidor · Bun 1.3 · TanStack Start"]
@@ -386,7 +388,7 @@ flowchart LR
     T_JOU["Tablas de journeys"]
     T_ENT["Tablas de entrega<br/>y medición"]
     T_AI["propuesta_ai · llamada_ai · reserva_ai<br/>lo aceptado se materializa<br/>en las tablas de destino"]
-    RLS["RLS en toda tabla · rol sin bypass<br/>guards SECURITY DEFINER<br/>evento_dominio append-only<br/>dos conexiones: admin y designio_app<br/>56 migraciones forward-only"]
+    RLS["RLS en toda tabla · rol sin bypass<br/>guards SECURITY DEFINER<br/>evento_dominio append-only<br/>dos conexiones: admin y designio_app<br/>57 migraciones forward-only"]
   end
   subgraph EXT["Externos y operación"]
     direction TB
@@ -451,9 +453,10 @@ viajan entre módulos como comportamiento, no solo como tipo: `ROLES_CURADORES` 
 `evidencia`) decide en `ai` quién pide una generación y en `loop` a quién se le promueve la bandeja;
 `ROLES_DERECHOS` (`evidencia`) fija en `aprobaciones` quién decide derechos pendientes; y
 `ROLES_AUDITORIA` (`portal`) y `ROLES_DISPOSICION` (`disposicion`) deciden en `loop` qué destinos
-ve cada rol y con qué rótulo, y `ROLES_OBSERVABILIDAD_AI` (definida en `ai.roles.ts`, un módulo sin
-Zod, como alias de `ROLES_AUDITORIA`) decide en `loop` quién ve la operación de la capa AI: desde #52
-un censo del grafo de módulos impide que el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`.
+ve cada rol y con qué rótulo, y `ROLES_OBSERVABILIDAD_AI` y `ROLES_INFORME_GROUNDING` (definidas en
+`ai.roles.ts`, un módulo sin Zod, como alias de `ROLES_AUDITORIA`) deciden en `loop` quién ve la
+operación de la capa AI y el informe de grounding: desde #52 un censo del grafo de módulos impide que
+el lateral vuelva a alcanzar `ai.schemas` o `ai.contenido`.
 Cambiar una de esas listas cambia esos módulos. El resto de esquemas
 Zod y tipos se importan libremente entre módulos como contratos compartidos. El detalle de tablas por
 contexto está en `21` y el de la capa AI en `22`.
@@ -474,6 +477,7 @@ contexto está en `21` y el de la capa AI en `22`.
 | Metric Registry, snapshots, outcome review | `/proyecto/$id` (sección medición) | `medicion` | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` | 09 |
 | Propuestas AI (CI, C0, CT, C2, C3, C4, C5, C6, C7) | `/propuestas` | `ai` | `propuesta_ai`, `llamada_ai`, `reserva_ai` | 10 |
 | Operación de la capa AI (coste, latencia, error y aceptación por capacidad) | `/observabilidad-ai` | `ai` (`ai.observabilidad.ts`) | `llamada_ai`, `reserva_ai`, `propuesta_ai` (solo lectura) | 10 |
+| Grounding medido (corridas de evals sobre lo aceptado, comparadas contra la corrida anterior y contra otra versión) | `/evals-grounding` | `ai` (`ai.evals.ts`) | `corrida_eval`, `medicion_eval` | 10 |
 | Aprobaciones pendientes por rol | `/aprobaciones` | `aprobaciones` (proyección) | lee `gate_instancia`, `derecho_uso`, `insight`, `design_version` | 11 |
 | Hilos del portal y auditoría | `/proyecto/$id`, `/design-version/$id`, `/auditoria` | `portal` | `hilo_comentario`, `comentario`, `evento_dominio` | 12 |
 | Biblioteca del cliente | `/biblioteca` | `memoria` (proyección) | lee `arquetipo`, `insight`, `decision`, `reto`, `segmento` | 13 |
@@ -499,7 +503,7 @@ contexto está en `21` y el de la capa AI en `22`.
    tokens, costo y modelo; cada propuesta conserva su contenido original aunque se corrija; sin
    proveedor la plataforma funciona igual y lo dice (con la excepción de J2 anotada arriba).
 
-## Estado del producto de un vistazo (2026-09-06)
+## Estado del producto de un vistazo (2026-09-07)
 
 | Bloque | Construido | En vuelo | Diseñado, pendiente |
 |---|---|---|---|
@@ -512,7 +516,7 @@ contexto está en `21` y el de la capa AI en `22`.
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
 | Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones como discrepancias propuestas (RF-06.8); C7 solo lee las ya registradas dentro del borrador del post mortem (discrepancia 20) |
 | Metric Registry (con borrador AI de entradas KPI, C6), snapshots, outcome review (con borrador AI de la narrativa, C7), veredicto | ✔ | | Recordatorios por cadencia, series ancladas a fechas de release |
-| Pipeline PropuestaAI, presupuesto, degradación, consentimiento, operación de la capa AI (RF-08.9) | ✔ (CI, C0, CT, C2, C3, C4, C5, C6, C7; cuadro de coste, latencia, error y aceptación por capacidad) | | C1 (transcripción), plan de releases asistido; BYOAI con secret manager; evals de grounding programadas |
+| Pipeline PropuestaAI, presupuesto, degradación, consentimiento, operación de la capa AI (RF-08.9), evals de grounding (RF-08.7) | ✔ (CI, C0, CT, C2, C3, C4, C5, C6, C7; cuadro de coste, latencia, error y aceptación por capacidad; corridas de grounding guardadas y comparadas contra la anterior y contra otra versión de prompt) | | C1 (transcripción), plan de releases asistido; BYOAI con secret manager; la corrida **periódica** de evals (no hay planificador) y la fidelidad semántica de citas (exigida y no medida) |
 | Exportación (archivo y entregable), disposición acordada | ✔ | | Exportación de adjuntos por object storage |
 | Despliegue Railway, CI de seis checks, suite authz contra Postgres real | ✔ | | E2E Playwright, scheduler y cron, backups verificados |
 
@@ -539,7 +543,7 @@ del handoff: un **lateral en negro violeta** que navega el árbol y un contenido
 
 | Zona | Contenido |
 |---|---|
-| **Lateral** | Marca tipográfica `designio.`; selector de **workspace activo** (una fila por membresía; cambiarlo remonta la pantalla); árbol **Cliente → Servicios → Retos → Proyectos** con el estado de cada reto pintado con el color del journey en que está (`J2`… `J7`, `cerrado`, o punteado para candidatos nacidos del post mortem); fila «+ Nuevo servicio» que abre un formulario en el sitio; y los destinos del workspace agrupados por clase desde [#51](https://github.com/jtrujillo-ws/designio-app/pull/51): **«Te espera»** arriba del árbol con exactamente los destinos que tienen contador (Aprobaciones con lo pendiente del rol, Bandeja con lo sin curar; a cero el bloque no existe y la fila vuelve a su estante), dos estantes de consulta siempre visibles, **«Material y razonamiento»** (Bandeja, Aprobaciones cuando no esperan, Evidencia, Insights, Oportunidades HMW, Segmentos) y **«Diseño y entrega»** (Journeys, Versions y releases, Propuestas AI con el sufijo «propone», Biblioteca), y **«Gobierno del workspace»** plegado en una fila que cuenta lo que el rol ve (Personas, Exportación, Disposición y, para los roles que las ven, Auditoría y, desde #52, Operación de la capa AI), con una nota que nombra solo esos destinos y la preferencia de abierto o cerrado recordada en el navegador por usuario y workspace |
+| **Lateral** | Marca tipográfica `designio.`; selector de **workspace activo** (una fila por membresía; cambiarlo remonta la pantalla); árbol **Cliente → Servicios → Retos → Proyectos** con el estado de cada reto pintado con el color del journey en que está (`J2`… `J7`, `cerrado`, o punteado para candidatos nacidos del post mortem); fila «+ Nuevo servicio» que abre un formulario en el sitio; y los destinos del workspace agrupados por clase desde [#51](https://github.com/jtrujillo-ws/designio-app/pull/51): **«Te espera»** arriba del árbol con exactamente los destinos que tienen contador (Aprobaciones con lo pendiente del rol, Bandeja con lo sin curar; a cero el bloque no existe y la fila vuelve a su estante), dos estantes de consulta siempre visibles, **«Material y razonamiento»** (Bandeja, Aprobaciones cuando no esperan, Evidencia, Insights, Oportunidades HMW, Segmentos) y **«Diseño y entrega»** (Journeys, Versions y releases, Propuestas AI con el sufijo «propone», Biblioteca), y **«Gobierno del workspace»** plegado en una fila que cuenta lo que el rol ve (Personas, Exportación, Disposición y, para los roles que las ven, Auditoría, Operación de la capa AI desde #52 y Grounding medido desde #53), con una nota que nombra solo esos destinos y la preferencia de abierto o cerrado recordada en el navegador por usuario y workspace |
 | **Topbar** | Buscador del workspace (busca de verdad: servicios, retos, proyectos, journeys, design versions, evidencia e insights, hasta 5 por clase y 20 en total, mínimo 2 caracteres) y salida de sesión. No repite marca, cliente ni usuario: esos son del lateral |
 | **Cabecera de arco** | Servicio seleccionado (estado de ruta `?servicio=`), reto y proyecto actuales, cifras del reto (criterios, gates cerrados, release vivo) y la barra del arco J1→J7 |
 | **Spotlight** | El journey **en curso** con su descripción, el gate abierto y el enlace a la pantalla donde se trabaja; con el loop cerrado enseña J7 hecho |
@@ -551,7 +555,7 @@ del handoff: un **lateral en negro violeta** que navega el árbol y un contenido
 Regla pura (`src/lib/loop/lateral.ts`), compartida entre cliente y servidor y probada sin pintar
 nada: la bandeja solo cuenta para quien la cura (lead y diseñador), así que a un sponsor no se le
 promueve a «Te espera»; el filtrado por rol es el de siempre (Auditoría solo para
-`ROLES_AUDITORIA`, Operación de la capa AI solo para `ROLES_OBSERVABILIDAD_AI`, que es la misma lista; Disposición se enseña a todos y solo cambia el rótulo a «Constancias que
+`ROLES_AUDITORIA`, Operación de la capa AI y Grounding medido solo para `ROLES_OBSERVABILIDAD_AI` y `ROLES_INFORME_GROUNDING`, que son la misma lista; Disposición se enseña a todos y solo cambia el rótulo a «Constancias que
 conservas» para quien no decide la disposición); ningún destino se pierde ni se repite al agrupar.
 En el riel estrecho cada fila es su abreviatura de tres letras y los estantes los separa un
 hairline. El árbol pinta sus cuatro niveles (ADR-0003): cada proyecto del reto cuelga como subfila
@@ -1350,6 +1354,42 @@ en cero y una que el registro ya no cubre aparece con su gasto.
 - **Pregunta de producto abierta** (anotada en `30`): quién ve la factura de la AI cuando BYOAI
   exista y la credencial sea del cliente.
 
+## Grounding medido (`/evals-grounding`)
+
+**Estado: Construido, salvo lo periódico** — PR [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) «El grounding se mide, se guarda y se
+compara: contra la corrida anterior y contra la otra versión» (RF-08.7). Una **corrida**
+(`corrida_eval`, estampada con `PROMPT_VERSION`, que es también su filtro: mide las propuestas
+**aceptadas** generadas con esa versión) guarda una fila por métrica y capacidad en `medicion_eval`
+con numerador, denominador, `sin_veredicto` y tasa. Cinco métricas (`METRICAS_DE_GROUNDING`),
+cuatro calculadas desde la base **sin llamar a ningún modelo** (deterministas, corribles en CI y no
+circulares) y la quinta declarada y vacía:
+
+| Métrica | Qué cuenta | Universo |
+|---|---|---|
+| `fidelidad-de-citas` | **Nada: se escribe siempre nula.** RF-08.7 exige un juicio semántico («la cita dice lo que el objeto afirma») que el repositorio no mide; la fila viaja rotulada «exigida y NO medida» (`METRICAS_SIN_MEDIR`, distinta de «no aplica») para que el hueco esté en el informe y la serie histórica ya tenga su carril | — |
+| `suelo-presencia-literal` | Citas de lo aceptado que aparecen literalmente en el material que vio el modelo; es un suelo, no fidelidad | Todas |
+| `afirmaciones-no-soportadas` | Afirmaciones **que el modelo propuso** (leídas del payload de la propuesta, no de la tabla `afirmacion`, para que una afirmación añadida a mano no contamine la cifra), no hipótesis, sin ninguna cita con derechos vigentes | Las que materializan insights (`CAPACIDADES_CON_AFIRMACIONES`) |
+| `correccion-humana` | Propuestas `corregida` sobre las materializadas (SYS-17) | Todas |
+| `contradicciones` | Insights aceptados con contraevidencia registrada (RF-03.9), sin distinguir quién la señaló | Las que materializan insights |
+
+- **Dos comparaciones, porque son dos preguntas**: el informe (`informeDeGrounding`) trae la
+  corrida `anterior` (la inmediatamente previa, la literalidad del criterio 4 de RF-08.7) y la
+  `anteriorDeOtraVersion` (la última de una versión de prompt distinta, la alarma de §17 «fidelidad
+  que no mejora entre releases»); la pantalla pinta las dos columnas de delta y avisa cuando lo
+  guardado midió una versión distinta de la que corre hoy. `sin_veredicto` es columna y no
+  derivada: una cita cuyo material cambió (por ejemplo, un derecho revocado) queda sin veredicto en
+  vez de contarse ausente, y `0/1` y `0/0 con una sin veredicto` dicen cosas opuestas.
+- **Dos puertas distintas**: **leer** el informe es de quien audita (`ROLES_INFORME_GROUNDING`,
+  alias de `ROLES_AUDITORIA`); **correr** una eval escribe un hecho fechado y es de los curadores
+  (`ROLES_CORREN_EVAL`: lead y diseñador, la misma lista que las políticas de INSERT de las dos
+  tablas, enfrentadas por un censo). La RLS deja leer las dos tablas a todo miembro; la pantalla la
+  cierra la proyección. Las dos tablas van al archivo de exportación y quedan `fuera` del
+  entregable. El lateral ofrece el destino bajo «Gobierno del workspace» con la abreviatura GRD.
+- **Lo que no entra, dicho**: el «periódicamente» de RF-08.7. No hay planificador en el repositorio
+  (ver `30`); el runner es una función de (actor, workspace) lista para el job que llegue, y la
+  pantalla enseña la fecha de la última corrida en vez de fingir estar al día. Cuatro preguntas de
+  producto quedan anotadas en las decisiones abiertas de `30`.
+
 ## Fuente
 
 SPEC-08 (RF-08.1 a RF-08.9), ADR-0012, SYS-17 a SYS-21. PRs [#14/b7e04b7](https://github.com/jtrujillo-ws/designio-app/commit/b7e04b7),
@@ -1497,7 +1537,7 @@ Dos ámbitos con dos reglas distintas, ambas correctas:
 | Ámbito | Qué lleva | Para qué |
 |---|---|---|
 | **archivo** | **Todo** el catálogo de objetos del workspace (tablas del dominio, auditoría, adjuntos), verificado contra un manifiesto. Los adjuntos viajan embebidos hasta un presupuesto de **25 MiB por paquete**; los que no caben quedan listados con sus metadatos, su `sha256` y el motivo de omisión, y se descargan aparte desde la bandeja | La copia del propietario (SYS-04, RF-01.8) |
-| **entregable** | **Solo evidencia**: la que tiene **derechos vigentes** para ámbito cliente, con su fuente, su mapeo a segmentos y los segmentos del workspace, sus registros de derecho de uso y los adjuntos originales de su ítem (`CATALOGO_EXPORT`: `evidencia`, `evidencia_segmento` y `derecho_uso` en modo `porEvidencia`, `fuente` en `porFuente`, `archivo_importado` en `porItem`, `segmento` en `todo`). La **propuesta AI** de la que nació una evidencia **no viaja**: `propuesta_ai` va `fuera` y la entrada de `evidencia` la declara como padre ausente («el entregable lleva la evidencia curada, no el artefacto interno que la produjo»), así que el `propuesta_ai_id` de la fila queda sin destino en el paquete. **No lleva** el razonamiento ni lo derivado: insights, decisiones, arquetipos, oportunidades, conceptos, journeys, design versions, releases, medición, hilos y auditoría van `fuera` en el catálogo, tabla por tabla y con justificación. La evidencia excluida por derechos sale **listada con el motivo**. Las cuatro tablas de las revisiones simuladas (`revision_simulada`, `hallazgo_simulado`, `hallazgo_simulado_evidencia`, `pregunta_de_test`) van al archivo y quedan `fuera` del entregable: entregarlas junto a la evidencia invitaría a leerlas como hallazgo de investigación (SYS-20) | El paquete que se entrega al cliente (RF-03.10) |
+| **entregable** | **Solo evidencia**: la que tiene **derechos vigentes** para ámbito cliente, con su fuente, su mapeo a segmentos y los segmentos del workspace, sus registros de derecho de uso y los adjuntos originales de su ítem (`CATALOGO_EXPORT`: `evidencia`, `evidencia_segmento` y `derecho_uso` en modo `porEvidencia`, `fuente` en `porFuente`, `archivo_importado` en `porItem`, `segmento` en `todo`). La **propuesta AI** de la que nació una evidencia **no viaja**: `propuesta_ai` va `fuera` y la entrada de `evidencia` la declara como padre ausente («el entregable lleva la evidencia curada, no el artefacto interno que la produjo»), así que el `propuesta_ai_id` de la fila queda sin destino en el paquete. **No lleva** el razonamiento ni lo derivado: insights, decisiones, arquetipos, oportunidades, conceptos, journeys, design versions, releases, medición, hilos y auditoría van `fuera` en el catálogo, tabla por tabla y con justificación. La evidencia excluida por derechos sale **listada con el motivo**. Las cuatro tablas de las revisiones simuladas (`revision_simulada`, `hallazgo_simulado`, `hallazgo_simulado_evidencia`, `pregunta_de_test`) van al archivo y quedan `fuera` del entregable: entregarlas junto a la evidencia invitaría a leerlas como hallazgo de investigación (SYS-20); lo mismo `corrida_eval` y `medicion_eval` (#53), que son operación de la capa AI y no trabajo entregado | El paquete que se entrega al cliente (RF-03.10) |
 
 - Exportar es una acción explícita (POST) que **deja auditoría**; la base registra permiso y evento
   en `registrar_exportacion` y **confirma** la entrega en `exportacion_registro`, que la disposición
@@ -1679,7 +1719,7 @@ JourneyBadge, Select, Switch, Tabs, Tag, Textarea, Wordmark); piezas de pantalla
 
 ## Migraciones
 
-**56 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
+**57 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
 vez con ledger `schema_migrations`. Las trece primeras crean el dominio (workspace, auth, árbol,
 evidencia, método, insight y decisión, portal, journey, medición, design version, evidencia
 profunda); las siguientes son **endurecimientos con nombre propio**, cada una con su motivación
@@ -1700,7 +1740,7 @@ criterios», «C3: la oportunidad se propone desde los insights», «el concepto
 | Journey | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot` |
 | Entrega | `design_version`, `elemento_cambio`, `elemento_decision`, `elemento_insight`, `release`, `release_elemento`, `effective_state`, `constatacion` |
 | Medición | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` |
-| AI | `llamada_ai`, `reserva_ai`, `propuesta_ai` |
+| AI | `llamada_ai`, `reserva_ai`, `propuesta_ai`, `corrida_eval`, `medicion_eval` |
 
 Toda tabla de datos de cliente lleva `workspace_id` con FK compuesta `(id, workspace_id)` hacia sus
 padres, de modo que ninguna FK cruza workspaces y el borrado acordado puede derivar el conjunto
@@ -1774,7 +1814,8 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
 | `ai.servicio.ts` | Orquestación: rol curador, presupuesto sobre `llamada_ai`, reserva, libro anticipado, materiales por capacidad, validación de ids contra el material, revisión y materialización |
 | `ai.functions.ts` | Server functions: panel, generar, aceptar, rechazar, registrar consentimiento, observabilidad del workspace |
 | `ai.observabilidad.ts` | Lector de RF-08.9: coste, latencia p50/p95, tasas de error y aceptación por capacidad, sobre `llamada_ai` y `propuesta_ai`, con `reservaSigueViva` compartido con el presupuesto; cerrado a `ROLES_OBSERVABILIDAD_AI` |
-| `ai.roles.ts` | Puertas de rol de la capa AI sin Zod (`ROLES_OBSERVABILIDAD_AI`), para que el lateral no arrastre el contrato AI (censo del grafo de módulos en la suite) |
+| `ai.roles.ts` | Puertas de rol de la capa AI sin Zod (`ROLES_OBSERVABILIDAD_AI`, `ROLES_INFORME_GROUNDING`), para que el lateral no arrastre el contrato AI (censo del grafo de módulos en la suite) |
+| `ai.evals.ts` | Corrida y lectura de las evals de grounding (RF-08.7): cuatro métricas calculadas desde la base sobre el payload de lo aceptado, filtradas por `PROMPT_VERSION`, con `sin_veredicto` guardado; informe con la corrida anterior y la última de otra versión; `CAPACIDADES_CON_AFIRMACIONES` derivada del registro |
 
 ## Persistencia
 
@@ -1835,7 +1876,7 @@ tasa de corrección humana ya se puede derivar de `contenido` vs `contenido_orig
 |---|---|
 | Tests de aislamiento por tenant en CI | **Construido** (suite `src/__tests__/authz/`, bloqueante) |
 | Prueba «AI off» del loop completo | **Parcial**: pruebas de degradación (`ai/__tests__/degradacion.test.ts`, `authz/ai.test.ts`) y la app funciona sin key; no hay recorrido E2E del loop con flag |
-| Evals de grounding con línea base | **Diseñado** |
+| Evals de grounding con línea base | **Parcial**: cuatro métricas deterministas se corren a demanda, se guardan por versión de prompt y se comparan contra la corrida anterior y contra otra versión (#53); falta la corrida periódica (sin planificador) y la fidelidad semántica de citas está declarada y no medida |
 | Escaneo y validación en la bandeja | **Parcial**: validación de formato, saneado y presupuesto de bytes; sin escaneo de malware |
 | Export/borrado completo verificado contra manifiesto | **Parcial**: exportación y disposición construidas (catálogo contrastado contra FKs vivas; constancia sellada), pero el `borrado` se rechaza cuando los adjuntos superan los 25 MiB del paquete, y el remedio en la aplicación (retirar adjuntos) solo alcanza a los de ítems pendientes; con adjuntos curados por encima del presupuesto solo cabe el `archivo` o la conexión administrativa (capítulo 17) |
 | Auditoría cubriendo el catálogo de acciones | **Parcial**: las transiciones y decisiones se emiten desde guards de la base, así que el SQL directo deja acta; las altas y parte de la curaduría (ítems, evidencia curada, adjuntos, insights propuestos, contradicciones, retos, servicios, journeys, arquetipos, decisiones, segmentos, invitaciones) emiten su evento desde el servicio en la misma transacción, sin trigger de tabla, y no hay un censo automático que contraste el catálogo de acciones con los eventos |
@@ -1934,7 +1975,7 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (24 archivos, uno por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, oportunidad, concepto, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#52): **988 pruebas** en verde. La suite de
+Recuento al último PR fusionado (#53): **1000 pruebas** en verde. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -1946,7 +1987,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 | PR | Qué trae | Estado |
 |---|---|---|
-| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) y [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) | — |
+| — | Ningún PR de producto abierto a fecha 2026-09-06. Los últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -1959,7 +2000,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones como **discrepancias propuestas** entre la design version y lo constatado, a confirmar por el lead (la spec sigue vigente; C7 solo lee las desviaciones ya registradas dentro del borrador del post mortem, y la migración de #47 argumenta contra un detector que proponga constataciones: decisión de producto pendiente, discrepancia 20) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
-| SPEC-08 AI | Capacidad C1 (transcripción y diarización) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; evaluaciones de grounding con línea base y regresión (la observabilidad por capacidad ya está construida en `/observabilidad-ai`, #52) | RF-08.2, RF-08.7 |
+| SPEC-08 AI | Capacidad C1 (transcripción y diarización) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; la corrida **periódica** de las evals de grounding y una medida de fidelidad semántica de citas (las cuatro métricas deterministas, su serie por versión de prompt y la comparación ya están construidas en `/evals-grounding`, #53; la observabilidad por capacidad en `/observabilidad-ai`, #52) | RF-08.2, RF-08.7 |
 | SPEC-09 Seguridad | Prueba «AI off» del loop completo como E2E; condiciones de proveedores registradas; backups con prueba de restauración documentada | RF-09.10, RF-09.11 |
 | Diseño técnico | Scheduler in-app (`scheduled_jobs` + tick + claim latch) y servicio cron de Railway; Playwright E2E; búsqueda semántica intra-workspace con pgvector; ADR formal «Stack del MVP» | `docs/06-diseno-tecnico/` |
 
@@ -2002,6 +2043,10 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | ADR «Stack del MVP» | Resuelto en dirección; ADR formal pendiente |
 | Iconografía | Lucide propuesto, pendiente de confirmación |
 | Quién ve la factura de la AI | Abierto (planteado en #52): hoy la proyección de `/observabilidad-ai` se cierra a quien audita (admin del cliente, lead y diseñador); con BYOAI (RF-09.9) la credencial del workspace significa que paga el cliente, y quien paga probablemente deba ver lo que gasta |
+| Fidelidad de citas (RF-08.7 §9) | Abierto (planteado en #53): medir «la cita dice lo que el objeto afirma» pide un juicio; las salidas son un modelo como juez (circular y con coste por corrida) o nombrar el proxy como proxy, que es lo que hay hoy con la exigencia declarada y vacía |
+| Umbral de la alarma de grounding (§17) | Abierto (#53): con el suelo publicado como suelo, qué umbral dispara «fidelidad que no mejora entre releases» y sobre qué métrica |
+| Revisiones escritas a mano en las evals | Abierto (#53): la ruta manual de C4 admite un fragmento sin llamada contra la que medirlo; hoy queda fuera del universo, y falta decidir si se mide contra el resumen de la evidencia o se declara fuera con su fracción |
+| Quién señaló la contradicción | Abierto (#53): la tabla no separa la contraevidencia que propuso el modelo de la añadida después; falta decidir si interesa separarlas |
 
 ## Fuera del MVP (ADR-0014 y specs)
 
@@ -2043,6 +2088,7 @@ clustering avanzado; modelos estadísticos de atribución; simulaciones masivas 
 | `/disposicion` | Disposición acordada | Construido |
 | `/auditoria` | Auditoría | Construido |
 | `/observabilidad-ai` | Operación de la capa AI: coste, latencia, error y aceptación por capacidad (RF-08.9) | Construido |
+| `/evals-grounding` | Grounding medido: corridas de evals sobre lo aceptado, comparadas (RF-08.7) | Construido (sin corrida periódica) |
 | `/healthz` (servidor) | Readiness del rollout: verifica rol, privilegios y base de la conexión de aplicación | Construido |
 
 ## Server functions por módulo
@@ -2064,7 +2110,7 @@ clustering avanzado; modelos estadísticos de atribución; simulaciones masivas 
 | `journey` | `journeyDelWorkspace`, `listaDeJourneys` | `crearJourneyDeServicio`, `agregarNodoAlJourney`, `editarNodoDelJourney`, `borrarNodoDelJourney`, `agregarAristaAlJourney`, `editarAristaDelJourney`, `borrarAristaDelJourney`, `enlazarEvidenciaAlNodo`, `desenlazarEvidenciaDelNodo`, `congelarSnapshotDelJourney` |
 | `entrega` | `designVersionDelWorkspace`, `listaDeDesignVersions`, `versionAprobadaDeServicio`, `proyectosYaCertificados`, `cadenaDelRelease` | `crearDesignVersionDelProyecto`, `agregarElementoDeCambio`, `editarElementoDeCambio`, `borrarElementoDeCambio`, `enlazarJourneyDeDesignVersion`, `declararSuperaADeDesignVersion`, `aprobarYCongelarDesignVersion`, `planificarReleaseDeDesignVersion`, `asignarElementoARelease`, `moverElementoDeRelease`, `quitarElementoDeRelease`, `registrarDespliegue`, `constatarReleaseDesplegado` |
 | `medicion` | `seguimientoDelProyecto` | `abrirRegistryDeReto`, `agregarEntradaKpi`, `editarEntradaKpi`, `borrarEntradaKpi`, `firmarMetricRegistry`, `abrirMedicionDelReto`, `cargarSnapshotDeFormulario`, `cargarSnapshotsPegados`, `pausarProyectoDelReto`, `retomarProyectoDelReto`, `abrirReviewDelReto`, `guardarBorradorDelReview`, `guardarResultadoDeCriterio`, `completarReviewDelReto` |
-| `ai` | `propuestasDelWorkspace`, `observabilidadDelWorkspace` | `generarPropuestasAI`, `aceptarPropuestaAI`, `rechazarPropuestaAI`, `registrarConsentimientoAI` |
+| `ai` | `propuestasDelWorkspace`, `observabilidadDelWorkspace`, `informeDeGroundingDelWorkspace` | `generarPropuestasAI`, `aceptarPropuestaAI`, `rechazarPropuestaAI`, `registrarConsentimientoAI`, `correrEvalDeGroundingDelWorkspace` |
 | `portal` | `hilosDelPortal`, `auditoriaDelWorkspace` | `abrirHiloDelPortal`, `comentarEnHilo`, `resolverHiloDelPortal` |
 | `exportacion` | — | `exportarWorkspaceFn` |
 | `disposicion` | `panelDisposicionFn`, `misConstanciasFn` | `registrarAcuerdoFn`, `ejecutarDisposicionFn` |
@@ -2130,6 +2176,7 @@ base.
 | **Reserva AI** | Hueco de presupuesto apartado para una generación en vuelo |
 | **Lineage** | Modelo, versión de prompt, origen de la key y alcance con que se produjo una propuesta |
 | **Presencia literal** | Medida de si el fragmento citado aparece en el material que el modelo vio; no es fidelidad |
+| **Corrida de eval** | Medición fechada del grounding de lo aceptado bajo una versión de prompt: cinco métricas por capacidad con numerador, denominador y casos sin veredicto, comparable con la corrida anterior y con la última de otra versión (#53) |
 | **Capacidad** | Una de C0–C7, CT o CI |
 | **Revisor AI** | Lente de revisión por arquetipo etiquetada como simulación; nunca evidencia (C4, construido en #48) |
 | **Revisión simulada** | Lo que una lente (arquetipo no refutado, con evidencia) ve en un concepto candidato: síntesis, hallazgos que citan o se declaran hipótesis, y preguntas para el test real; una por lente y concepto, con la marca de simulación imborrable |
@@ -2181,7 +2228,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Seis días de construcción (2026-09-01 a 2026-09-06), 49 commits en `agents`, cada uno un
+Siete días de construcción (2026-09-01 a 2026-09-07), 50 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -2235,6 +2282,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-06 | #51 | El lateral deja de ser una lista: lo pendiente arriba, el árbol entero y el gobierno plegado |
 | 09-06 | #48 | C4: los revisores AI son simulación, y lo siguen siendo después de aceptarlos |
 | 09-06 | #52 | RF-08.9: el libro de costos AI tiene lector, y sus números dicen lo que miden |
+| 09-07 | #53 | RF-08.7: el grounding se mide, se guarda y se compara contra dos corridas |
 
 ---
 

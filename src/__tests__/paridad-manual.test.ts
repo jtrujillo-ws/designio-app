@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { CAPACIDADES, CAPACIDADES_ACTIVAS } from '@/lib/ai/ai.schemas';
@@ -113,6 +113,361 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
     }
     return nombres;
+  };
+
+  /**
+   * LA LIGADURA LÉXICA DE UN NOMBRE EN EL SITIO DONDE SE USA: parámetro, variable, `function`,
+   * cabecera de `for` o `catch`. Si la hay, TAPA al import y el nombre ya no dice a dónde va.
+   *
+   * Vive aquí arriba, y no dentro de una sonda, porque las dos lo preguntan y porque la lección
+   * más cara de #54 fue justo ésta: «¿qué liga este nombre aquí?» se leía en varias copias, y
+   * tres rondas seguidas el hallazgo era el sitio que quedó sin actualizar al endurecer el de al
+   * lado. Una sola lectura, o vuelve.
+   */
+  const ligaEsteNombre = (b: ts.BindingName, nombre: string): boolean => {
+    if (ts.isIdentifier(b)) return b.text === nombre;
+    for (const e of b.elements) {
+      if (ts.isOmittedExpression(e)) continue;
+      if (ligaEsteNombre(e.name, nombre)) return true;
+    }
+    return false;
+  };
+
+  /*
+   * Y NO SÓLO UN `if`: LO QUE CORTOCIRCUITA TAMPOCO SE EJECUTA. Esta lectura sólo miraba
+   * sentencias de control, así que `onEnviar={() => false && definirCriterio(…)}` —o un
+   * `true ? viejo() : nuevo()`— contaba como invocación viva: quitar la llamada de verdad
+   * dejaba la invariante de pantallas en verde. Las cuatro formas que cortocircuitan en este
+   * lenguaje son `&&`, `||`, `??` y `?:`, y se leen aquí las cuatro; dejar una fuera es
+   * exactamente el hallazgo que ha vuelto ronda tras ronda.
+   *
+   * Sigue SIN plegar constantes —nada de seguir un `const MUERTO = false`—: se lee la palabra
+   * clave y como mucho se le quitan los paréntesis. Decidir qué es constante es por donde este
+   * censo empezaría a poner en rojo código intacto, y ése es el modo de fallo caro.
+   */
+  /**
+   * Quitadas las envolturas que no cambian a QUÉ se llama: paréntesis, `as` y `!`.
+   *
+   * Vive aquí porque el callee y el RECEPTOR tienen que leerse igual. Se desenvolvía sólo el
+   * callee, así que `(manual as typeof manual).definirCriterio(…)` —el `as` sobre el espacio de
+   * nombres, no sobre la llamada entera— dejaba un receptor que no era un identificador, la
+   * invocación válida se ignoraba y el censo se ponía ROJO SOBRE CÓDIGO QUE FUNCIONA.
+   */
+  const desenvuelto = (e: ts.Expression): ts.Expression => {
+    let x: ts.Expression = e;
+    while (
+      /*
+       * LAS CINCO, que son TODAS las que este lenguaje tiene: paréntesis, `as`, `satisfies`,
+       * `!` y el cast antiguo `<T>x`. Faltaba `satisfies`, y con él
+       * `(definirCriterio satisfies typeof definirCriterio)(…)` no se veía como llamada: ROJO
+       * SOBRE CÓDIGO QUE FUNCIONA. Una ronda después de prometer escribir las reglas enteras en
+       * vez del caso señalado, aquí sólo había tres de cinco. `<T>x` no cabe en un `.tsx`, pero
+       * el censo también lee los `.ts` de servicio, así que entra igual.
+       */
+      ts.isParenthesizedExpression(x) ||
+      ts.isAsExpression(x) ||
+      ts.isSatisfiesExpression(x) ||
+      ts.isNonNullExpression(x) ||
+      ts.isTypeAssertionExpression(x)
+    ) {
+      x = x.expression;
+    }
+    return x;
+  };
+
+  /**
+   * Las sentencias que contiene un ÁMBITO LÉXICO, o `null` si el nodo no lo es.
+   *
+   * Los CUATRO nodos del lenguaje que llevan lista de sentencias y forman ámbito: el fichero,
+   * un bloque, el cuerpo de un `namespace` y el bloque de un `switch` —cuyas cláusulas comparten
+   * UN ámbito, por eso se aplanan—. Faltaba el `namespace`: una pantalla declarada dentro de uno
+   * no tapaba al import del fichero.
+   *
+   * Vive aquí porque `ligaduraDe` y `declaradaEn` preguntan lo mismo, y cada vez que este
+   * fichero ha tenido una misma pregunta en dos sitios, la ronda siguiente ha traído el sitio
+   * que no actualicé.
+   */
+  /**
+   * Una sentencia que corta el flujo en seco: lo que venga DETRÁS, en su misma lista, no corre.
+   *
+   * Deliberadamente sólo el nivel de la lista: un `return` dentro de un `if` no mata a los
+   * hermanos del `if`, y adivinar eso ya sería análisis de flujo de verdad. Aquí sólo se lee
+   * lo que es indiscutible.
+   */
+  const salidaSeca = (st: ts.Statement): boolean =>
+    ts.isReturnStatement(st) ||
+    ts.isThrowStatement(st) ||
+    ts.isBreakStatement(st) ||
+    ts.isContinueStatement(st);
+
+  const sentenciasDelAmbito = (n: ts.Node): readonly ts.Statement[] | null => {
+    if (ts.isSourceFile(n) || ts.isBlock(n) || ts.isModuleBlock(n)) return n.statements;
+    if (ts.isCaseBlock(n)) return n.clauses.flatMap((c) => [...c.statements]);
+    return null;
+  };
+
+  const ramaMuerta = (x: ts.Node): readonly ts.Node[] => {
+    const literal = (e: ts.Expression): boolean | null => {
+      let c: ts.Expression = e;
+      while (ts.isParenthesizedExpression(c)) c = c.expression;
+      if (c.kind === ts.SyntaxKind.TrueKeyword) return true;
+      if (c.kind === ts.SyntaxKind.FalseKeyword) return false;
+      return null;
+    };
+    if (ts.isIfStatement(x)) {
+      const v = literal(x.expression);
+      if (v === false) return [x.thenStatement];
+      if (v === true) return x.elseStatement === undefined ? [] : [x.elseStatement];
+      return [];
+    }
+    if (ts.isWhileStatement(x)) {
+      return literal(x.expression) === false ? [x.statement] : [];
+    }
+    /*
+     * Y EL `for` CON CONDICIÓN LITERAL, que estaba UNA LÍNEA POR DEBAJO del `while` y me la
+     * salté al ampliar esto hace una hora. `for (; false;) { … }` no ejecuta su cuerpo igual
+     * que no lo ejecuta un `while (false)`. Un `do … while (false)` SÍ lo ejecuta una vez, así
+     * que no entra aquí.
+     */
+    if (ts.isForStatement(x)) {
+      /*
+       * Y EL INCREMENTADOR TAMPOCO CORRE. Con la condición literal falsa, un
+       * `for (; false; definirCriterio(…))` no ejecuta NI el cuerpo NI el incrementador, y se
+       * devolvía sólo el cuerpo. Por eso esta lectura devuelve una LISTA: es la única
+       * construcción con más de una parte muerta, y con un solo nodo era indecible.
+       */
+      if (x.condition === undefined || literal(x.condition) !== false) return [];
+      return x.incrementor === undefined ? [x.statement] : [x.incrementor, x.statement];
+    }
+    if (ts.isConditionalExpression(x)) {
+      const v = literal(x.condition);
+      if (v === false) return [x.whenTrue];
+      if (v === true) return [x.whenFalse];
+      return [];
+    }
+    if (ts.isBinaryExpression(x)) {
+      const v = literal(x.left);
+      if (v === null) return [];
+      const op = x.operatorToken.kind;
+      if (op === ts.SyntaxKind.AmpersandAmpersandToken) return v === false ? [x.right] : [];
+      if (op === ts.SyntaxKind.BarBarToken) return v === true ? [x.right] : [];
+      // `true ?? f()` y `false ?? f()`: un literal nunca es nullish, así que la derecha no corre.
+      if (op === ts.SyntaxKind.QuestionQuestionToken) return [x.right];
+      return [];
+    }
+    return [];
+  };
+
+  /*
+   * Y LIGA IGUAL SI EL NOMBRE VIENE DE UN PATRÓN. Esta lectura sólo reconocía declaraciones
+   * cuyo nombre fuera un identificador, así que un `const { definirCriterio } = props` —o un
+   * parámetro desestructurado, o la ligadura de un `for`, o la de un `catch`— no tapaba al
+   * import y la llamada al LOCAL se le acreditaba. Por eso usa `ligaEsteNombre`, que ya existía
+   * para lo mismo un ámbito más adentro: dos lecturas del mismo concepto, otra vez.
+   */
+  /**
+   * Los `var` que declara un cuerpo, MIRANDO DENTRO DE SUS BLOQUES pero sin cruzar otra función.
+   *
+   * La exploración de abajo lee las sentencias que cuelgan DIRECTAMENTE de cada bloque ancestro,
+   * y con `let`/`const` eso es exacto. Con `var` no: su ámbito es la función entera, así que en
+   * `if (cond) { var definirCriterio = local; } definirCriterio()` la llamada va al local y la
+   * declaración no está en ningún bloque ancestro suyo — se le acreditaba al import.
+   *
+   * Se cachea por cuerpo porque esto se pregunta una vez por identificador llamado y el barrido
+   * es recursivo; sin la caché, el censo pasa a ser cuadrático.
+   */
+  /** El cuerpo de una función, para las formas que de verdad tienen uno. */
+  const cuerpoDeLaFuncion = (n: ts.Node): ts.Node | null => {
+    if (
+      ts.isFunctionDeclaration(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) ||
+      ts.isSetAccessorDeclaration(n)
+    ) {
+      return n.body ?? null;
+    }
+    return null;
+  };
+
+  const varsPorCuerpo = new WeakMap<ts.Node, Map<string, ts.Node>>();
+  const varsDe = (cuerpo: ts.Node): Map<string, ts.Node> => {
+    const previo = varsPorCuerpo.get(cuerpo);
+    if (previo !== undefined) return previo;
+    const halladas = new Map<string, ts.Node>();
+    const recoger = (b: ts.BindingName, d: ts.Node): void => {
+      if (ts.isIdentifier(b)) {
+        if (!halladas.has(b.text)) halladas.set(b.text, d);
+        return;
+      }
+      for (const e of b.elements) {
+        if (!ts.isOmittedExpression(e)) recoger(e.name, d);
+      }
+    };
+    const mirar = (n: ts.Node): void => {
+      /*
+       * LAS TRES FRONTERAS que un `var` no cruza hacia fuera: una función, un bloque estático de
+       * clase y el cuerpo de un `namespace` —que al compilar es una IIFE—. Ninguna de las dos
+       * últimas es function-like, así que este barrido se metía dentro y apuntaba sus `var` como
+       * ligaduras de la función o del fichero de alrededor: una llamada legítima al import con
+       * ese nombre se descartaba. ROJO SOBRE CÓDIGO QUE FUNCIONA.
+       *
+       * La del `namespace` la encontré yo repasando esta lista después de haberla declarado
+       * completa en la ronda anterior. No lo estaba. Que la encontrara el repaso y no la ronda
+       * siguiente es la única diferencia que tengo a favor.
+       */
+      if (
+        ts.isFunctionLike(n) ||
+        ts.isClassStaticBlockDeclaration(n) ||
+        ts.isModuleBlock(n)
+      ) {
+        return;
+      }
+      /*
+       * Y LAS DOS FORMAS de declarar a ámbito de función: la sentencia de variable y la cabecera
+       * de un `for`/`for…of`/`for…in`. Sólo se leía la primera, así que tras un
+       * `for (var definirCriterio of …) {}` la llamada de DESPUÉS —el `var` sigue vivo al salir
+       * del bucle— se le acreditaba al import.
+       *
+       * Se enumeran aquí las dos, y las dos fronteras de arriba, a propósito: es el tercer
+       * hallazgo sobre esta misma lectura (rondas 9, 11 y 11) y cada vez había sido por
+       * parchear el caso señalado en vez de escribir la regla entera. Éstas son todas las
+       * formas y todas las fronteras que `var` tiene en este lenguaje.
+       */
+      const lista: ts.VariableDeclarationList | null = ts.isVariableStatement(n)
+        ? n.declarationList
+        : (ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n)) &&
+            n.initializer !== undefined &&
+            ts.isVariableDeclarationList(n.initializer)
+          ? n.initializer
+          : null;
+      if (lista !== null && (lista.flags & ts.NodeFlags.BlockScoped) === 0) {
+        for (const d of lista.declarations) recoger(d.name, d);
+      }
+      ts.forEachChild(n, mirar);
+    };
+    ts.forEachChild(cuerpo, mirar);
+    varsPorCuerpo.set(cuerpo, halladas);
+    return halladas;
+  };
+
+  const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
+    // Por qué hijo se sube: un `var` del cuerpo NO alcanza al default de un parámetro.
+    let hijo: ts.Node = donde;
+    let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
+    while (a !== undefined) {
+      if (ts.isFunctionLike(a)) {
+        /*
+         * Y UNA FUNCIÓN-EXPRESIÓN CON NOMBRE SE LIGA A SÍ MISMA. En
+         * `const h = function definirCriterio() { definirCriterio(); }` la llamada de dentro es
+         * la recursiva, no el import — y se le acreditaba al import. Es la ligadura que una
+         * función lleva encima, no la de sus parámetros, así que se miraba en el sitio pero no
+         * se miraba entera.
+         */
+        if (ts.isFunctionExpression(a) && a.name?.text === nombre) return a;
+        for (const p of a.parameters) {
+          if (ligaEsteNombre(p.name, nombre)) return p;
+        }
+      }
+      // Y una clase-expresión con nombre se liga a sí misma, igual que la función de arriba.
+      if (ts.isClassExpression(a) && a.name?.text === nombre) return a;
+      /*
+       * Y EL `var` DEL CUERPO SÓLO TAPA DENTRO DEL CUERPO. Preguntarlo al pasar por cualquier
+       * función daba por tapada una llamada escrita en el DEFAULT DE UN PARÁMETRO —
+       * `function P(x = definirCriterio(…)) { var definirCriterio = local; }`—, donde los
+       * parámetros viven en su propio ámbito y el `var` del cuerpo no llega. Se descartaba una
+       * invocación manual de verdad: ROJO SOBRE CÓDIGO QUE FUNCIONA, y regresión de mi propio
+       * arreglo de la ronda anterior. Por eso se mira POR QUÉ HIJO se ha subido.
+       */
+      // Y dentro de un bloque estático o de un `namespace`, sus propios `var` SÍ ligan.
+      if (ts.isClassStaticBlockDeclaration(a)) {
+        const v = varsDe(a.body).get(nombre);
+        if (v !== undefined) return v;
+      }
+      if (ts.isModuleBlock(a)) {
+        const v = varsDe(a).get(nombre);
+        if (v !== undefined) return v;
+      }
+      const cuerpo = cuerpoDeLaFuncion(a);
+      if (cuerpo !== null && hijo === cuerpo) {
+        const v = varsDe(cuerpo).get(nombre);
+        if (v !== undefined) return v;
+      }
+      if (ts.isSourceFile(a)) {
+        const v = varsDe(a).get(nombre);
+        if (v !== undefined) return v;
+      }
+      /*
+       * Y UNA CLÁUSULA DE `switch` TAMBIÉN LIGA. El bloque de un `switch` es un ámbito léxico
+       * —un `const` declarado en un `case` vale para TODAS las cláusulas—, pero esta lectura
+       * sólo miraba `Block` y `SourceFile`, así que un `case 'a': const definirCriterio = local;`
+       * no tapaba al import y su llamada se le acreditaba. Se aplanan las cláusulas porque el
+       * ámbito es el bloque entero del `switch`, no cada cláusula por separado.
+       */
+      const sentencias = sentenciasDelAmbito(a);
+      if (sentencias !== null) {
+        for (const st of sentencias) {
+          /*
+           * Y UNA `function` DECLARADA LIGA IGUAL QUE UN `const`. Esta búsqueda sólo miraba
+           * sentencias de variable, así que un `function conUsuario(_actor, _callback) {}`
+           * anidado —que se traga lo que recibe— no tapaba al import y el nombre seguía
+           * resolviendo hasta `db.ts`: el callback se daba por ejecutado y su SQL contaba
+           * sin mandarse. `declaradaEn`, la otra búsqueda de este fichero, sí las leía; eran
+           * dos lecturas del mismo concepto que no decían lo mismo.
+           */
+          if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
+          /*
+           * Y UNA `class` LIGA IGUAL QUE UNA `function`. Faltaba el tercer modo de declarar un
+           * nombre: una pantalla que importe `* as metodo` y declare dentro una
+           * `class metodo { static definirCriterio() {} }` llama a la clase, y la llamada se le
+           * acreditaba al import; borrar la invocación manual de verdad dejaba la invariante en
+           * verde. La misma copia sin actualizar de siempre, un tipo de sentencia más allá.
+           */
+          if (ts.isClassDeclaration(st) && st.name?.text === nombre) return st;
+          /*
+           * Y UN `namespace` TAMBIÉN DECLARA UN NOMBRE DE VALOR. Un `namespace metodo` anidado
+           * tapa a un `import * as metodo` de arriba, y `metodo.definirCriterio()` va al
+           * anidado; se le acreditaba al import. Sólo con nombre de identificador: un
+           * `declare module 'x'` lleva literal de cadena y no liga nada local.
+           */
+          if (
+            ts.isModuleDeclaration(st) &&
+            ts.isIdentifier(st.name) &&
+            st.name.text === nombre
+          ) {
+            return st;
+          }
+          if (!ts.isVariableStatement(st)) continue;
+          for (const d of st.declarationList.declarations) {
+            if (ligaEsteNombre(d.name, nombre)) return d;
+          }
+        }
+      }
+      /*
+       * Y LOS DOS SITIOS QUE LIGAN SIN SER SENTENCIAS DE BLOQUE: la cabecera de un `for` y el
+       * `catch`. Sin ellos, un `for (const persistir of […]) { await persistir(); }` no
+       * tapaba a un `persistir` importado y la llamada se acreditaba al import, con lo que
+       * borrar la escritura de verdad dejaba la invariante en verde.
+       */
+      if (
+        (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
+        a.initializer !== undefined &&
+        ts.isVariableDeclarationList(a.initializer)
+      ) {
+        for (const d of a.initializer.declarations) {
+          if (ligaEsteNombre(d.name, nombre)) return d;
+        }
+      }
+      if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
+        const v = a.variableDeclaration;
+        if (ligaEsteNombre(v.name, nombre)) return v;
+      }
+      hijo = a;
+      a = a.parent as ts.Node | undefined;
+    }
+    return null;
   };
 
   it('cada capacidad declara su paridad, y la clase concuerda con el destino', () => {
@@ -260,6 +615,307 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         ).toBe(true);
       }
     }
+  });
+
+  /**
+   * Y LA PREGUNTA QUE ESTE CENSO NO SE PODÍA HACER: ¿LA LLAMA ALGUIEN?
+   *
+   * Las tres sondas de este fichero miden la capa de SERVER FUNCTIONS, y por buenas razones:
+   * SYS-21 pide que la operación sea ejecutable sin AI, y ejecutable es la server function. Pero
+   * eso deja fuera exactamente un caso, y no es teórico: `definirCriterio` existía, se exportaba,
+   * escribía `criterio_exito` y pasaba las tres — y NO LA LLAMABA NINGÚN COMPONENTE. Con la AI
+   * apagada no había forma de crear un criterio de éxito, y SYS-22 los exige para G0. La pantalla
+   * llegaba a pintar «Sin criterios definidos: G0 no podrá aprobarse» sin ofrecer nada con lo que
+   * arreglarlo. Lo destapó una revisión contando llamadores a mano; se cerró en #55.
+   *
+   * Una puerta que nadie abre no es una puerta. Esto lo convierte en invariante para las nueve.
+   *
+   * NOMBRAR NO ES LLAMAR, y ésa es toda la dificultad. Un `grep` del nombre daría verde con el
+   * import a secas, con una mención en un comentario o con el nombre en una posición de tipo — que
+   * es justo el estado en el que estaba C0 antes de #55: importable y sin usar. Así que se exige
+   * una LLAMADA VIVA: el nombre en posición de callee, con las envolturas transparentes quitadas,
+   * y siguiendo el alias con el que la pantalla lo importe —renombrado o por espacio de nombres—.
+   *
+   * DOS LÍMITES, escritos y no disfrazados:
+   *  · sólo mira los `.tsx` de `src/components` y `src/routes`. Si mañana una pantalla delega la
+   *    llamada en un `.ts` de al lado, esto se pondrá ROJO y pedirá una decisión en vez de callar;
+   *  · no pregunta si el componente se RENDERIZA, sólo si la llamada existe en él. Un componente
+   *    muerto entero es un problema distinto y más grande, y no es el que esta sonda persigue.
+   */
+  it('alguna pantalla llama de verdad a cada puerta manual', () => {
+    /** Los `.tsx` de la capa que el usuario toca. */
+    const pantallas = (dir: string): string[] => {
+      if (!existsSync(dir)) return [];
+      const fuera: string[] = [];
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const ruta = `${dir}/${e.name}`;
+        if (e.isDirectory()) fuera.push(...pantallas(ruta));
+        else if (e.name.endsWith('.tsx')) fuera.push(ruta);
+      }
+      return fuera;
+    };
+    const CAPA = [...pantallas(`${raiz}/src/components`), ...pantallas(`${raiz}/src/routes`)];
+    expect(CAPA.length, 'no se encontró ni una pantalla: esta sonda no estaría mirando nada').toBeGreaterThan(0);
+
+    /**
+     * Cómo trae una pantalla un nombre de otro módulo. `tipoSolo` se descarta: un
+     * `import type { X }` no puede llamar a nada, y contarlo sería volver al «nombrar es llamar».
+     */
+    type Traido = { modulo: string; original: string; espacio: boolean };
+    const traidosPor = (f: string): Map<string, Traido> => {
+      const fuera = new Map<string, Traido>();
+      for (const st of leer(f).statements) {
+        if (!ts.isImportDeclaration(st) || !st.importClause) continue;
+        if (st.importClause.isTypeOnly) continue;
+        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (destino === null) continue;
+        const enlace = st.importClause.namedBindings;
+        if (enlace && ts.isNamedImports(enlace)) {
+          for (const e of enlace.elements) {
+            if (e.isTypeOnly) continue;
+            fuera.set(e.name.text, {
+              modulo: destino,
+              original: (e.propertyName ?? e.name).text,
+              espacio: false,
+            });
+          }
+        } else if (enlace && ts.isNamespaceImport(enlace)) {
+          fuera.set(enlace.name.text, { modulo: destino, original: '*', espacio: true });
+        }
+      }
+      return fuera;
+    };
+
+    /**
+     * Lo que un fichero LLAMA, no lo que menciona: sólo el nombre en posición de callee.
+     *
+     * Con las envolturas transparentes quitadas, por lo mismo que en el grafo de escrituras:
+     * `(definirCriterio as typeof definirCriterio)({ data })` es la misma llamada. Las llamadas
+     * de propiedad se guardan como `objeto.nombre`, que es como se ve un espacio de nombres.
+     */
+    const llamadosEn = (f: string): Set<string> => {
+      const fuera = new Set<string>();
+      const ver = (x: ts.Node): void => {
+        if (ts.isCallExpression(x)) {
+          const q: ts.Expression = desenvuelto(x.expression);
+          /*
+           * Y UN NOMBRE TAPADO NO ACREDITA AL IMPORT. Guardar el texto del identificador a secas
+           * bastaba para que una pantalla con la server function importada —usada sólo en un
+           * `typeof`— y un parámetro interno del mismo nombre pasara por llamadora: se llama al
+           * parámetro y la puerta manual sigue sin abrirse, con la invariante en verde. Es la
+           * misma «forma no es identidad» que costó tres rondas en #54, y por eso `ligaduraDe`
+           * vive arriba y lo comparten las dos sondas.
+           */
+          if (ts.isIdentifier(q)) {
+            if (ligaduraDe(q, q.text) === null) fuera.add(q.text);
+          } else if (ts.isPropertyAccessExpression(q) || ts.isElementAccessExpression(q)) {
+            /*
+             * Y LOS CORCHETES CON LITERAL SON EL MISMO ACCESO QUE EL PUNTO:
+             * `manual['definirCriterio'](…)` llama exactamente a lo mismo que
+             * `manual.definirCriterio(…)`. Esta sonda sólo leía el punto, así que una pantalla
+             * que llamara por corchetes se daba por no-llamadora: ROJO SOBRE CÓDIGO QUE
+             * FUNCIONA. Y lo que lo hace peor es que `nombreDeQuienLlama` —el lector del censo
+             * de escrituras— YA leía los corchetes desde #54: eran dos sondas del mismo
+             * fichero reconociendo formas de llamada distintas. Se leen igual las dos.
+             *
+             * Sólo literal de cadena, igual que la otra: un `manual[k]` con `k` variable no se
+             * resuelve sin ejecutar, y adivinarlo es por donde este censo empezaría a mentir.
+             */
+            const miembro = ts.isPropertyAccessExpression(q)
+              ? q.name.text
+              : ts.isStringLiteral(q.argumentExpression)
+                ? q.argumentExpression.text
+                : null;
+            // El receptor se lee igual que el callee: el `as` puede envolver sólo al espacio.
+            const r = desenvuelto(q.expression);
+            if (miembro !== null && ts.isIdentifier(r) && ligaduraDe(r, r.text) === null) {
+              fuera.add(`${r.text}.${miembro}`);
+            }
+          }
+        }
+        /*
+         * Y LA RAMA MUERTA TAMPOCO ABRE LA PUERTA. Este descenso contaba una llamada por
+         * aparecer en el árbol, así que mover la única invocación bajo un `if (false)` —o
+         * dejar el manejador viejo tras quitarle el botón— seguía dando la pantalla por
+         * llamadora. Es la misma ceguera que el recorrido de escrituras, y por eso `ramaMuerta`
+         * también vive arriba y la leen las dos.
+         */
+        const muertas = ramaMuerta(x);
+        /*
+         * Y LO QUE VA DETRÁS DE UN `return`/`throw`/`break`/`continue` TAMPOCO SE EJECUTA.
+         * Este descenso no miraba el orden de las sentencias, así que dejar la única llamada
+         * —o la única escritura— después de un `return` seco la seguía acreditando.
+         *
+         * La excepción, que es lo que impide que esto se vuelva un rechazo falso: una
+         * `function` declarada después SIGUE SIENDO LLAMABLE desde antes, porque se iza. Se
+         * visita igual. Una `class` no: su ligadura nunca llega a inicializarse.
+         */
+        const lista =
+          ts.isBlock(x) || ts.isSourceFile(x) || ts.isModuleBlock(x) ? x.statements : null;
+        if (lista !== null) {
+          let tras = false;
+          for (const st of lista) {
+            if ((!tras || ts.isFunctionDeclaration(st)) && !muertas.includes(st)) ver(st);
+            if (salidaSeca(st)) tras = true;
+          }
+          return;
+        }
+        ts.forEachChild(x, (y) => {
+          if (!muertas.includes(y)) ver(y);
+        });
+      };
+      ver(leer(f));
+      return fuera;
+    };
+
+    /**
+     * DÓNDE SE DECLARA DE VERDAD UN NOMBRE, siguiendo los re-exports del módulo por el que entra.
+     *
+     * Comparando rutas a secas, una pantalla que importe por un barrel (`@/lib/metodo`) daba una
+     * ruta que NUNCA puede ser igual a la del paso declarado (`@/lib/metodo/metodo.functions`), y
+     * esto se ponía rojo sobre código que funciona. Ése es el otro modo de fallo de este fichero
+     * y el que más caro sale: una sonda que miente en rojo enseña a desconfiar de ella, y
+     * entonces ya no protege nada. Las sondas de export e invocabilidad de arriba ya seguían los
+     * re-exports; ésta tenía que hacerlo igual.
+     */
+    type Origen = { modulo: string; nombre: string };
+    const declaraA = (modulo: string, nombre: string, vistos = new Set<string>()): Origen | null => {
+      /*
+       * Y EL GUARD DE CICLOS SE LLAVEA POR MÓDULO **Y NOMBRE**, que es lo que se pregunta. Con
+       * la llave sólo del módulo, dos caminos de barrel al mismo fichero se estorbaban: si el
+       * primero —`export * from './x'`— buscaba ahí un nombre y no lo encontraba, el segundo
+       * —`export { real as publico } from './x'`— ya no podía entrar a buscar `real`, y el paso
+       * se quedaba sin origen. Rojo sobre código que funciona: una llave que no coincide con la
+       * pregunta no corta ciclos, corta respuestas.
+       */
+      const llave = `${modulo}#${nombre}`;
+      if (vistos.has(llave) || !existsSync(modulo)) return null;
+      vistos.add(llave);
+      const exportado = (n: ts.Node): boolean =>
+        (n as { modifiers?: ts.NodeArray<ts.ModifierLike> }).modifiers?.some(
+          (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+        ) ?? false;
+      for (const st of leer(modulo).statements) {
+        if (ts.isFunctionDeclaration(st) && st.name?.text === nombre && exportado(st)) {
+          return { modulo, nombre };
+        }
+        if (ts.isVariableStatement(st) && exportado(st)) {
+          for (const d of st.declarationList.declarations) {
+            if (ts.isIdentifier(d.name) && d.name.text === nombre) return { modulo, nombre };
+          }
+        }
+        if (!ts.isExportDeclaration(st)) continue;
+        /*
+         * Y `export { definirCriterio }` SIN módulo de origen es una declaración LOCAL sacada
+         * por una lista. La sonda de export de arriba la acepta —cuenta el nombre con el que
+         * sale—, así que dar por no resuelto este caso no era diferir a nadie: era saltarse el
+         * paso en silencio, y con la llamada de la pantalla borrada esto seguía en verde.
+         */
+        if (!st.moduleSpecifier) {
+          if (!st.exportClause || !ts.isNamedExports(st.exportClause)) continue;
+          for (const e of st.exportClause.elements) {
+            if (e.name.text !== nombre) continue;
+            const local = (e.propertyName ?? e.name).text;
+            const declarado = leer(modulo).statements.some((d) => {
+              if (ts.isFunctionDeclaration(d)) return d.name?.text === local;
+              if (!ts.isVariableStatement(d)) return false;
+              return d.declarationList.declarations.some((x) => ligaEsteNombre(x.name, local));
+            });
+            if (declarado) return { modulo, nombre: local };
+          }
+          continue;
+        }
+        const destino = resolver(modulo, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (destino === null) continue;
+        if (st.exportClause && ts.isNamedExports(st.exportClause)) {
+          for (const e of st.exportClause.elements) {
+            if (e.name.text !== nombre) continue;
+            const hallado = declaraA(destino, (e.propertyName ?? e.name).text, vistos);
+            if (hallado !== null) return hallado;
+          }
+        } else if (!st.exportClause) {
+          const hallado = declaraA(destino, nombre, vistos);
+          if (hallado !== null) return hallado;
+        }
+      }
+      return null;
+    };
+
+    const sinPantalla: string[] = [];
+    const sinOrigen: string[] = [];
+    for (const cap of CAPACIDADES_ACTIVAS) {
+      const paridad = CAPACIDADES[cap].paridadManual;
+      if (paridad.clase !== 'escritura') continue;
+      for (const paso of paridad.pasos) {
+        const modulo = resolver(`${raiz}/src/lib/ai/ai.schemas.ts`, paso.modulo);
+        if (modulo === null) continue; // Ya lo denuncia la sonda de arriba; aquí no se repite.
+        /*
+         * Y EL PASO DECLARADO SE NORMALIZA IGUAL QUE EL IMPORT DE LA PANTALLA. Normalizando sólo
+         * un lado, declarar el paso contra un barrel —una forma que las sondas de export e
+         * invocabilidad de arriba SÍ aceptan— dejaba el origen de la pantalla apuntando al
+         * módulo de verdad y el del paso al barrel: ningún llamador legítimo casaba y esto se
+         * ponía rojo. Arreglé un lado de la comparación y no el otro; se comparan los DOS
+         * orígenes.
+         */
+        /*
+         * Y si el paso NO resuelve a un origen, eso se NOMBRA. Aquí había un `continue` puesto
+         * suponiendo que la sonda de export de arriba ya lo denunciaba, y no era verdad: ella
+         * acepta formas que `declaraA` no sabía leer, así que el `continue` convertía un hueco
+         * de lectura en un salto callado. Cuando este censo no puede ver algo, pide una decisión.
+         */
+        const origenDelPaso = declaraA(modulo, paso.funcion);
+        if (origenDelPaso === null) {
+          sinOrigen.push(`${cap}: ${paso.modulo}#${paso.funcion}`);
+          continue;
+        }
+        const laLlama = CAPA.some((pantalla) => {
+          const traidos = traidosPor(pantalla);
+          const llamados = llamadosEn(pantalla);
+          /*
+           * Y el cruce compara MÓDULO Y NOMBRE. Arreglando el barrel se me cayó la comparación
+           * del nombre, y con ella cualquier import llamado del mismo módulo valía: el
+           * `editarCriterioDeReto` de esta misma pantalla daba por abierta la puerta de C0.
+           * Por eso `declaraA` devuelve las dos cosas — y devuelve el NOMBRE, no el que se
+           * importó, para que un re-export que renombre no pierda el rastro.
+           */
+          const esElPaso = (o: Origen | null): boolean =>
+            o !== null && o.modulo === origenDelPaso.modulo && o.nombre === origenDelPaso.nombre;
+          for (const [local, via] of traidos) {
+            if (via.espacio) {
+              /*
+               * Y POR EL ESPACIO DE NOMBRES SE RESUELVE EL MIEMBRO QUE SE LLAMA, no el nombre
+               * del paso. Buscando `${local}.${paso.funcion}` se daba por hecho que el barrel
+               * no renombra: con un `export { definirCriterio as crearCriterioDeExito }` y una
+               * pantalla que llama `api.crearCriterioDeExito(…)`, el llamador legítimo se
+               * descartaba ANTES de que `declaraA` pudiera comparar orígenes, y esto se ponía
+               * ROJO SOBRE CÓDIGO QUE FUNCIONA. Es el modo de fallo caro: una sonda que miente
+               * en rojo enseña a desconfiar de ella, y entonces ya no protege nada. La rama de
+               * al lado —el import nombrado— ya resolvía lo que la pantalla importa de verdad;
+               * ésta se había quedado comparando el nombre en crudo.
+               */
+              const prefijo = `${local}.`;
+              for (const llamado of llamados) {
+                if (!llamado.startsWith(prefijo)) continue;
+                if (esElPaso(declaraA(via.modulo, llamado.slice(prefijo.length)))) return true;
+              }
+              continue;
+            }
+            if (llamados.has(local) && esElPaso(declaraA(via.modulo, via.original))) return true;
+          }
+          return false;
+        });
+        if (!laLlama) sinPantalla.push(`${cap}: ${paso.modulo}#${paso.funcion}`);
+      }
+    }
+
+    expect(
+      sinOrigen.sort(),
+      'este censo no sabe de dónde sale el paso declarado, así que no puede comprobar quién lo llama: decide si cuenta',
+    ).toEqual([]);
+    expect(
+      sinPantalla.sort(),
+      'la puerta manual existe y escribe, pero NINGUNA pantalla la llama: con la AI apagada no hay forma de hacerlo (es el caso de C0 antes de #55)',
+    ).toEqual([]);
   });
 
   /**
@@ -597,7 +1253,17 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * verde. Los corchetes ya se leían al resolver la LLAMADA; faltaba aquí, que es el mismo
      * concepto leído en otro sitio.
      */
-    const nombreDeQuienLlama = (q: ts.Expression): string | null => {
+    const nombreDeQuienLlama = (e: ts.Expression): string | null => {
+      /*
+       * Y AQUÍ TAMBIÉN SE DESENVUELVE, que es la misma asimetría de la sonda de pantallas una
+       * capa más allá y NO estaba reportada: salió midiéndola. Un
+       * `(conUsuario as typeof conUsuario)(actorId, async (tx) => {…})` —un cast corriente sobre
+       * el callee— dejaba de reconocerse como «ejecuta su callback», y con él se caían TODAS las
+       * escrituras de dentro: el censo decía que la secuencia manual no cubre
+       * `update outcome_review`. ROJO SOBRE CÓDIGO QUE FUNCIONA, en la otra sonda y por la misma
+       * causa. Se lee una vez aquí porque de este lector cuelgan los tres consumidores.
+       */
+      const q = desenvuelto(e);
       if (ts.isPropertyAccessExpression(q)) return q.name.text;
       if (ts.isElementAccessExpression(q) && ts.isStringLiteral(q.argumentExpression)) {
         return q.argumentExpression.text;
@@ -669,16 +1335,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * que nunca se manda. El nombre se resuelve hasta `db.ts`, y una ligadura local (lo que
        * TAPA al import) descalifica: ahí ya no se sabe qué es.
        */
+      /*
+       * Y AQUÍ SE LEE EL CALLEE DESENVUELTO, que es donde de verdad se caía. Arreglar
+       * `nombreDeQuienLlama` no bastó —lo comprobé midiendo, y siguió rojo—: esta puerta
+       * exigía un identificador PELADO, así que un `(conUsuario as typeof conUsuario)(actorId,
+       * async (tx) => {…})` no pasaba y con él se caían todas las escrituras de dentro. Dos
+       * lecturas del mismo callee que no decían lo mismo, otra vez.
+       */
+      const q = desenvuelto(x.expression);
       if (como === 'suelto') {
-        if (!ts.isIdentifier(x.expression)) return false;
-        if (ligaduraDe(x.expression, x.expression.text) !== null) return false;
-        return vieneDeLaBase(x.getSourceFile().fileName, x.expression.text) === quien;
+        if (!ts.isIdentifier(q)) return false;
+        if (ligaduraDe(q, q.text) !== null) return false;
+        return vieneDeLaBase(x.getSourceFile().fileName, q.text) === quien;
       }
-      if (!ts.isPropertyAccessExpression(x.expression)) return false;
-      let a: ts.Expression = x.expression.expression;
+      if (!ts.isPropertyAccessExpression(q)) return false;
+      let a: ts.Expression = desenvuelto(q.expression);
       for (let i = 0; i < 12; i += 1) {
         if (ts.isCallExpression(a) || ts.isPropertyAccessExpression(a)) {
-          a = a.expression;
+          a = desenvuelto(a.expression);
           continue;
         }
         break;
@@ -850,8 +1524,16 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * un ámbito más adentro.
        */
       const declaradaEn = (ambito: ts.Node, nombre: string): ts.Node | null => {
-        if (!ts.isBlock(ambito) && !ts.isSourceFile(ambito)) return null;
-        for (const st of ambito.statements) {
+        /*
+         * Y LA CLÁUSULA DE `switch` TAMBIÉN DECLARA, igual que en `ligaduraDe`. Esto NO estaba
+         * reportado: salió de ir a buscar en esta sonda la misma forma que el hallazgo señalaba
+         * en la otra. Aquí el fallo es al revés y peor: un ayudante declarado en un `case` y
+         * llamado ahí mismo no se encontraba, su cuerpo no se recorría, y su escritura
+         * desaparecía del censo — ROJO SOBRE CÓDIGO QUE FUNCIONA.
+         */
+        const sentencias = sentenciasDelAmbito(ambito);
+        if (sentencias === null) return null;
+        for (const st of sentencias) {
           if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
           if (!ts.isVariableStatement(st)) continue;
           for (const d of st.declarationList.declarations) {
@@ -868,14 +1550,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         return null;
       };
       /** Los nombres que liga un patrón: `(p)`, `({ p })`, `([p])`, `(...p)`, y anidados. */
-      const ligaEsteNombre = (b: ts.BindingName, nombre: string): boolean => {
-        if (ts.isIdentifier(b)) return b.text === nombre;
-        for (const e of b.elements) {
-          if (ts.isOmittedExpression(e)) continue;
-          if (ligaEsteNombre(e.name, nombre)) return true;
-        }
-        return false;
-      };
       /*
        * Y UN PARÁMETRO TAPA AL AYUDANTE DE FUERA, igual que lo tapa una declaración. El
        * ascenso sólo miraba bloques y ficheros, así que con un `[nada].map((persistir) =>
@@ -954,6 +1628,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         cola.push(...nombraA(cuerpo));
       }
 
+      /*
+       * Y UNA RAMA QUE NO SE EJECUTA NUNCA TAMPOCO ESCRIBE. Este recorrido filtraba cuerpos de
+       * función y nada más, así que un `if (false) { await tx\`update …\` }` se visitaba entero
+       * y acreditaba la escritura: el manejador declarado podía volver sin persistir nada con la
+       * paridad en verde.
+       *
+       * Sólo la condición LITERAL, que es la que se lee sin adivinar: `if (false)` no ejecuta su
+       * rama, `if (true)` no ejecuta su `else`, y un `while (false)` no ejecuta su cuerpo.
+       * Deliberadamente NO se intenta plegar constantes ni seguir un `const MUERTO = false`:
+       * decidir qué es constante es justo por donde este censo empezaría a poner en rojo código
+       * intacto, y ése es el otro modo de fallo, el que enseña a desconfiar de la sonda.
+       */
       const ver = (x: ts.Node): void => {
         if (x !== n && ts.isFunctionLike(x)) {
           const nombre = nombreDe(x);
@@ -961,7 +1647,29 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           if (nombre === null && !laEjecutaQuienLaRecibe(x)) return;
         }
         visitar(x);
-        ts.forEachChild(x, ver);
+        const muertas = ramaMuerta(x);
+        /*
+         * Y LO QUE VA DETRÁS DE UN `return`/`throw`/`break`/`continue` TAMPOCO SE EJECUTA.
+         * Este descenso no miraba el orden de las sentencias, así que dejar la única llamada
+         * —o la única escritura— después de un `return` seco la seguía acreditando.
+         *
+         * La excepción, que es lo que impide que esto se vuelva un rechazo falso: una
+         * `function` declarada después SIGUE SIENDO LLAMABLE desde antes, porque se iza. Se
+         * visita igual. Una `class` no: su ligadura nunca llega a inicializarse.
+         */
+        const lista =
+          ts.isBlock(x) || ts.isSourceFile(x) || ts.isModuleBlock(x) ? x.statements : null;
+        if (lista !== null) {
+          let tras = false;
+          for (const st of lista) {
+            if ((!tras || ts.isFunctionDeclaration(st)) && !muertas.includes(st)) ver(st);
+            if (salidaSeca(st)) tras = true;
+          }
+          return;
+        }
+        ts.forEachChild(x, (y) => {
+          if (!muertas.includes(y)) ver(y);
+        });
       };
       ver(n);
     };
@@ -2213,55 +2921,6 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /** La ligadura LÉXICA de un nombre en el sitio donde se usa: parámetro o variable. */
-    const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
-      let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
-      while (a !== undefined) {
-        if (ts.isFunctionLike(a)) {
-          for (const p of a.parameters) {
-            if (ts.isIdentifier(p.name) && p.name.text === nombre) return p;
-          }
-        }
-        if (ts.isBlock(a) || ts.isSourceFile(a)) {
-          for (const st of a.statements) {
-            /*
-             * Y UNA `function` DECLARADA LIGA IGUAL QUE UN `const`. Esta búsqueda sólo miraba
-             * sentencias de variable, así que un `function conUsuario(_actor, _callback) {}`
-             * anidado —que se traga lo que recibe— no tapaba al import y el nombre seguía
-             * resolviendo hasta `db.ts`: el callback se daba por ejecutado y su SQL contaba
-             * sin mandarse. `declaradaEn`, la otra búsqueda de este fichero, sí las leía; eran
-             * dos lecturas del mismo concepto que no decían lo mismo.
-             */
-            if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
-            if (!ts.isVariableStatement(st)) continue;
-            for (const d of st.declarationList.declarations) {
-              if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
-            }
-          }
-        }
-        /*
-         * Y LOS DOS SITIOS QUE LIGAN SIN SER SENTENCIAS DE BLOQUE: la cabecera de un `for` y el
-         * `catch`. Sin ellos, un `for (const persistir of […]) { await persistir(); }` no
-         * tapaba a un `persistir` importado y la llamada se acreditaba al import, con lo que
-         * borrar la escritura de verdad dejaba la invariante en verde.
-         */
-        if (
-          (ts.isForStatement(a) || ts.isForOfStatement(a) || ts.isForInStatement(a)) &&
-          a.initializer !== undefined &&
-          ts.isVariableDeclarationList(a.initializer)
-        ) {
-          for (const d of a.initializer.declarations) {
-            if (ts.isIdentifier(d.name) && d.name.text === nombre) return d;
-          }
-        }
-        if (ts.isCatchClause(a) && a.variableDeclaration !== undefined) {
-          const v = a.variableDeclaration;
-          if (ts.isIdentifier(v.name) && v.name.text === nombre) return v;
-        }
-        a = a.parent as ts.Node | undefined;
-      }
-      return null;
-    };
-
     /** `sql` / `sqlAdmin` de `db.ts`: la FÁBRICA del cliente, que todavía hay que llamar. */
     const esFabricaDeCliente = (e: ts.Expression, f: string): boolean => {
       if (ts.isIdentifier(e)) {
@@ -2299,7 +2958,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       if (fn.parameters.indexOf(p) !== 0) return false;
       return recepcionDe(fn).some(({ llamada, indice }) => {
         if (indice !== 1) return false;
-        const quien = llamada.expression;
+        // Desenvuelto, igual que en las otras dos puertas: el `as` sobre el callee no cambia
+        // quién entrega la transacción, y leerlo pelado tiraba las escrituras del callback.
+        const quien = desenvuelto(llamada.expression);
         return (
           ts.isIdentifier(quien) &&
           ligaduraDe(quien, quien.text) === null &&

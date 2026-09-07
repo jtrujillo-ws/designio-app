@@ -419,6 +419,33 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     const sqlDe = (n: ts.Node): Consulta[] => {
+      /**
+       * Los nombres que se consumen —aparecen dentro de un `await` o de un `return`— y EN QUÉ
+       * función, que es lo que hace útil la cuenta. Un `return conUsuario(actorId, async (tx) =>
+       * {…})` envuelve el cuerpo entero en un `return`; sin cortar en la frontera de la función
+       * anidada, todo lo que hay dentro contaba como consumido y la comprobación no medía nada.
+       */
+      const funcionDe = (y: ts.Node): ts.Node => {
+        let a: ts.Node | undefined = y.parent as ts.Node | undefined;
+        while (a !== undefined && !ts.isFunctionLike(a)) a = a.parent as ts.Node | undefined;
+        return a ?? n;
+      };
+      const consumidosEn = new Map<ts.Node, Set<string>>();
+      const juntarConsumidos = (y: ts.Node): void => {
+        if (ts.isAwaitExpression(y) || ts.isReturnStatement(y)) {
+          const suya = funcionDe(y);
+          const set = consumidosEn.get(suya) ?? new Set<string>();
+          const dentro = (z: ts.Node): void => {
+            if (z !== y && ts.isFunctionLike(z)) return;
+            if (ts.isIdentifier(z)) set.add(z.text);
+            ts.forEachChild(z, dentro);
+          };
+          dentro(y);
+          consumidosEn.set(suya, set);
+        }
+        ts.forEachChild(y, juntarConsumidos);
+      };
+      juntarConsumidos(n);
       const trozos: Consulta[] = [];
       recorrerVivo(n, (x) => {
         if (!ts.isTaggedTemplateExpression(x)) return;
@@ -444,6 +471,20 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           arriba = arriba.parent as ts.Node | undefined;
         }
         if (arriba !== undefined && ts.isExpressionStatement(arriba)) return;
+        /*
+         * Y si se GUARDA en una variable, esa variable tiene que consumirse. `const pendiente =
+         * tx\`…\`` seguido de un `console.debug(pendiente)` pasa el lint y no envía nada: la
+         * consulta sigue siendo perezosa. Se pide que el nombre aparezca dentro de un `await` o
+         * de un `return` en algún punto de la función — que es lo que de verdad la dispara—.
+         */
+        if (
+          arriba !== undefined &&
+          ts.isVariableDeclaration(arriba) &&
+          ts.isIdentifier(arriba.name) &&
+          !(consumidosEn.get(funcionDe(arriba))?.has(arriba.name.text) ?? false)
+        ) {
+          return;
+        }
         const t = x.template;
         if (ts.isNoSubstitutionTemplateLiteral(t)) {
           trozos.push({ sql: soloSql(t.text), campos: [] });
@@ -747,6 +788,31 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
       if (donde < 0) return [];
       const cola = cuerpo.slice(donde);
+      /*
+       * Y tiene que ser una cadena de «and». Guardando sólo las columnas, un
+       * `where id = ${id} or workspace_id = ${ws}` daba el mismo conjunto que el correcto — y
+       * con un `or` ninguna columna ata la fila, así que escribir uno podía escribirlos todos.
+       * Ante un `or` de nivel cero no se registra NADA: la ruta manual no acota, y eso es
+       * exactamente lo que la comparación tiene que decir.
+       */
+      {
+        let hondoO = 0;
+        let enTextoO = false;
+        for (let i = 0; i < cola.length; i++) {
+          const c = cola[i]!;
+          if (enTextoO) {
+            if (c === "'") enTextoO = false;
+            continue;
+          }
+          if (c === "'") enTextoO = true;
+          else if (c === '(') hondoO += 1;
+          else if (c === ')') hondoO -= 1;
+          else if (hondoO === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
+            if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
+            if (/^or\b/i.test(cola.slice(i))) return [];
+          }
+        }
+      }
       const columnas: string[] = [];
       let hondo2 = 0;
       let enTexto2 = false;
@@ -825,16 +891,32 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * Un alias corriente (`const escribir = enlazarInsight`) NO tapa: ahí el respaldo por
          * nombre sigue siendo la única forma de llegar.
          */
-        const sombras = new Set<string>();
-        const ligadas = (x: ts.Node): void => {
-          if (x !== decl && ts.isFunctionLike(x)) {
-            if (ts.isFunctionDeclaration(x) && x.name) sombras.add(x.name.text);
-            const padre = x.parent as ts.Node | undefined;
-            if (padre && ts.isVariableDeclaration(padre) && ts.isIdentifier(padre.name)) {
-              sombras.add(padre.name.text);
+        const sombras = new Map<string, string | null>();
+        const nombresDe = (b: ts.BindingName, poner: (n: string) => void): void => {
+          if (ts.isIdentifier(b)) poner(b.text);
+          else if (ts.isObjectBindingPattern(b) || ts.isArrayBindingPattern(b)) {
+            for (const e of b.elements) {
+              if (ts.isBindingElement(e)) nombresDe(e.name, poner);
             }
           }
-          if (ts.isParameter(x) && ts.isIdentifier(x.name)) sombras.add(x.name.text);
+        };
+        const ligadas = (x: ts.Node): void => {
+          if (x !== decl && ts.isFunctionDeclaration(x) && x.name) sombras.set(x.name.text, null);
+          if (ts.isParameter(x)) nombresDe(x.name, (n) => sombras.set(n, null));
+          if (ts.isVariableDeclaration(x)) {
+            /*
+             * Un alias simple —`const escribir = enlazarInsight`— tapa el nombre PERO conserva
+             * su destino: si se tapara sin más, el recorrido perdería el escritor y el censo
+             * declararía rota una ruta intacta. Cualquier otra ligadura —desestructurar, una
+             * llamada que devuelve un callback— tapa sin destino, que es lo que corresponde:
+             * ese nombre ya no es el del módulo.
+             */
+            const alias =
+              x.initializer !== undefined && ts.isIdentifier(x.initializer)
+                ? x.initializer.text
+                : null;
+            nombresDe(x.name, (n) => sombras.set(n, ts.isIdentifier(x.name) ? alias : null));
+          }
           ts.forEachChild(x, ligadas);
         };
         ligadas(decl);
@@ -852,10 +934,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * real ya quitada.
            */
           if (objeto !== null) continue;
-          if (sombras.has(nombre)) continue;
-          const importado = imports.get(nombre);
+          const bajo = sombras.has(nombre) ? sombras.get(nombre)! : nombre;
+          if (bajo === null) continue;
+          const importado = imports.get(bajo);
           if (importado) cola.push({ modulo: importado.modulo, funcion: importado.original });
-          else if (locales.has(nombre)) cola.push({ modulo: actual.modulo, funcion: nombre });
+          else if (locales.has(bajo)) cola.push({ modulo: actual.modulo, funcion: bajo });
         }
       }
       cacheDeEscrituras.set(`${modulo}#${funcion}`, escrituras);

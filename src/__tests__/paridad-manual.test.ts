@@ -156,16 +156,44 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
   const desenvuelto = (e: ts.Expression): ts.Expression => {
     let x: ts.Expression = e;
     while (
+      /*
+       * LAS CINCO, que son TODAS las que este lenguaje tiene: paréntesis, `as`, `satisfies`,
+       * `!` y el cast antiguo `<T>x`. Faltaba `satisfies`, y con él
+       * `(definirCriterio satisfies typeof definirCriterio)(…)` no se veía como llamada: ROJO
+       * SOBRE CÓDIGO QUE FUNCIONA. Una ronda después de prometer escribir las reglas enteras en
+       * vez del caso señalado, aquí sólo había tres de cinco. `<T>x` no cabe en un `.tsx`, pero
+       * el censo también lee los `.ts` de servicio, así que entra igual.
+       */
       ts.isParenthesizedExpression(x) ||
       ts.isAsExpression(x) ||
-      ts.isNonNullExpression(x)
+      ts.isSatisfiesExpression(x) ||
+      ts.isNonNullExpression(x) ||
+      ts.isTypeAssertionExpression(x)
     ) {
       x = x.expression;
     }
     return x;
   };
 
-  const ramaMuerta = (x: ts.Node): ts.Node | null => {
+  /**
+   * Las sentencias que contiene un ÁMBITO LÉXICO, o `null` si el nodo no lo es.
+   *
+   * Los CUATRO nodos del lenguaje que llevan lista de sentencias y forman ámbito: el fichero,
+   * un bloque, el cuerpo de un `namespace` y el bloque de un `switch` —cuyas cláusulas comparten
+   * UN ámbito, por eso se aplanan—. Faltaba el `namespace`: una pantalla declarada dentro de uno
+   * no tapaba al import del fichero.
+   *
+   * Vive aquí porque `ligaduraDe` y `declaradaEn` preguntan lo mismo, y cada vez que este
+   * fichero ha tenido una misma pregunta en dos sitios, la ronda siguiente ha traído el sitio
+   * que no actualicé.
+   */
+  const sentenciasDelAmbito = (n: ts.Node): readonly ts.Statement[] | null => {
+    if (ts.isSourceFile(n) || ts.isBlock(n) || ts.isModuleBlock(n)) return n.statements;
+    if (ts.isCaseBlock(n)) return n.clauses.flatMap((c) => [...c.statements]);
+    return null;
+  };
+
+  const ramaMuerta = (x: ts.Node): readonly ts.Node[] => {
     const literal = (e: ts.Expression): boolean | null => {
       let c: ts.Expression = e;
       while (ts.isParenthesizedExpression(c)) c = c.expression;
@@ -175,12 +203,12 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
     if (ts.isIfStatement(x)) {
       const v = literal(x.expression);
-      if (v === false) return x.thenStatement;
-      if (v === true) return x.elseStatement ?? null;
-      return null;
+      if (v === false) return [x.thenStatement];
+      if (v === true) return x.elseStatement === undefined ? [] : [x.elseStatement];
+      return [];
     }
     if (ts.isWhileStatement(x)) {
-      return literal(x.expression) === false ? x.statement : null;
+      return literal(x.expression) === false ? [x.statement] : [];
     }
     /*
      * Y EL `for` CON CONDICIÓN LITERAL, que estaba UNA LÍNEA POR DEBAJO del `while` y me la
@@ -189,25 +217,32 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * que no entra aquí.
      */
     if (ts.isForStatement(x)) {
-      return x.condition !== undefined && literal(x.condition) === false ? x.statement : null;
+      /*
+       * Y EL INCREMENTADOR TAMPOCO CORRE. Con la condición literal falsa, un
+       * `for (; false; definirCriterio(…))` no ejecuta NI el cuerpo NI el incrementador, y se
+       * devolvía sólo el cuerpo. Por eso esta lectura devuelve una LISTA: es la única
+       * construcción con más de una parte muerta, y con un solo nodo era indecible.
+       */
+      if (x.condition === undefined || literal(x.condition) !== false) return [];
+      return x.incrementor === undefined ? [x.statement] : [x.incrementor, x.statement];
     }
     if (ts.isConditionalExpression(x)) {
       const v = literal(x.condition);
-      if (v === false) return x.whenTrue;
-      if (v === true) return x.whenFalse;
-      return null;
+      if (v === false) return [x.whenTrue];
+      if (v === true) return [x.whenFalse];
+      return [];
     }
     if (ts.isBinaryExpression(x)) {
       const v = literal(x.left);
-      if (v === null) return null;
+      if (v === null) return [];
       const op = x.operatorToken.kind;
-      if (op === ts.SyntaxKind.AmpersandAmpersandToken) return v === false ? x.right : null;
-      if (op === ts.SyntaxKind.BarBarToken) return v === true ? x.right : null;
+      if (op === ts.SyntaxKind.AmpersandAmpersandToken) return v === false ? [x.right] : [];
+      if (op === ts.SyntaxKind.BarBarToken) return v === true ? [x.right] : [];
       // `true ?? f()` y `false ?? f()`: un literal nunca es nullish, así que la derecha no corre.
-      if (op === ts.SyntaxKind.QuestionQuestionToken) return x.right;
-      return null;
+      if (op === ts.SyntaxKind.QuestionQuestionToken) return [x.right];
+      return [];
     }
-    return null;
+    return [];
   };
 
   /*
@@ -343,12 +378,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
        * no tapaba al import y su llamada se le acreditaba. Se aplanan las cláusulas porque el
        * ámbito es el bloque entero del `switch`, no cada cláusula por separado.
        */
-      const sentencias: readonly ts.Statement[] | null =
-        ts.isBlock(a) || ts.isSourceFile(a)
-          ? a.statements
-          : ts.isCaseBlock(a)
-            ? a.clauses.flatMap((c) => [...c.statements])
-            : null;
+      const sentencias = sentenciasDelAmbito(a);
       if (sentencias !== null) {
         for (const st of sentencias) {
           /*
@@ -669,9 +699,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * llamadora. Es la misma ceguera que el recorrido de escrituras, y por eso `ramaMuerta`
          * también vive arriba y la leen las dos.
          */
-        const muerta = ramaMuerta(x);
+        const muertas = ramaMuerta(x);
         ts.forEachChild(x, (y) => {
-          if (y !== muerta) ver(y);
+          if (!muertas.includes(y)) ver(y);
         });
       };
       ver(leer(f));
@@ -1441,12 +1471,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * llamado ahí mismo no se encontraba, su cuerpo no se recorría, y su escritura
          * desaparecía del censo — ROJO SOBRE CÓDIGO QUE FUNCIONA.
          */
-        const sentencias: readonly ts.Statement[] | null =
-          ts.isBlock(ambito) || ts.isSourceFile(ambito)
-            ? ambito.statements
-            : ts.isCaseBlock(ambito)
-              ? ambito.clauses.flatMap((c) => [...c.statements])
-              : null;
+        const sentencias = sentenciasDelAmbito(ambito);
         if (sentencias === null) return null;
         for (const st of sentencias) {
           if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) return st;
@@ -1562,9 +1587,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           if (nombre === null && !laEjecutaQuienLaRecibe(x)) return;
         }
         visitar(x);
-        const muerta = ramaMuerta(x);
+        const muertas = ramaMuerta(x);
         ts.forEachChild(x, (y) => {
-          if (y !== muerta) ver(y);
+          if (!muertas.includes(y)) ver(y);
         });
       };
       ver(n);

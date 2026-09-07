@@ -162,6 +162,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     if (ts.isWhileStatement(x)) {
       return literal(x.expression) === false ? x.statement : null;
     }
+    /*
+     * Y EL `for` CON CONDICIÓN LITERAL, que estaba UNA LÍNEA POR DEBAJO del `while` y me la
+     * salté al ampliar esto hace una hora. `for (; false;) { … }` no ejecuta su cuerpo igual
+     * que no lo ejecuta un `while (false)`. Un `do … while (false)` SÍ lo ejecuta una vez, así
+     * que no entra aquí.
+     */
+    if (ts.isForStatement(x)) {
+      return x.condition !== undefined && literal(x.condition) === false ? x.statement : null;
+    }
     if (ts.isConditionalExpression(x)) {
       const v = literal(x.condition);
       if (v === false) return x.whenTrue;
@@ -188,6 +197,62 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
    * import y la llamada al LOCAL se le acreditaba. Por eso usa `ligaEsteNombre`, que ya existía
    * para lo mismo un ámbito más adentro: dos lecturas del mismo concepto, otra vez.
    */
+  /**
+   * Los `var` que declara un cuerpo, MIRANDO DENTRO DE SUS BLOQUES pero sin cruzar otra función.
+   *
+   * La exploración de abajo lee las sentencias que cuelgan DIRECTAMENTE de cada bloque ancestro,
+   * y con `let`/`const` eso es exacto. Con `var` no: su ámbito es la función entera, así que en
+   * `if (cond) { var definirCriterio = local; } definirCriterio()` la llamada va al local y la
+   * declaración no está en ningún bloque ancestro suyo — se le acreditaba al import.
+   *
+   * Se cachea por cuerpo porque esto se pregunta una vez por identificador llamado y el barrido
+   * es recursivo; sin la caché, el censo pasa a ser cuadrático.
+   */
+  /** El cuerpo de una función, para las formas que de verdad tienen uno. */
+  const cuerpoDeLaFuncion = (n: ts.Node): ts.Node | null => {
+    if (
+      ts.isFunctionDeclaration(n) ||
+      ts.isFunctionExpression(n) ||
+      ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) ||
+      ts.isConstructorDeclaration(n) ||
+      ts.isGetAccessorDeclaration(n) ||
+      ts.isSetAccessorDeclaration(n)
+    ) {
+      return n.body ?? null;
+    }
+    return null;
+  };
+
+  const varsPorCuerpo = new WeakMap<ts.Node, Map<string, ts.Node>>();
+  const varsDe = (cuerpo: ts.Node): Map<string, ts.Node> => {
+    const previo = varsPorCuerpo.get(cuerpo);
+    if (previo !== undefined) return previo;
+    const halladas = new Map<string, ts.Node>();
+    const recoger = (b: ts.BindingName, d: ts.Node): void => {
+      if (ts.isIdentifier(b)) {
+        if (!halladas.has(b.text)) halladas.set(b.text, d);
+        return;
+      }
+      for (const e of b.elements) {
+        if (!ts.isOmittedExpression(e)) recoger(e.name, d);
+      }
+    };
+    const mirar = (n: ts.Node): void => {
+      if (ts.isFunctionLike(n)) return; // `var` no cruza la frontera de una función.
+      if (
+        ts.isVariableStatement(n) &&
+        (n.declarationList.flags & ts.NodeFlags.BlockScoped) === 0
+      ) {
+        for (const d of n.declarationList.declarations) recoger(d.name, d);
+      }
+      ts.forEachChild(n, mirar);
+    };
+    ts.forEachChild(cuerpo, mirar);
+    varsPorCuerpo.set(cuerpo, halladas);
+    return halladas;
+  };
+
   const ligaduraDe = (donde: ts.Node, nombre: string): ts.Node | null => {
     let a: ts.Node | undefined = donde.parent as ts.Node | undefined;
     while (a !== undefined) {
@@ -206,6 +271,15 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       }
       // Y una clase-expresión con nombre se liga a sí misma, igual que la función de arriba.
       if (ts.isClassExpression(a) && a.name?.text === nombre) return a;
+      const cuerpo = cuerpoDeLaFuncion(a);
+      if (cuerpo !== null) {
+        const v = varsDe(cuerpo).get(nombre);
+        if (v !== undefined) return v;
+      }
+      if (ts.isSourceFile(a)) {
+        const v = varsDe(a).get(nombre);
+        if (v !== undefined) return v;
+      }
       if (ts.isBlock(a) || ts.isSourceFile(a)) {
         for (const st of a.statements) {
           /*
@@ -636,11 +710,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             o !== null && o.modulo === origenDelPaso.modulo && o.nombre === origenDelPaso.nombre;
           for (const [local, via] of traidos) {
             if (via.espacio) {
-              if (
-                llamados.has(`${local}.${paso.funcion}`) &&
-                esElPaso(declaraA(via.modulo, paso.funcion))
-              ) {
-                return true;
+              /*
+               * Y POR EL ESPACIO DE NOMBRES SE RESUELVE EL MIEMBRO QUE SE LLAMA, no el nombre
+               * del paso. Buscando `${local}.${paso.funcion}` se daba por hecho que el barrel
+               * no renombra: con un `export { definirCriterio as crearCriterioDeExito }` y una
+               * pantalla que llama `api.crearCriterioDeExito(…)`, el llamador legítimo se
+               * descartaba ANTES de que `declaraA` pudiera comparar orígenes, y esto se ponía
+               * ROJO SOBRE CÓDIGO QUE FUNCIONA. Es el modo de fallo caro: una sonda que miente
+               * en rojo enseña a desconfiar de ella, y entonces ya no protege nada. La rama de
+               * al lado —el import nombrado— ya resolvía lo que la pantalla importa de verdad;
+               * ésta se había quedado comparando el nombre en crudo.
+               */
+              const prefijo = `${local}.`;
+              for (const llamado of llamados) {
+                if (!llamado.startsWith(prefijo)) continue;
+                if (esElPaso(declaraA(via.modulo, llamado.slice(prefijo.length)))) return true;
               }
               continue;
             }

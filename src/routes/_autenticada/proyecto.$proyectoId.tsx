@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { CSSProperties } from 'react';
 import { createFileRoute, useNavigate, useRouter } from '@tanstack/react-router';
+import { CriteriosDelReto } from '@/components/metodo/CriteriosDelReto';
 import { PanelDeHilos } from '@/components/portal/PanelDeHilos';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -18,12 +19,12 @@ import {
 import { ETIQUETA_PERFIL } from '@/lib/metodo/metodo.plantillas';
 import {
   CLASES_OBJETO_CITABLE,
+  criteriosCompletos,
   ETIQUETA_CLASE_OBJETO,
   faltaParaAprobarGate,
 } from '@/lib/metodo/metodo.schemas';
 import type {
   ClaseObjetoCitable,
-  CriterioDeReto,
   GateDeProyecto,
   ItemDeGate,
   ProyectoMetodo,
@@ -194,23 +195,6 @@ function hilosDe(hilos: HiloDeObjeto[], tipo: AnclaDeHilo, id: string): HiloDeOb
   return hilos.filter((h) => h.objetoTipo === tipo && h.objetoId === id);
 }
 
-/** Espejo cliente del predicado SYS-22 de aprobarGate — solo informa la etiqueta de
- * G0; la exigencia real vive en el servidor y en la política. */
-function criteriosCompletos(criterios: CriterioDeReto[]): boolean {
-  return (
-    criterios.length > 0 &&
-    criterios.every(
-      (c) =>
-        c.kpi.trim() !== '' &&
-        c.definicion.trim() !== '' &&
-        c.objetivo.trim() !== '' &&
-        c.ventanaDias !== null &&
-        (((c.lineaBaseValor ?? '').trim() !== '' && c.lineaBaseFecha !== null) ||
-          c.lineaBasePlan.trim() !== ''),
-    )
-  );
-}
-
 function PantallaProyecto() {
   const datos = Route.useLoaderData();
   const { membresiaActiva } = Route.useRouteContext();
@@ -258,6 +242,7 @@ function PantallaProyecto() {
               hilos={hilosDe(datos.hilos, 'proyecto', datos.proyecto.id)}
               rol={rol}
               onCambio={() => router.invalidate()}
+              onError={setError}
             />
             {error && (
               <span role="alert" style={{ font: '500 13px var(--font-sans)', color: 'var(--danger)' }}>
@@ -346,12 +331,14 @@ function EncabezadoProyecto({
   hilos,
   rol,
   onCambio,
+  onError,
 }: {
   proyecto: ProyectoMetodo;
   workspaceId: string;
   hilos: HiloDeObjeto[];
   rol: string;
   onCambio: () => Promise<void>;
+  onError: (mensaje: string | null) => void;
 }) {
   const gatesAprobados = proyecto.gates.filter((g) => g.estado === 'aprobado').length;
   return (
@@ -369,35 +356,15 @@ function EncabezadoProyecto({
       <span style={{ font: '400 13px var(--font-sans)', color: 'var(--text-muted)' }}>
         Reto {proyecto.reto.codigo} · {proyecto.reto.titulo}
       </span>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        <span style={micro}>Criterios de éxito (ventana por criterio, SYS-22)</span>
-        {proyecto.reto.criterios.length === 0 && (
-          <span style={{ font: '400 12.5px var(--font-sans)', color: 'var(--warn)' }}>
-            Sin criterios definidos: G0 no podrá aprobarse.
-          </span>
-        )}
-        {proyecto.reto.criterios.map((c) => (
-          <div key={c.id} style={{ font: '400 12.5px/1.5 var(--font-sans)', color: 'var(--text-body)' }}>
-            <strong>{c.kpi}</strong>
-            {c.objetivo ? ` → ${c.objetivo}` : ''}
-            {' · '}
-            {c.lineaBaseValor
-              ? `base ${c.lineaBaseValor}${c.lineaBaseFecha ? ` (${c.lineaBaseFecha})` : ''}`
-              : c.lineaBasePlan
-                ? 'base con plan'
-                : 'sin línea base'}
-            {' · '}
-            {c.ventanaDias ? `ventana ${c.ventanaDias} días` : 'SIN VENTANA'}
-            {/* La definición ES lo que el sponsor certifica en G0: sin ella a la
-                vista, aprobaría un KPI cuyo cálculo nunca leyó. */}
-            {c.definicion && (
-              <div style={{ font: '400 12px var(--font-sans)', color: 'var(--text-muted)' }}>
-                {c.definicion}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
+      <CriteriosDelReto
+        workspaceId={workspaceId}
+        retoId={proyecto.reto.id}
+        criterios={proyecto.reto.criterios}
+        criteriosCongelados={proyecto.reto.criteriosCongelados}
+        rol={rol}
+        onCambio={onCambio}
+        onError={onError}
+      />
       <PanelDeHilos
         workspaceId={workspaceId}
         objeto={{ tipo: 'proyecto', id: proyecto.id }}

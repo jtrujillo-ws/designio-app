@@ -508,7 +508,12 @@ export async function proyectoMetodo(
               order by c.creado_en, c.id)
             from criterio_exito c
             where c.reto_id = r.id and c.workspace_id = p.workspace_id), '[]'::jsonb))
-          from (select r0.id, r0.codigo, r0.titulo, r0.estado from reto r0
+          -- El congelado lo contesta la MISMA función que la política usa para rechazar la
+          -- escritura, y no un espejo: son dos condiciones —el G0 aprobado y el Metric
+          -- Registry firmado— y la segunda no viaja en nada más de esta proyección.
+          from (select r0.id, r0.codigo, r0.titulo, r0.estado,
+                  reto_criterios_congelados(r0.id, r0.workspace_id) as "criteriosCongelados"
+                from reto r0
                 where r0.id = p.reto_id and r0.workspace_id = p.workspace_id) r
         ) as reto,
         coalesce((select jsonb_agg(jsonb_build_object(
@@ -557,6 +562,7 @@ export async function proyectoMetodo(
       titulo: string;
       estado: string;
       criterios: ProyectoMetodo['reto']['criterios'];
+      criteriosCongelados: boolean;
     };
     return {
       id: fila.id as string,

@@ -248,13 +248,34 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      *
      * De las cadenas se conservan las comillas y se tira el contenido, para no descolocar lo que
      * viene después: una lista de valores sigue teniendo el mismo número de elementos.
+     *
+     * Y las de DÓLAR cuentan igual: `select $$insert into cita$$` es la misma avería con la otra
+     * forma de citar de Postgres. La apertura se reconoce como `$tag$` con etiqueta opcional, lo
+     * que deja fuera los `$1` de los parámetros — una etiqueta no empieza por dígito—, aunque
+     * aquí no aparecen: las interpolaciones ya llegan como testigo.
      */
     const soloSql = (t: string): string => {
       let fuera = '';
       let enCadena = false;
+      let cierreDolar: string | null = null;
       let i = 0;
       while (i < t.length) {
         const c = t[i]!;
+        if (cierreDolar !== null) {
+          if (t.startsWith(cierreDolar, i)) {
+            fuera += cierreDolar;
+            i += cierreDolar.length;
+            cierreDolar = null;
+          } else i += 1;
+          continue;
+        }
+        const abre = c === '$' && !enCadena ? /^\$([A-Za-z_]\w*)?\$/.exec(t.slice(i)) : null;
+        if (abre) {
+          fuera += abre[0];
+          cierreDolar = abre[0];
+          i += abre[0].length;
+          continue;
+        }
         if (enCadena) {
           if (c === "'") {
             fuera += c;
@@ -532,8 +553,32 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       const set = /\bset\b/i.exec(resto);
       if (!set) return [];
       const cuerpo = resto.slice(set.index + set[0].length);
-      const fin = /\b(where|returning|from)\b/i.exec(cuerpo);
-      return partesDeNivelCero(fin ? cuerpo.slice(0, fin.index) : cuerpo)
+      /*
+       * El terminador se busca a PROFUNDIDAD CERO, como ya se hacía con las comas.
+       * Buscándolo con una regex a secas, un `set a = (select … from …), b = ${…}` se cortaba en
+       * el `from` de la subconsulta: las columnas posteriores desaparecían de lo exigido y el
+       * escritor a mano podía dejar de guardarlas con el censo en verde.
+       */
+      const finDeNivelCero = (t: string): number => {
+        let hondo = 0;
+        let enTexto = false;
+        for (let i = 0; i < t.length; i++) {
+          const c = t[i]!;
+          if (enTexto) {
+            if (c === "'") enTexto = false;
+            continue;
+          }
+          if (c === "'") enTexto = true;
+          else if (c === '(') hondo += 1;
+          else if (c === ')') hondo -= 1;
+          else if (hondo === 0 && (i === 0 || /\W/.test(t[i - 1]!))) {
+            if (/^(where|returning|from)\b/i.test(t.slice(i))) return i;
+          }
+        }
+        return -1;
+      };
+      const fin = finDeNivelCero(cuerpo);
+      return partesDeNivelCero(fin >= 0 ? cuerpo.slice(0, fin) : cuerpo)
         .filter((x) => x.includes(TESTIGO.trim()))
         .map((x) => /^\s*([a-z_][a-z0-9_]*)\s*=/i.exec(x)?.[1]?.toLowerCase() ?? '')
         .filter((x) => x !== '');

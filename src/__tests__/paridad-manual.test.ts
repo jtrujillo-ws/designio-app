@@ -132,6 +132,103 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     }
   });
 
+  /*
+   * Y QUE SE PUEDA INVOCAR, no sólo que el nombre esté exportado.
+   *
+   * `export const guardar = persistir()` exporta una PROMESA —el resultado de una llamada que
+   * ocurrió UNA vez al cargar el módulo—, no algo que una pantalla pueda llamar. Y el recorrido
+   * de escrituras llegaba igual hasta `persistir` y acreditaba su SQL, así que las dos
+   * aserciones pasaban sobre una puerta que no existe. SYS-21 pide que la operación sea
+   * EJECUTABLE; esto es lo que lo comprueba.
+   *
+   * Lo invocable aquí son dos formas y ninguna más: una función literal, y la CADENA con la que
+   * este repositorio declara una server function —`createServerFn({…}).inputValidator(…)
+   * .handler(fn)`—, reconocida por la raíz de la cadena y por el import que la trae. Lo demás
+   * no se acepta en silencio: se nombra.
+   */
+  const CONSTRUCTOR_DE_SERVER_FN = 'createServerFn';
+  const MODULO_DE_SERVER_FN = '@tanstack/react-start';
+  const traeElConstructor = (arbol: ts.SourceFile): boolean =>
+    arbol.statements.some((st) => {
+      if (!ts.isImportDeclaration(st)) return false;
+      if ((st.moduleSpecifier as ts.StringLiteral).text !== MODULO_DE_SERVER_FN) return false;
+      const b = st.importClause?.namedBindings;
+      return (
+        b !== undefined &&
+        ts.isNamedImports(b) &&
+        b.elements.some((e) => e.name.text === CONSTRUCTOR_DE_SERVER_FN)
+      );
+    });
+  const raizDeLaCadena = (x: ts.Expression): ts.Expression => {
+    let a: ts.Expression = x;
+    for (;;) {
+      if (ts.isCallExpression(a) || ts.isPropertyAccessExpression(a)) {
+        a = a.expression;
+        continue;
+      }
+      return a;
+    }
+  };
+  const invocable = (f: string, nombre: string, saltos = 0): boolean => {
+    if (saltos > 6) return false;
+    const arbol = leer(f);
+    let decl: ts.Node | null = null;
+    for (const st of arbol.statements) {
+      if (ts.isFunctionDeclaration(st) && st.name?.text === nombre) decl = st;
+      else if (ts.isVariableStatement(st)) {
+        for (const d of st.declarationList.declarations) {
+          if (ts.isIdentifier(d.name) && d.name.text === nombre && d.initializer) {
+            decl = d.initializer;
+          }
+        }
+      } else if (ts.isExportDeclaration(st) && st.moduleSpecifier) {
+        // Un barrel legítimo: se sigue hasta donde se declara, con nombre o con comodín.
+        const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+        if (destino === null) continue;
+        if (st.exportClause === undefined) {
+          if (invocable(destino, nombre, saltos + 1)) return true;
+        } else if (ts.isNamedExports(st.exportClause)) {
+          for (const e of st.exportClause.elements) {
+            if (e.name.text !== nombre) continue;
+            if (invocable(destino, (e.propertyName ?? e.name).text, saltos + 1)) return true;
+          }
+        }
+      }
+    }
+    if (decl === null) return false;
+    let x: ts.Node = decl;
+    while (
+      ts.isParenthesizedExpression(x) ||
+      ts.isAsExpression(x) ||
+      ts.isNonNullExpression(x)
+    ) {
+      x = x.expression;
+    }
+    if (ts.isFunctionDeclaration(x) || ts.isArrowFunction(x) || ts.isFunctionExpression(x)) {
+      return true;
+    }
+    if (ts.isCallExpression(x)) {
+      const r = raizDeLaCadena(x);
+      return (
+        ts.isIdentifier(r) && r.text === CONSTRUCTOR_DE_SERVER_FN && traeElConstructor(arbol)
+      );
+    }
+    if (!ts.isIdentifier(x)) return false;
+    // Un alias: local primero, y si no, por donde lo importen.
+    const nom = x.text;
+    for (const st of arbol.statements) {
+      if (!ts.isImportDeclaration(st)) continue;
+      const destino = resolver(f, (st.moduleSpecifier as ts.StringLiteral).text);
+      if (destino === null) continue;
+      const b = st.importClause?.namedBindings;
+      if (b === undefined || !ts.isNamedImports(b)) continue;
+      for (const e of b.elements) {
+        if (e.name.text === nom) return invocable(destino, (e.propertyName ?? e.name).text, saltos + 1);
+      }
+    }
+    return invocable(f, nom, saltos + 1);
+  };
+
   it('la puerta manual que cada capacidad nombra existe y se exporta', () => {
     const conEscritura = CAPACIDADES_ACTIVAS.filter(
       (c) => CAPACIDADES[c].paridadManual.clase === 'escritura',
@@ -149,6 +246,10 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         expect(
           [...exportadasDe(modulo!)].includes(paso.funcion),
           `${cap}: ${paso.modulo} no exporta ${paso.funcion}`,
+        ).toBe(true);
+        expect(
+          invocable(modulo!, paso.funcion),
+          `${cap}: ${paso.modulo} exporta ${paso.funcion}, pero no es algo que se pueda invocar`,
         ).toBe(true);
       }
     }
@@ -362,6 +463,33 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * otro disfraz. Lo que no resuelva a un cliente de la base no se ignora en silencio: tumba
      * el censo nombrando la etiqueta, y así pide una decisión en vez de contarla o perderla.
      */
+    /**
+     * EL NOMBRE QUE UNA EXPRESIÓN REASIGNA, si es que reasigna alguno.
+     *
+     * Vale para todo el rango de operadores de asignación —un `+=` cambia el valor igual que un
+     * `=`— y para `++`/`--`. Lo usan las tres ligaduras que este censo sigue —la del valor de un
+     * campo, la del cliente de la base y la del destino de una llamada—, porque las tres se
+     * apoyaban en el inicializador de la declaración y ninguna miraba lo que pasaba después.
+     */
+    const nombreReasignado = (y: ts.Node): ts.Identifier | null => {
+      if (
+        ts.isBinaryExpression(y) &&
+        y.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        y.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+        ts.isIdentifier(y.left)
+      ) {
+        return y.left;
+      }
+      if (
+        (ts.isPrefixUnaryExpression(y) || ts.isPostfixUnaryExpression(y)) &&
+        (y.operator === ts.SyntaxKind.PlusPlusToken ||
+          y.operator === ts.SyntaxKind.MinusMinusToken) &&
+        ts.isIdentifier(y.operand)
+      ) {
+        return y.operand;
+      }
+      return null;
+    };
     const etiquetasDesconocidas = new Set<string>();
     const callbacksSinInvocar = new Set<string>();
     const predicadosSinColumna = new Set<string>();
@@ -464,6 +592,38 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       ['catch', [0]],
       ['finally', [0]],
     ]);
+    /*
+     * Y HAY QUIEN ESPERA LO QUE SU CALLBACK DEVUELVE, no sólo quien lo llama. `conUsuario` hace
+     * `return fn(tx)` dentro de un callback asíncrono que `begin` espera, así que la promesa de
+     * la consulta se ASIMILA: un `(tx) => tx\`insert …\`` de cuerpo corto SÍ sale hacia la base
+     * aunque la flecha no sea `async`.
+     *
+     * Sin esto, reescribir `async (tx) => { await tx\`…\` }` como `(tx) => tx\`…\`` —que hace
+     * exactamente lo mismo— ponía el censo en rojo sobre una ruta intacta. Un rechazo falso no
+     * es el modo de fallo menor: es el que enseña a desconfiar de la sonda.
+     *
+     * La lista es corta a propósito: `map` o `forEach` reciben lo que llaman y TIRAN lo que
+     * devuelve, así que ahí un cuerpo corto sigue sin ejecutarse.
+     */
+    const asimilaLoQueDevuelve = (quien: string): boolean => quien === ENTREGA_LA_TRANSACCION;
+    /** Si la función que envuelve a la plantilla la entrega a alguien que ESPERA su vuelta. */
+    const laEsperaQuienLaRecibe = (f: ts.Node): boolean => {
+      const recibe = f.parent as ts.Node | undefined;
+      if (recibe === undefined || !ts.isCallExpression(recibe)) return false;
+      const q = recibe.expression;
+      const quien = ts.isPropertyAccessExpression(q)
+        ? q.name.text
+        : ts.isIdentifier(q)
+          ? q.text
+          : null;
+      if (quien === null || !asimilaLoQueDevuelve(quien)) return false;
+      const posiciones = EJECUTAN_SU_CALLBACK.get(quien);
+      return (
+        posiciones !== undefined &&
+        posiciones.includes(recibe.arguments.indexOf(f as unknown as ts.Expression))
+      );
+    };
+
     /** Si quien recibe una función anónima la ejecuta. Lo que no, se nombra si lleva SQL. */
     const laEjecutaQuienLaRecibe = (x: ts.Node): boolean => {
       // Un nodo función-like sin cuerpo es un TIPO: no ejecuta nada y no hay nada que decir.
@@ -717,25 +877,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * cambia el valor igual y mirando sólo el `=` pasaba en verde: la misma avería con otro
          * operador, que es como han llegado casi todas.
          */
-        const reasignado = ((): ts.Identifier | null => {
-          if (
-            ts.isBinaryExpression(y) &&
-            y.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
-            y.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
-            ts.isIdentifier(y.left)
-          ) {
-            return y.left;
-          }
-          if (
-            (ts.isPrefixUnaryExpression(y) || ts.isPostfixUnaryExpression(y)) &&
-            (y.operator === ts.SyntaxKind.PlusPlusToken ||
-              y.operator === ts.SyntaxKind.MinusMinusToken) &&
-            ts.isIdentifier(y.operand)
-          ) {
-            return y.operand;
-          }
-          return null;
-        })();
+        const reasignado = nombreReasignado(y);
         if (reasignado !== null) {
           const d = declaracionDe(y, reasignado.text);
           if (d !== null) reasignadas.add(d);
@@ -749,7 +891,9 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
          * que el arreglo anterior perseguía por el otro lado.
          */
         const dispara =
-          ts.isAwaitExpression(y) || (ts.isReturnStatement(y) && esAsincrona(funcionDe(y)));
+          ts.isAwaitExpression(y) ||
+          (ts.isReturnStatement(y) &&
+            (esAsincrona(funcionDe(y)) || laEsperaQuienLaRecibe(funcionDe(y))));
         if (dispara) {
           const nombres = new Set<string>();
           valorConsumido(y.expression, nombres);
@@ -810,10 +954,13 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
            * `persistir(tx)` contaba la escritura sin que ocurriera.
            */
           if (ts.isReturnStatement(padre) && padre.expression === hijo) {
-            return esAsincrona(funcionDe(padre));
+            const suya = funcionDe(padre);
+            return esAsincrona(suya) || laEsperaQuienLaRecibe(suya);
           }
           // El cuerpo CORTO de una flecha es un `return` con otra forma, y se mide igual.
-          if (ts.isArrowFunction(padre) && padre.body === hijo) return esAsincrona(padre);
+          if (ts.isArrowFunction(padre) && padre.body === hijo) {
+            return esAsincrona(padre) || laEsperaQuienLaRecibe(padre);
+          }
           // `Promise.all([q1, q2])`: la lista y la llamada sólo cuentan si LA LLAMADA se espera.
           if (ts.isArrayLiteralExpression(padre) && padre.elements.includes(hijo as ts.Expression)) {
             const llamada = padre.parent as ts.Node | undefined;
@@ -1744,6 +1891,39 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
     };
 
     /** Y la etiqueta entera: lo que de verdad manda la sentencia a la base. */
+    /** El mismo lector, con otro nombre, para los ámbitos donde `ligaduraDe` queda tapado. */
+    const ligaduraLexica = ligaduraDe;
+
+    /**
+     * Si una variable se REASIGNA dentro de la función que la declara.
+     *
+     * `let client = sql(); client = String.raw; await client\`update …\`` se leía por el
+     * inicializador y contaba como escritura, cuando lo que se etiqueta es un formateador de
+     * cadenas: borrar la persistencia de verdad dejaba la paridad en verde.
+     */
+    const seReasigna = (d: ts.VariableDeclaration): boolean => {
+      if (!ts.isIdentifier(d.name)) return false;
+      const nombre = d.name.text;
+      let ambito: ts.Node | undefined = d.parent as ts.Node | undefined;
+      while (
+        ambito !== undefined &&
+        !ts.isFunctionLike(ambito) &&
+        !ts.isSourceFile(ambito)
+      ) {
+        ambito = ambito.parent as ts.Node | undefined;
+      }
+      if (ambito === undefined) return false;
+      let hay = false;
+      const ver = (y: ts.Node): void => {
+        if (hay) return;
+        const izq = nombreReasignado(y);
+        if (izq !== null && izq.text === nombre && ligaduraDe(izq, nombre) === d) hay = true;
+        ts.forEachChild(y, ver);
+      };
+      ver(ambito);
+      return hay;
+    };
+
     const esCliente = (e: ts.Expression, f: string, hondo = 0): boolean => {
       if (hondo > 8) return false;
       let x: ts.Expression = e;
@@ -1761,7 +1941,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
       if (liga === null) return false;
       if (ts.isParameter(liga)) return esParametroDeLaBase(liga, f);
       if (ts.isVariableDeclaration(liga) && liga.initializer) {
-        return esCliente(liga.initializer, f, hondo + 1);
+        return !seReasigna(liga) && esCliente(liga.initializer, f, hondo + 1);
       }
       return false;
     };
@@ -1936,6 +2116,24 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
           return null;
         };
+        /*
+         * Y TAMPOCO SI SE REASIGNA. `let ejecutar = persistirManual; ejecutar =
+         * generarConProveedor; await ejecutar()` acreditaba el SQL del primero y dejaba fuera
+         * el módulo del proveedor: la ruta declarada llamaba SÓLO al modelo y SYS-21 seguía en
+         * verde. Un alias mutable tapa el nombre y no dice a dónde va, que es lo conservador.
+         */
+        const reasignadasAqui = new Set<ts.Node>();
+        {
+          const anotar = (y: ts.Node): void => {
+            const izq = nombreReasignado(y);
+            if (izq !== null) {
+              const d = ligaduraLexica(izq, izq.text);
+              if (d !== null) reasignadasAqui.add(d);
+            }
+            ts.forEachChild(y, anotar);
+          };
+          anotar(decl);
+        }
         const ligaduraDe = (ambito: ts.Node, nombre: string): Sombra => {
           if (ts.isFunctionLike(ambito)) {
             for (const par of ambito.parameters) {
@@ -1967,6 +2165,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
                 d.initializer !== undefined && ts.isIdentifier(d.initializer)
                   ? d.initializer.text
                   : null;
+              if (reasignadasAqui.has(d)) return { hay: true, alias: null, via: null };
               return {
                 hay: true,
                 alias: ts.isIdentifier(d.name) ? alias : null,
@@ -1989,7 +2188,14 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
         };
         for (const { objeto, nombre, donde } of llamadasEn(decl)) {
-          // `servicio.crear(…)` con `import * as servicio`: el módulo lo dice el espacio.
+          /*
+           * `servicio.crear(…)` con `import * as servicio`: el módulo lo dice el espacio — PERO
+           * sólo si nadie lo tapa. Con un parámetro o un local llamado igual, esta rama se
+           * creía el import y acreditaba SQL de otro módulo mientras corría el método del
+           * parámetro: la escritura de verdad podía borrarse con la invariante en verde. Es el
+           * mismo agujero que la etiqueta de la plantilla ya tenía tapado, por el otro lado.
+           */
+          if (objeto !== null && sombraEn(donde, objeto).hay) continue;
           const espacio = objeto === null ? undefined : imports.get(objeto);
           if (espacio?.original === '*') {
             cola.push({ modulo: espacio.modulo, funcion: nombre });

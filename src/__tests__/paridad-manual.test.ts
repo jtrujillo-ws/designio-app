@@ -801,7 +801,11 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
      * `id = ${entrada.reviewId}` — o sea, se podían escribir todos los borradores del workspace
      * con el censo en verde. Es la misma distinción que en las columnas: lo que viene de fuera.
      */
-    const filtroTrasLaTabla = (sql: string, desde: number, verbo: string): string[] => {
+    const filtroTrasLaTabla = (
+      sql: string,
+      desde: number,
+      verbo: string,
+    ): { columna: string; operador: string; indice: number }[] => {
       if (verbo !== 'update') return [];
       const resto = sql.slice(desde);
       const set = /\bset\b/i.exec(resto);
@@ -853,7 +857,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
           }
         }
       }
-      const columnas: string[] = [];
+      const columnas: { columna: string; operador: string; indice: number }[] = [];
       let hondo2 = 0;
       let enTexto2 = false;
       for (let i = 0; i < cola.length; i++) {
@@ -867,15 +871,21 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         else if (c === ')') hondo2 -= 1;
         else if (hondo2 === 0 && (i === 0 || /\W/.test(cola[i - 1]!))) {
           if (/^(returning|order|limit)\b/i.test(cola.slice(i))) break;
-          const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i\d+\b/i.exec(cola.slice(i));
-          if (m) columnas.push(m[1]!.toLowerCase());
+          const m = /^([a-z_][a-z0-9_]*)\s*(=|<>|!=|\bin\b)\s*\(?\s*:i(\d+)\b/i.exec(cola.slice(i));
+          if (m) {
+            columnas.push({
+              columna: m[1]!.toLowerCase(),
+              operador: m[2]!.toLowerCase().trim(),
+              indice: Number(m[3]),
+            });
+          }
         }
       }
       return columnas;
     };
 
     /** Las escrituras «verbo tabla» alcanzables desde una función, con las columnas de cada una. */
-    type Escritura = { columnas: Map<string, Set<string>>; filtro: Set<string> };
+    type Escritura = { columnas: Map<string, Set<string>>; filtro: Map<string, Set<string>> };
     type Alcance = { escrituras: Map<string, Escritura>; modulos: Set<string> };
     const cacheDeEscrituras = new Map<string, Alcance>();
     const alcanceDesde = (modulo: string, funcion: string): Alcance => {
@@ -913,7 +923,7 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
             const clave = `${verbo} ${tabla}`;
             const y = escrituras.get(clave) ?? {
               columnas: new Map<string, Set<string>>(),
-              filtro: new Set<string>(),
+              filtro: new Map<string, Set<string>>(),
             };
             const tras = m.index + m[0].length;
             for (const c of columnasTrasLaTabla(consulta.sql, tras, verbo)) {
@@ -921,7 +931,17 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
               for (const i of c.indices) for (const n of consulta.campos[i] ?? []) campos.add(n);
               y.columnas.set(c.columna, campos);
             }
-            for (const c of filtroTrasLaTabla(consulta.sql, tras, verbo)) y.filtro.add(c);
+            /*
+             * El filtro se guarda con su OPERADOR y con el campo del que sale, por lo mismo que
+             * las columnas: `id <> ${…}` acota la fila al revés y daba el mismo conjunto que
+             * `id = ${…}`.
+             */
+            for (const c of filtroTrasLaTabla(consulta.sql, tras, verbo)) {
+              const clv = `${c.columna} ${c.operador}`;
+              const campos = y.filtro.get(clv) ?? new Set<string>();
+              for (const n of consulta.campos[c.indice] ?? []) campos.add(n);
+              y.filtro.set(clv, campos);
+            }
             escrituras.set(clave, y);
           }
         }
@@ -1083,14 +1103,18 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
         for (const [e, y] of escriturasDesde(m!, paso.funcion)) {
           const acumulado = cubierto.get(e) ?? {
             columnas: new Map<string, Set<string>>(),
-            filtro: new Set<string>(),
+            filtro: new Map<string, Set<string>>(),
           };
           for (const [c, campos] of y.columnas) {
             const junto = acumulado.columnas.get(c) ?? new Set<string>();
             for (const n of campos) junto.add(n);
             acumulado.columnas.set(c, junto);
           }
-          for (const c of y.filtro) acumulado.filtro.add(c);
+          for (const [c, campos] of y.filtro) {
+            const junto = acumulado.filtro.get(c) ?? new Set<string>();
+            for (const n of campos) junto.add(n);
+            acumulado.filtro.set(c, junto);
+          }
           cubierto.set(e, acumulado);
         }
       }
@@ -1163,12 +1187,45 @@ describe('paridad manual de las capacidades AI (RF-08.6)', () => {
 
       const filtrosQueFaltan = [...exigido]
         .flatMap(([e, y]) =>
-          [...y.filtro].filter((c) => !cubierto.get(e)!.filtro.has(c)).map((c) => `${e} where ${c}`),
+          [...y.filtro.keys()]
+            .filter((c) => !cubierto.get(e)!.filtro.has(c))
+            .map((c) => `${e} where ${c}`),
         )
         .sort();
       expect(
         filtrosQueFaltan,
         `${cap}: la secuencia manual (${secuencia}) escribe lo mismo que ${suyos[0]} pero no acota la fila igual`,
+      ).toEqual([]);
+
+      /*
+       * Y UN OPERANDO QUE NOMBRA A OTRA COLUMNA DEL MISMO FILTRO es un intercambio:
+       * `where id = ${entrada.workspaceId} and workspace_id = ${entrada.reviewId}` acota por los
+       * valores cruzados y da el mismo conjunto que lo correcto.
+       *
+       * No se compara el campo contra el de la materialización, y esto es una LIMITACIÓN medida,
+       * no un olvido: C7 acota por `id` desde `p.anclaId` en la materialización y desde
+       * `entrada.reviewId` a mano, y ahí no hay nada roto — son el mismo dato con dos nombres, y
+       * a diferencia de las columnas escritas no hay un nombre de columna con el que normalizar
+       * (`id` no se parece a ninguno de los dos). Exigir la coincidencia habría puesto en rojo
+       * una ruta intacta.
+       */
+      const pelar = (n: string): string => n.toLowerCase().replace(/_/g, '');
+      const columnasDelFiltro = new Set(
+        [...cubierto.values()].flatMap((y) => [...y.filtro.keys()].map((k) => pelar(k.split(' ')[0]!))),
+      );
+      const operandosCruzados = [...cubierto]
+        .flatMap(([e, y]) =>
+          [...y.filtro].flatMap(([clv, campos]) => {
+            const col = clv.split(' ')[0]!;
+            return [...campos]
+              .filter((n) => pelar(n) !== pelar(col) && columnasDelFiltro.has(pelar(n)))
+              .map((n) => `${e} where ${col} ← ${n}`);
+          }),
+        )
+        .sort();
+      expect(
+        operandosCruzados,
+        `${cap}: la secuencia manual (${secuencia}) acota por un valor que nombra a otra columna del mismo filtro`,
       ).toEqual([]);
     }
 

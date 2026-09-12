@@ -440,7 +440,14 @@ aceptar una propuesta, `ai.servicio.ts` inserta directamente en `evidencia` y `d
 `criterio_exito` (C0), `insight`, `afirmacion`, `cita` y `contradiccion` (C2), `oportunidad` y
 `oportunidad_insight` (C3), `entrada_kpi` (C6) y `revision_simulada`, `hallazgo_simulado`,
 `hallazgo_simulado_evidencia` y `pregunta_de_test` (C4, por `escribirRevisionSimulada`), y actualiza
-`outcome_review` (C7); todos los servicios insertan en `evento_dominio`; y las proyecciones
+`outcome_review` (C7). En `evento_dominio` **no escriben todos los servicios**: insertan directamente
+desde TypeScript `ai`, `arbol`, `auth`, `evidencia`, `insight`, `journey`, `medicion`, `metodo` (con
+`gobernanza`) y `segmento`, mientras que `entrega`, `portal`, `exportacion` y `disposicion` no tienen
+ningún `insert into evento_dominio` y sus actas las emiten los guards y funciones definer de la base
+(`DesignVersionAprobada`, `Release*`, `EffectiveStateConstatado`, `Hilo*`, `ComentarioPublicado`,
+`WorkspaceExportado`, `DisposicionAcordada`, `WorkspaceDispuesto`), y `oportunidad` no escribe acta
+ni desde el servicio ni por guard; quien busque escritores del libro de auditoría tiene que mirar las
+dos capas. Y las proyecciones
 (Aprobaciones, Biblioteca, la exportación bajo RLS) leen lo que otros poseen. En **tiempo de
 ejecución** hay seis dependencias por **llamada a función** entre módulos de dominio: `ai` llama a `bloquearReto` de `metodo`,
 a `leerJourneyCompleto`, `leerJourneysCompletos` y `validarJourney` de `journey`, y a
@@ -483,17 +490,17 @@ contexto está en `21` y el de la capa AI en `22`.
 | Bandeja de importación y curaduría | `/importacion` | `evidencia` | `item_importacion`, `archivo_importado`, `consentimiento_item`, `evidencia` | 02 |
 | Evidencia y derechos de uso | `/evidencia` | `evidencia` | `evidencia`, `derecho_uso`, `fuente` | 03 |
 | Insights, citas y contradicciones | `/insights` | `insight` | `insight`, `afirmacion`, `cita`, `contradiccion` | 04 |
-| Retos, criterios, etapas, gates, checklist | `/proyecto/$id` | `metodo` | `reto`, `criterio_exito`, `etapa_instancia`, `gate_instancia`, `checklist_item` | 05 |
-| Decisiones, arquetipos, reaperturas, conceptos y sus revisiones simuladas | `/proyecto/$id` | `metodo/gobernanza` | `decision`, `decision_insight`, `arquetipo`, `reapertura_etapa`, `concepto`, `concepto_evidencia` (solo lectura desde la pantalla), `revision_simulada`, `hallazgo_simulado`, `hallazgo_simulado_evidencia`, `pregunta_de_test` | 05 |
+| Retos, criterios, etapas, gates, checklist | `/proyecto/$proyectoId` | `metodo` | `reto`, `criterio_exito`, `etapa_instancia`, `gate_instancia`, `checklist_item` | 05 |
+| Decisiones, arquetipos, reaperturas, conceptos y sus revisiones simuladas | `/proyecto/$proyectoId` | `metodo/gobernanza` | `decision`, `decision_insight`, `arquetipo`, `reapertura_etapa`, `concepto`, `concepto_evidencia` (solo lectura desde la pantalla), `revision_simulada`, `hallazgo_simulado`, `hallazgo_simulado_evidencia`, `pregunta_de_test` | 05 |
 | Portafolio de oportunidades HMW | `/oportunidades` | `servicio/oportunidad` | `oportunidad`, `oportunidad_insight` | 06 |
-| Journeys, blueprints, validación, snapshot | `/journeys`, `/journey/$id` | `journey` | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot`, `catalogo_journey` | 07 |
-| Design versions, diff, releases, effective state, conciliación | `/design-versions`, `/design-version/$id` | `entrega` | `design_version`, `elemento_cambio`, `release`, `release_elemento`, `effective_state`, `constatacion` | 08 |
-| Metric Registry, snapshots, outcome review | `/proyecto/$id` (sección medición) | `medicion` | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` | 09 |
+| Journeys, blueprints, validación, snapshot | `/journeys`, `/journey/$journeyId` | `journey` | `journey`, `journey_nodo`, `journey_arista`, `journey_nodo_evidencia`, `journey_snapshot`, `catalogo_journey` | 07 |
+| Design versions, diff, releases, effective state, conciliación | `/design-versions`, `/design-version/$designVersionId` | `entrega` | `design_version`, `elemento_cambio`, `release`, `release_elemento`, `effective_state`, `constatacion` | 08 |
+| Metric Registry, snapshots, outcome review | `/proyecto/$proyectoId` (sección medición) | `medicion` | `metric_registry`, `entrada_kpi`, `snapshot`, `outcome_review`, `resultado_criterio` | 09 |
 | Propuestas AI (CI, C0, CT, C2, C3, C4, C5, C6, C7) | `/propuestas` | `ai` | `propuesta_ai`, `llamada_ai`, `reserva_ai` | 10 |
 | Operación de la capa AI (coste, latencia, error y aceptación por capacidad) | `/observabilidad-ai` | `ai` (`ai.observabilidad.ts`) | `llamada_ai`, `reserva_ai`, `propuesta_ai` (solo lectura) | 10 |
 | Grounding medido (corridas de evals sobre lo aceptado, comparadas contra la corrida anterior y contra otra versión) | `/evals-grounding` | `ai` (`ai.evals.ts`) | `corrida_eval`, `medicion_eval` | 10 |
 | Aprobaciones pendientes por rol | `/aprobaciones` | `aprobaciones` (proyección) | lee `gate_instancia`, `derecho_uso`, `insight`, `design_version` | 11 |
-| Hilos del portal y auditoría | `/proyecto/$id`, `/design-version/$id`, `/auditoria` | `portal` | `hilo_comentario`, `comentario`, `evento_dominio` | 12 |
+| Hilos del portal y auditoría | `/proyecto/$proyectoId`, `/design-version/$designVersionId`, `/auditoria` | `portal` | `hilo_comentario`, `comentario`, `evento_dominio` | 12 |
 | Biblioteca del cliente | `/biblioteca` | `memoria` (proyección) | lee `arquetipo`, `insight`, `decision`, `reto`, `segmento` | 13 |
 | Segmentos | `/segmentos` | `segmento` | `segmento`, `arquetipo_segmento`, `evidencia_segmento` | 14 |
 | Acceso, sesión, invitaciones, miembros | `/login`, `/invitacion/$token`, `/personas` | `auth` | `usuario`, `miembro` | 15 |

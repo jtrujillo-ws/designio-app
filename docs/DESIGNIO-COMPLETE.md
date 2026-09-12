@@ -778,8 +778,10 @@ módulo aparte (ADR-0007).
   pantalla**: las server functions `crearRetoCandidato` y `activarRetoConPerfil` existen y están
   probadas, pero ninguna ruta ni componente las llama todavía; hoy un reto y su proyecto nacen del
   seed o de una llamada directa. Es el hueco visible que queda del flujo J2 (ver `30`).
-- Cada **criterio de éxito** registra KPI, definición, línea base (valor y fecha), objetivo y
-  **ventana de medición en días**. Desde la app entran aceptando propuestas de la AI (C0) **o a
+- Cada **criterio de éxito** registra KPI, definición, línea base, objetivo y **ventana de
+  medición en días**. La línea base es **valor y fecha, o bien un plan** para medirla cuando aún
+  no existe (`lineaBasePlan`, no vacío): `CriterioSchema` admite valor y fecha nulos con plan, C0
+  produce criterios así a propósito y el predicado de G0 acepta esa alternativa. Desde la app entran aceptando propuestas de la AI (C0) **o a
   mano**: desde [#55](https://github.com/jtrujillo-ws/designio-app/pull/55) el bloque `CriteriosDelReto` de la pantalla del proyecto ofrece «Añadir
   criterio» y «Editar» por fila a lead y diseñador (los roles de `criterio_insert` y
   `criterio_update`), con el botón decidido por el mismo `CriterioSchema` que valida el servidor y
@@ -975,7 +977,12 @@ mirar. El PR añade el **portafolio de oportunidades** del reto.
   razonamiento sigue en pie con derechos vivos, comprobado por el protocolo compartido. No exige
   "portafolio aprobado" en el guard (eso es expectativa del método y vive en el checklist), para no
   dejar sin firma a proyectos que llegaron a la etapa 3 antes de existir la tabla.
-- La ventana del portafolio se cierra cuando G3 firma **o** cuando el reto termina.
+- La ventana del portafolio (`reto_admite_portafolio`, el predicado que usan las políticas de
+  oportunidad, la pantalla y C3) está abierta mientras el reto sigue `candidato` o `activo` y no se
+  da a la vez G3 aprobado **y** etapa 3 cerrada. Cerrar o archivar el reto la cierra del todo; la
+  firma de G3 la cierra **mientras la etapa 3 siga cerrada**: una **reapertura** de la etapa 3
+  (que la deja `en-curso`) vuelve a abrir el portafolio aunque G3 siga firmado, así que la
+  aprobación de G3 no es un congelado irreversible.
 - Entra en el catálogo de exportación (SYS-04) y en la congelación por disposición.
 
 ## Generación asistida (C3)

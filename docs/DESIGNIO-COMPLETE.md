@@ -6,7 +6,7 @@ language: es
 ---
 
 <!-- DESIGNIO-COMPLETE — documento consolidado, canónico y derivado del código y del paquete de diseño. -->
-<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 20656e4, 2026-09-07). -->
+<!-- Fuente: repositorio jtrujillo-ws/designio-app, rama agents (punta 794948e, 2026-09-07). -->
 
 # Designio — Documentación completa de la plataforma
 
@@ -17,7 +17,7 @@ language: es
 > cumplimiento. Debe dar a cualquier lector una idea clara de **qué es Designio, qué incluye hoy,
 > qué está en vuelo y qué está diseñado pero todavía no construido**.
 >
-> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-07, punta `20656e4`
+> Fuente de verdad: el código en la rama `agents` (integración) a fecha 2026-09-07, punta `794948e`
 > (tras fusionar [#39](https://github.com/jtrujillo-ws/designio-app/pull/39),
 > [#43](https://github.com/jtrujillo-ws/designio-app/pull/43),
 > [#45](https://github.com/jtrujillo-ws/designio-app/pull/45),
@@ -67,7 +67,7 @@ capítulo:
 | Marca | Significado |
 |---|---|
 | **Construido** | Existe en la rama `agents`, con migración, server function, pantalla y pruebas |
-| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy ninguno: #39, #43, #45, #46, #47, #49, #50, #51, #48, #52, #53, #55 y #54 se fusionaron entre el 2026-09-05 y el 2026-09-07) |
+| **En vuelo** | Existe en un PR abierto contra `agents` que todavía no se ha fusionado (hoy ninguno: #39, #43, #45, #46, #47, #49, #50, #51, #48, #52, #53, #55, #54 y #56 se fusionaron entre el 2026-09-05 y el 2026-09-07) |
 | **Diseñado** | Está especificado en el paquete de diseño (`docs/05-specs/`, `docs/06-diseno-tecnico/`) pero no hay código que lo materialice |
 | **Fuera del MVP** | Excluido explícitamente por ADR-0014 o por la spec correspondiente |
 
@@ -528,7 +528,7 @@ contexto está en `21` y el de la capa AI en `22`.
 | Journeys, catálogo, Mermaid, carriles, validación, snapshot | ✔ | | Vista timeline y por actor |
 | Design versions, elementos, diff, releases, effective state, conciliación, G7 | ✔ | | Detección AI de desviaciones como discrepancias propuestas (RF-06.8); C7 solo lee las ya registradas dentro del borrador del post mortem (discrepancia 20) |
 | Metric Registry (con borrador AI de entradas KPI, C6), snapshots, outcome review (con borrador AI de la narrativa, C7), veredicto | ✔ | | Recordatorios por cadencia, series ancladas a fechas de release |
-| Pipeline PropuestaAI, presupuesto, degradación, consentimiento, operación de la capa AI (RF-08.9), evals de grounding (RF-08.7), paridad manual como invariante (RF-08.6) | ✔ (CI, C0, CT, C2, C3, C4, C5, C6, C7; cuadro de coste, latencia, error y aceptación por capacidad; corridas de grounding guardadas y comparadas contra la anterior y contra otra versión de prompt; `paridadManual` declarada por capacidad y censada hasta la escritura) | | C1 (transcripción), plan de releases asistido; BYOAI con secret manager; la corrida **periódica** de evals (no hay planificador) y la fidelidad semántica de citas (exigida y no medida); el censo de paridad sobre la capa de pantalla (hoy llega hasta la server function) |
+| Pipeline PropuestaAI, presupuesto, degradación, consentimiento, operación de la capa AI (RF-08.9), evals de grounding (RF-08.7), paridad manual como invariante (RF-08.6) | ✔ (CI, C0, CT, C2, C3, C4, C5, C6, C7; cuadro de coste, latencia, error y aceptación por capacidad; corridas de grounding guardadas y comparadas contra la anterior y contra otra versión de prompt; `paridadManual` declarada por capacidad y censada desde la pantalla hasta la escritura) | | C1 (transcripción), plan de releases asistido; BYOAI con secret manager; la corrida **periódica** de evals (no hay planificador) y la fidelidad semántica de citas (exigida y no medida) |
 | Exportación (archivo y entregable), disposición acordada | ✔ | | Exportación de adjuntos por object storage |
 | Despliegue Railway, CI de seis checks, suite authz contra Postgres real | ✔ | | E2E Playwright, scheduler y cron, backups verificados |
 
@@ -1323,7 +1323,7 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
    diseño experimental no se tocan); quien acepta queda registrado en la propuesta, no como creador
    del review, y la procedencia se fija por `xmin` del review sobre la propuesta.
 
-## Paridad manual declarada y censada (RF-08.6, #54)
+## Paridad manual declarada y censada (RF-08.6, #54 y #56)
 
 - Cada capacidad del registro `CAPACIDADES` lleva un campo **obligatorio** `paridadManual`
   (`ai.schemas.ts`): una capacidad nueva **no compila** sin declarar cómo se hace a mano lo que
@@ -1342,8 +1342,8 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
   `escribirRevisionSimuladaAMano`. E `informativa`, con su **porqué** escrito (CT y C5: no
   materializan nada, así que no hay escritura que replicar; la razón se declara para que «no hace
   falta» no se confunda con «se nos olvidó»).
-- El **censo** (`src/__tests__/paridad-manual.test.ts`, tres sondas con el parser de TypeScript
-  y sin base) comprueba las tres direcciones en que la paridad puede romperse: que la **clase
+- El **censo** (`src/__tests__/paridad-manual.test.ts`, cuatro sondas con el parser de TypeScript
+  y sin base) comprueba las direcciones en que la paridad puede romperse: que la **clase
   concuerde con el destino** (materializa ⇒ `escritura`; sin destino ⇒ `informativa` con un porqué
   de más de 40 caracteres); que cada paso **exista, se exporte y se pueda invocar** (una función
   literal o la cadena `createServerFn(...).handler(...)`, siguiendo re-exports con nombre y de
@@ -1357,10 +1357,17 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
   existe con el nombre que el censo deriva (`revision-simulada` → `revision_simulada`,
   `criterio-exito` → `criterio_exito`), comprobado contra `information_schema`, para que un
   destino renombrado sin su tabla no pase en verde.
-- Lo que el censo **no cubre todavía**, y #54 deja abierto a propósito: la capa de **pantalla**.
-  Hoy llega hasta la server function; que un componente la llame de verdad no se mide, y fue
-  justo ese hueco el que destapó que `definirCriterio` existía sin que ninguna pantalla lo llamara
-  (cerrado en #55). Generalizar la sonda a JSX para las nueve capacidades queda en la hoja de ruta.
+- La **cuarta sonda** (#56) hace la pregunta que las tres primeras no podían: **¿la llama
+  alguien?** Fue exactamente el caso de C0: `definirCriterio` existía, se exportaba, escribía
+  `criterio_exito` y pasaba las tres sondas, y ningún componente la llamaba (cerrado en #55). Ahora
+  cada paso declarado tiene que aparecer como **llamada viva** en algún `.tsx` de `src/components`
+  o `src/routes`: en posición de callee, con las envolturas transparentes quitadas y siguiendo el
+  alias con el que la pantalla lo importe (renombrado, espacio de nombres o corchetes), sin contar
+  lo que cuelga de una rama que nunca corre. Nombrar no es llamar: el import a secas, una mención
+  en un comentario o el nombre en posición de tipo no cuentan. Dos límites escritos en la sonda:
+  solo mira `.tsx` de esas dos carpetas (una pantalla que delegue la llamada en un `.ts` la pone en
+  rojo y pide una decisión), y no pregunta si el componente se **renderiza**, solo si la llamada
+  existe en él.
 - Lo que #54 **no toca**: ningún dato, ninguna migración, ninguna pantalla. Es un cambio de
   contrato (`ParidadManual` y el campo en `DefinicionCapacidad`) y de suite (3.142 líneas de censo
   y una sonda con base), y de paso reescribe las cuatro sondas de carrera de C4 para que esperen
@@ -2049,11 +2056,11 @@ registro histórico del alcance funcional (loop J1–J7 y seis superficies), no 
 
 | Estrato | Dónde | Qué cubre |
 |---|---|---|
-| Unit puro (sin base) | `src/__tests__/*.test.ts`, `src/lib/**/__tests__/` | Estado del loop y destinos, diff de entrega, Mermaid, sanitización, esquemas, números de formulario, degradación AI, proveedor (no lanza), sesión, password, limitador, memoria, segmentos, búsqueda, configuración de entrada, el censo de paridad manual con el parser de TypeScript (`paridad-manual.test.ts`, #54) |
+| Unit puro (sin base) | `src/__tests__/*.test.ts`, `src/lib/**/__tests__/` | Estado del loop y destinos, diff de entrega, Mermaid, sanitización, esquemas, números de formulario, degradación AI, proveedor (no lanza), sesión, password, limitador, memoria, segmentos, búsqueda, configuración de entrada, el censo de paridad manual con el parser de TypeScript (`paridad-manual.test.ts`, #54 y #56) |
 | **Autorización contra Postgres real** | `src/__tests__/authz/*.test.ts` (24 archivos, uno por superficie: aislamiento, auth, árbol, evidencia, evidencia profunda, insight, método, gobernanza, oportunidad, concepto, journey, entrega, medición, portal, aprobaciones, disposición, exportación, memoria, segmentos, servicio, busqueda, calendario, loop, ai) | Ambas capas: cero filas sin contexto, acceso cruzado entre dos workspaces, transiciones, guards, censos estructurales (funciones definer sin EXECUTE público, superficies de enlace a evidencia con guard, catálogo de exportación contra FKs vivas, tablas bajo `IS001`) |
 | Seed como prueba | `db:seed` ×2 en CI | Idempotencia y paso por los mismos guards que la app |
 
-Recuento al último PR fusionado (#54): **1015 pruebas** en verde, en 49 archivos. La suite de
+Recuento al último PR fusionado (#56): **1016 pruebas** en verde, en 49 archivos. La suite de
 autorización se **omite y lo dice** si faltan las URLs de base; en CI siempre corre. Regla de
 revisión: cada candado se verifica retirándolo, y debe caer exactamente la prueba que lo cubre.
 
@@ -2066,7 +2073,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | PR | Qué trae | Estado |
 |---|---|---|
 | — | Ninguno abierto a la fecha de este documento | — |
-| — | Últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) [#55](https://github.com/jtrujillo-ws/designio-app/pull/55) (los criterios de éxito se escriben a mano) y [#54](https://github.com/jtrujillo-ws/designio-app/pull/54) (RF-08.6, la paridad manual deja de ser una afirmación y pasa a ser una invariante) | — |
+| — | Últimos fusionados: [#39](https://github.com/jtrujillo-ws/designio-app/pull/39) (oportunidades HMW y G3), [#43](https://github.com/jtrujillo-ws/designio-app/pull/43) (C6, borrador del Metric Registry), [#45](https://github.com/jtrujillo-ws/designio-app/pull/45) (C3, HMW propuestas desde los insights validados), [#46](https://github.com/jtrujillo-ws/designio-app/pull/46) (conceptos y resultados de test en la base), [#47](https://github.com/jtrujillo-ws/designio-app/pull/47) (C7, borrador del post mortem), [#49](https://github.com/jtrujillo-ws/designio-app/pull/49) (el recorte del material acota qué desviaciones puede afirmar C7), [#50](https://github.com/jtrujillo-ws/designio-app/pull/50) (C7 avisa al modelo de que su material se truncó) , [#51](https://github.com/jtrujillo-ws/designio-app/pull/51) (el lateral agrupa los destinos: lo pendiente arriba, el árbol entero y el gobierno plegado) y [#48](https://github.com/jtrujillo-ws/designio-app/pull/48) (C4, los revisores AI por arquetipo como simulación imborrable) , [#52](https://github.com/jtrujillo-ws/designio-app/pull/52) (RF-08.9, el libro de costos AI tiene lector y pantalla) y [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) (RF-08.7, el grounding se mide, se guarda y se compara) [#55](https://github.com/jtrujillo-ws/designio-app/pull/55) (los criterios de éxito se escriben a mano), [#54](https://github.com/jtrujillo-ws/designio-app/pull/54) (RF-08.6, la paridad manual deja de ser una afirmación y pasa a ser una invariante) y [#56](https://github.com/jtrujillo-ws/designio-app/pull/56) (la paridad manual, censada también en la pantalla) | — |
 
 ## Diseñado y pendiente, por spec
 
@@ -2079,7 +2086,7 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 | SPEC-05 Journeys | Vistas timeline y por actor (la descarga SVG/PNG del render y la copia del código Mermaid ya están construidas en la pantalla del journey) | RF-05.3 |
 | SPEC-06 Trazabilidad | Detección AI de desviaciones como **discrepancias propuestas** entre la design version y lo constatado, a confirmar por el lead (la spec sigue vigente; C7 solo lee las desviaciones ya registradas dentro del borrador del post mortem, y la migración de #47 argumenta contra un detector que proponga constataciones: decisión de producto pendiente, discrepancia 20) | RF-06.8 |
 | SPEC-07 Medición | Recordatorios al propietario del dato por cadencia (scheduler); marcas de release sobre la serie; retos candidatos pre-poblados desde la memoria al completar el review | RF-07.4, RF-07.5, RF-07.7, RF-07.10 |
-| SPEC-08 AI | Capacidad C1 (transcripción y diarización) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; la corrida **periódica** de las evals de grounding y una medida de fidelidad semántica de citas (las cuatro métricas deterministas, su serie por versión de prompt y la comparación ya están construidas en `/evals-grounding`, #53; la observabilidad por capacidad en `/observabilidad-ai`, #52); extender el censo de paridad manual a la capa de **pantalla** (hoy llega hasta la server function, #54) | RF-08.2, RF-08.6, RF-08.7 |
+| SPEC-08 AI | Capacidad C1 (transcripción y diarización) y la descomposición asistida en releases (segunda salida de C6, que exige una capacidad nueva anclada en la design version); BYOAI con secret manager; la corrida **periódica** de las evals de grounding y una medida de fidelidad semántica de citas (las cuatro métricas deterministas, su serie por versión de prompt y la comparación ya están construidas en `/evals-grounding`, #53; la observabilidad por capacidad en `/observabilidad-ai`, #52) | RF-08.2, RF-08.7 |
 | SPEC-09 Seguridad | Prueba «AI off» del loop completo como E2E; condiciones de proveedores registradas; backups con prueba de restauración documentada | RF-09.10, RF-09.11 |
 | Diseño técnico | Scheduler in-app (`scheduled_jobs` + tick + claim latch) y servicio cron de Railway; Playwright E2E; búsqueda semántica intra-workspace con pgvector; ADR formal «Stack del MVP» | `docs/06-diseno-tecnico/` |
 
@@ -2109,11 +2116,12 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
   todas); y el **pasaje literal de las citas en `propuesta_ai.contenido`**, que el panel ya recorta
   para quien no puede recibirlo pero el rol de aplicación sigue pudiendo leer por SQL, porque
   revocar la columna toca los nueve sitios que leen ese campo en todas las capacidades.
-- El **censo de paridad manual** (#54) se detiene en la server function: comprueba que la puerta
-  manual existe, se puede invocar y alcanza la escritura, pero no que **una pantalla la llame**. Fue
-  ese hueco el que dejó pasar `definirCriterio` sin componente hasta #55. Generalizar la sonda a
-  la capa JSX para las nueve capacidades queda pendiente, con sus dos hilos de revisión abiertos a
-  propósito.
+- El **censo de paridad manual** reimplementa el binder de JavaScript sobre el árbol sintáctico,
+  sin `Program` ni `TypeChecker`: los hallazgos de las últimas siete rondas de #56 fueron todos de
+  esa clase (alias, envolturas, ámbitos, formas de `var`). Sus dos límites conocidos están escritos
+  en la sonda y salen en rojo, no en verde (un paso pasado solo como callback y una consulta pasada
+  a otra función que la espere). La recomendación anotada en #56: si vuelve a costar rondas, el
+  arreglo es el checker, no otro caso más.
 
 ## Decisiones abiertas del paquete de diseño
 
@@ -2295,7 +2303,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I4 / SYS-18 | `agente-ai` sin aprobar ni publicar | Rol no invitable, ausente de todo predicado de escritura; CT sin destino | Construido |
 | I4 / SYS-19 | Toda escritura AI pasa por PropuestaAI con lineage | `propuesta_ai` + guard de materialización diferido; `propuesta_ai_id` en destinos | Construido |
 | I4 / SYS-20 | Revisores AI etiquetados, no evidencia, no cuentan en G4/G5 | `es_simulacion` con CHECK y sin UPDATE en las cuatro tablas de C4; `checklist_item` sin columna donde citar una revisión (censo en la suite); `unique (concepto_id, arquetipo_id)`; `sin_agregado_sintetico()` en base y contrato | Construido (#48) |
-| I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada; C4 con formulario a mano por la misma función y el mismo contrato que la aceptación; `paridadManual` obligatoria por capacidad y censo del grafo de llamadas hasta la escritura sin pasar por el proveedor (#54) | **Parcial**: la ruta manual llega a la pantalla para las nueve capacidades (criterios a mano desde #55) y está censada hasta la server function (#54); falta el censo sobre la capa de pantalla y el E2E «AI off» |
+| I4 / SYS-21 | Sin AI todo flujo manual; límites por workspace | `evaluarCapacidadAI` nunca lanza; cupo `limite_llamadas_ai_dia`; pantallas con AI apagada; C4 con formulario a mano por la misma función y el mismo contrato que la aceptación; `paridadManual` obligatoria por capacidad y censo del grafo de llamadas desde una llamada viva en la pantalla hasta la escritura, sin pasar por el proveedor (#54, #56) | **Parcial**: la ruta manual llega a la pantalla para las nueve capacidades (criterios a mano desde #55) y está censada de la pantalla a la escritura (#54, #56); falta el E2E «AI off» |
 | I5 / SYS-22 | Ventana por criterio en G0; registry firmado en G6 | `criterio_g0_pendiente_guard`, `registry_firmar_guard`, `aprobado_sin_registry` solo como marca histórica | Construido |
 | I5 / SYS-23 | Snapshots solo formulario/CSV, append-only | `snapshot_insert` con contrato firmado y ventana abierta; `snapshot_carga_no_corrige_guard` | Construido |
 | I5 / SYS-24 | Sin causalidad automática; veredicto cerrado | `outcome_review_completar_guard`; catálogo de cuatro veredictos; estructura de contribución y factores | Construido |
@@ -2312,7 +2320,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 
 # 93 — Apéndice: cronología de PRs fusionados en `agents`
 
-Siete días de construcción (2026-09-01 a 2026-09-07), 52 commits en `agents`, cada uno un
+Siete días de construcción (2026-09-01 a 2026-09-07), 53 commits en `agents`, cada uno un
 squash-merge con título que dice qué garantía añade.
 
 | Fecha | PR | Título |
@@ -2369,6 +2377,7 @@ squash-merge con título que dice qué garantía añade.
 | 09-07 | #53 | RF-08.7: el grounding se mide, se guarda y se compara contra dos corridas |
 | 09-07 | #55 | Los criterios de éxito se pueden escribir a mano, que es lo que SYS-22 da por hecho |
 | 09-07 | #54 | RF-08.6: la paridad manual deja de ser una afirmación y pasa a ser una invariante |
+| 09-07 | #56 | Una puerta que nadie abre no es una puerta: la paridad manual, censada también en la pantalla |
 
 ---
 

@@ -2302,7 +2302,7 @@ Invariantes de producto I1–I6 (prediseño §6) y de sistema SYS-01–SYS-24 (`
 | I6 / SYS-01 | `workspace_id` en la identidad de todo objeto | FKs compuestas; RLS en toda tabla; rol sin bypass | Construido |
 | I6 / SYS-02 | Ninguna consulta, contexto AI ni exportación mezcla workspaces | RLS; exportación bajo RLS; `exigir_aislamiento_de_escritura`; pruebas con dos workspaces | Construido |
 | I6 / SYS-03 | Biblioteca general sin referencias entrantes de clientes | Sin tablas todavía; checklists en código | **Diseñado** |
-| I6 / SYS-04 | Exportación completa y borrado completo según acuerdo | Catálogo contra FKs vivas; `ejecutar_disposicion` con recuento y constancia | Construido |
+| I6 / SYS-04 | Exportación completa y borrado completo según acuerdo | Catálogo contra FKs vivas; `ejecutar_disposicion` con recuento y constancia; `disposicion_motivo_no_ejecutable` rechaza el borrado si el archivo no pudo llevarse todos los adjuntos | **Parcial**: el `archivo` y el `borrado` están construidos, pero un workspace con más de 25 MiB de adjuntos **curados** no puede borrarse desde la aplicación (la comprobación de bytes lo rechaza y solo se pueden retirar adjuntos de ítems pendientes); hasta que haya exportación por object storage o paquete multi-parte, ese caso solo admite el archivo o la conexión administrativa (capítulos 17 y 23, hoja de ruta) |
 | SYS-05 | DV aprobada inmutable; cambios crean nueva | Índice único parcial; `elemento_cambio_version_editable_guard` | Construido |
 | SYS-06 | Release referencia una DV aprobada y declara elementos | `release_insert`, `release_elemento`, alcance fijo tras desplegar | Construido |
 | SYS-07 | Desviación con razón | `constatacion` exige razón cuando `desviado` | Construido |

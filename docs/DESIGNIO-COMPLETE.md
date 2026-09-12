@@ -28,8 +28,10 @@ language: es
 > [#51](https://github.com/jtrujillo-ws/designio-app/pull/51),
 > [#48](https://github.com/jtrujillo-ws/designio-app/pull/48),
 > [#52](https://github.com/jtrujillo-ws/designio-app/pull/52),
-> [#53](https://github.com/jtrujillo-ws/designio-app/pull/53) y
-> [#55](https://github.com/jtrujillo-ws/designio-app/pull/55)). Donde el paquete de diseño y el código
+> [#53](https://github.com/jtrujillo-ws/designio-app/pull/53),
+> [#55](https://github.com/jtrujillo-ws/designio-app/pull/55),
+> [#54](https://github.com/jtrujillo-ws/designio-app/pull/54) y
+> [#56](https://github.com/jtrujillo-ws/designio-app/pull/56)). Donde el paquete de diseño y el código
 > difieren, **gana el código** y la diferencia se anota en el apéndice 94.
 >
 > Generado: 2026-09-05 — rama `claude/designio-doc-sequentia-base-j0y13b`.
@@ -569,8 +571,8 @@ nada: la bandeja solo cuenta para quien la cura (lead y diseñador), así que a 
 promueve a «Te espera»; el filtrado por rol es el de siempre (Auditoría solo para
 `ROLES_AUDITORIA`, Operación de la capa AI y Grounding medido solo para `ROLES_OBSERVABILIDAD_AI` y `ROLES_INFORME_GROUNDING`, que son la misma lista; Disposición se enseña a todos y solo cambia el rótulo a «Constancias que
 conservas» para quien no decide la disposición); ningún destino se pierde ni se repite al agrupar.
-En el riel estrecho cada fila es su abreviatura de tres letras y los estantes los separa un
-hairline. El árbol pinta sus cuatro niveles (ADR-0003): cada proyecto del reto cuelga como subfila
+En el riel estrecho cada fila es su abreviatura de tres letras (`AI`, de dos, para Propuestas AI) y los
+estantes los separa un hairline. El árbol pinta sus cuatro niveles (ADR-0003): cada proyecto del reto cuelga como subfila
 con el proyecto actual destacado. Fuente: handoff «Loop · impacto visual», turno 4a.
 
 ## Cómo se deriva el estado del loop
@@ -1802,10 +1804,10 @@ JourneyBadge, Select, Switch, Tabs, Tag, Textarea, Wordmark); piezas de pantalla
 ## Migraciones
 
 **57 migraciones SQL forward-only** en `db/migrations/`, aplicadas en orden de nombre exactamente una
-vez con ledger `schema_migrations`. Las trece primeras crean el dominio (workspace, auth, árbol,
+vez con ledger `schema_migrations`. Las doce primeras crean el dominio (`00-init` más workspace, auth, árbol,
 evidencia, método, insight y decisión, portal, journey, medición, design version, evidencia
 profunda); las siguientes son **endurecimientos con nombre propio**, cada una con su motivación
-escrita en cabecera («derechos en toda cita», «candados compartidos», «la premisa del aislamiento se
+escrita en cabecera («la extensión del adjunto atada al formato verificado por bytes», «derechos en toda cita», «candados compartidos», «la premisa del aislamiento se
 comprueba», «el libro se abre antes de despachar», «borrado acordado», «lo que le falta a un gate lo
 dice la base», «la oportunidad se traza a insights», «C6: el registry se propone contra los
 criterios», «C3: la oportunidad se propone desde los insights», «el concepto se prueba antes de avanzar»…).
@@ -1842,7 +1844,7 @@ alcanzado del catálogo de Postgres.
 | Un protocolo de razonamiento | `razonamiento_usable_guard` (candados → relectura), `razonamiento_sin_respaldo` (predicado), `razonamiento_sin_respaldo_visible` (envoltorio con puerta de membresía y grant) |
 | Qué falta a un gate | `gate_faltas_para_aprobar` devuelve `motivo_de_bloqueo[]` (código, motivo); `_visible` para la app |
 | Grants mínimos por columna | Lo que solo escribe un guard queda fuera del grant del rol de aplicación (por ejemplo, `sembrado_registro` no es escribible desde la app) |
-| Funciones definer sin `EXECUTE` público | Censo en pruebas: ninguna función `prosecdef` de `public` deja EXECUTE a PUBLIC (65 funciones, 0 infractoras al último recuento) |
+| Funciones definer sin `EXECUTE` público | Censo en pruebas contra `pg_proc`: ninguna función `prosecdef` de `public` deja EXECUTE a PUBLIC; la prueba exige que el censo no sea vacío (más de 20 funciones) y que haya cero infractoras, y no publica el recuento (las migraciones definen más de un centenar de funciones definer) |
 | Concurrencia | `pg_advisory_xact_lock` como primera sentencia de guards diferidos que comparten objeto; `exigir_read_committed` en tablas cuyos guards releen; `session_user` para el llamante bajo definer |
 | Calendario | `fecha_de_la_base()` e `inicio_del_dia_de_la_base()` deciden vigencias y ventanas; nunca el reloj del proceso |
 
@@ -2094,7 +2096,6 @@ revisión: cada candado se verifica retirándolo, y debe caer exactamente la pru
 
 - Que el guard de gates invoque predicados por gate en vez de inlinearlos (en curso: la migración
   «lo que le falta a un gate lo dice la base» dio el primer paso).
-- `parseInt` truncante en la pantalla del journey (viene de #12).
 - Pregunta de producto abierta: dirección de orden de la cola de revisión (recomendación aplicada:
   confianza ascendente).
 - La medida de grounding es presencia literal, no fidelidad: ligar «con respaldo» al acto humano

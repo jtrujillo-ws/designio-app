@@ -1316,9 +1316,14 @@ que todas esas entradas existen. La costura es "declarar en vez de ramificar".
    delimitado como datos no confiables y acotado (`MAX_MATERIAL`), salida estructurada validada por
    Zod contra el esquema de la capacidad, ids copiados del material normalizados.
 5. **Revisión** en el panel. Para las capacidades que **materializan** (CI, C0, C2, C3, C4, C6, y C7 escribiendo sobre su ancla): **aceptar**,
-   **corregir y aceptar** (las citas y las contradicciones no se corrigen: son testimonio del modelo;
-   en C4 tampoco se corrigen la lente ni las marcas de hipótesis de los hallazgos, ni se reparten
-   las citas entre hallazgos, por `propuesta_ai_c4_testimonio_guard`; el resto sí) o **rechazar**. Para las **informativas** (CT, C5) no hay nada que aceptar ni
+   **corregir y aceptar** (lo que es **testimonio del modelo no se corrige**: las **citas** y la
+   **confianza declarada** en todas las capacidades, por `propuesta_ai_revision_guard` en la base y
+   por el servicio; y lo que cada capacidad añade en `TESTIMONIO_ADICIONAL`: en C2 las
+   **contradicciones**, en C6 el **criterio** al que responde la entrada (`criterioId`), en C7 los
+   **elementos** que señalan las desviaciones (`elementoId`, no el texto de la lectura), y en C4 la
+   **lente** y las **marcas de hipótesis** de los hallazgos, además del reparto de citas entre
+   hallazgos por `propuesta_ai_c4_testimonio_guard`; textos, prioridades, razones, nombres,
+   definiciones, lecturas y preguntas sí se corrigen) o **rechazar**. Para las **informativas** (CT, C5) no hay nada que aceptar ni
    corregir: el informe se lee y se **marca como leído**; `aceptarPropuesta` las rechaza a
    propósito. El **contenido original se
    conserva** siempre (SYS-17). La **presencia literal** de cada cita en el material que vio el
@@ -1596,7 +1601,7 @@ Fuente: SPEC-01 (RF-01.7). PR [#40](https://github.com/jtrujillo-ws/designio-app
   workspace que originó la invitación** rota el token e invalida el anterior; una invitación a esa
   misma cuenta pendiente desde **otro** workspace no emite enlace ni toca el token vigente (la
   activación sigue perteneciendo al workspace de origen). **Sin correo saliente en el MVP**, el enlace de activación se muestra en pantalla para
-  compartirlo. El aterrizaje fija la contraseña y entra directo al workspace.
+  compartirlo. El aterrizaje fija la contraseña y abre sesión en `/app`; la cuenta entra en el workspace **activo por defecto** (el primero de sus membresías por nombre, o el que pida `ws`), que coincide con el que originó la invitación cuando es el único, pero no necesariamente si la cuenta ya tenía otras membresías.
 - Estados de usuario: `invitado`, `activo`, `inactivo`. La aplicación solo ejerce `invitado` →
   `activo` (activar la invitación); desactivar una cuenta es hoy SQL administrativo, sin pantalla ni
   reactivación, y una cuenta inactiva no entra ni puede ser re-invitada.

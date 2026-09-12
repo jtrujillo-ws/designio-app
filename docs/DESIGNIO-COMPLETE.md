@@ -1905,7 +1905,7 @@ Descrito funcionalmente en `10`. Técnicamente (`src/lib/ai/`):
   latencia, `intento`, `reserva_id`, `consentimiento_version`, `cerrado_en`). El costo es de la
   llamada, no de la propuesta.
 - `reserva_ai`: el hueco de las generaciones en vuelo y el token de exclusión por ancla
-  (`item_id`, `reto_id`, `gate_id`, `journey_id`, `registry_id`, `outcome_review_id`, `concepto_id`), con ventana de caducidad e índice único parcial por ancla (no se paga dos veces por el mismo objeto).
+  (`item_id`, `reto_id`, `gate_id`, `journey_id`, `registry_id`, `outcome_review_id`, `concepto_id`), con ventana de caducidad e índice único parcial por **(capacidad, ancla)**: impide dos generaciones **simultáneas** de la misma capacidad sobre el mismo objeto, no que el objeto vuelva a costar una llamada más adelante. La reserva es un arriendo en vuelo: el servicio la borra al terminar la generación y la base la da por caducada pasada la ventana, así que tras aceptar, rechazar o caducar, el mismo ancla puede pedir otra generación y pagarla. Lo que cierra el paso mientras hay una propuesta **pendiente** es otra cosa: los índices únicos parciales de `propuesta_ai` por (capacidad, ancla) con `estado = 'propuesta'` para item, gate y journey, y la comprobación de admisión para el reto (C0 y C2 son lotes).
 - `propuesta_ai`: capacidad, destino (`evidencia`, `criterio-exito`, `insight`, `entrada-kpi`,
   `oportunidad`, `outcome-review`, `revision-simulada` o informativo), ancla, `contenido` y `contenido_original`, confianza, `es_simulacion` (obligatoria en C4),
   estado, `modelo`, `prompt_version`, `alcance_resumen`, `alcance_evidencia` (C2 y C4, en C4 partido por sesión y obligatorio) y `alcance_insights`
